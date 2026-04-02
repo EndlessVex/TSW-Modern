@@ -1,9 +1,29 @@
+# ── Dependencies ──
+node_modules/
 
-# Game reference files
-The Secret World/
+# ── Build output ──
+dist/
+build/
+target/
 
-# ── GSD baseline (auto-generated) ──
+# ── Environment / secrets ──
+.env
+.env.*
+!.env.example
+
+# ── Tauri ──
+src-tauri/gen/schemas/
+
+# ── Local reference material ──
+references/
+
+# ── GSD (agent workspace) ──
 .gsd
+
+# ── Background shell state ──
+.bg-shell/
+
+# ── Editor / OS ──
 .DS_Store
 Thumbs.db
 *.swp
@@ -12,20 +32,14 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
-.env
-.env.*
-!.env.example
-node_modules/
-.next/
-dist/
-build/
-__pycache__/
-*.pyc
-.venv/
-venv/
-target/
-vendor/
+
+# ── Logs ──
 *.log
+
+# ── Game install (local testing) ──
+The Secret World/
+
+# ── Misc ──
 coverage/
 .cache/
 tmp/
