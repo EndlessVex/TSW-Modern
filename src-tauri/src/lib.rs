@@ -1,0 +1,1166 @@
+pub mod config;
+pub mod download;
+pub mod rdb;
+pub mod verify;
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use download::{
+    check_for_updates as check_updates_inner, create_client, compute_download_plan,
+    run_downloads, DownloadConfig, DownloadManifest, PatchStatus,
+};
+use verify::{CorruptedEntry, VerifyResult};
+
+/// Global cached patch status for `get_patch_status` command.
+static PATCH_STATUS_CACHE: Mutex<Option<PatchStatus>> = Mutex::new(None);
+/// Global flag to prevent concurrent patching.
+static PATCHING_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+/// Global flag to prevent concurrent verification.
+static VERIFY_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+/// Global cancellation flag for verification.
+static VERIFY_CANCEL: AtomicBool = AtomicBool::new(false);
+/// Cached result of the last verification scan.
+static VERIFY_RESULT_CACHE: Mutex<Option<VerifyResult>> = Mutex::new(None);
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct InstallValidation {
+    pub valid: bool,
+    pub version: Option<String>,
+    pub rdb_count: usize,
+    pub message: String,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct AuthResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Validate credentials format (fallback-first: no server connection, D007).
+/// The game handles actual authentication via its built-in login screen.
+pub fn authenticate_inner(username: &str, password: &str) -> AuthResult {
+    if username.trim().is_empty() {
+        return AuthResult {
+            success: false,
+            message: "Username is required.".into(),
+        };
+    }
+    if password.is_empty() {
+        return AuthResult {
+            success: false,
+            message: "Password is required.".into(),
+        };
+    }
+    // Fallback approach: credentials are validated for format only.
+    // The game's built-in login handles actual auth when launched without -loginkey.
+    AuthResult {
+        success: true,
+        message: "Credentials accepted. Game will authenticate on launch.".into(),
+    }
+}
+
+/// Validate a TSW install directory by checking for expected marker files.
+///
+/// Checks: TheSecretWorld.exe, TheSecretWorldDX11.exe, RDB/ with .rdbdata files,
+/// LocalConfig.xml, and optionally reads Version.txt.
+pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
+    let base = Path::new(path);
+
+    if path.is_empty() {
+        return InstallValidation {
+            valid: false,
+            version: None,
+            rdb_count: 0,
+            message: "Install path is empty.".into(),
+        };
+    }
+
+    if !base.is_dir() {
+        return InstallValidation {
+            valid: false,
+            version: None,
+            rdb_count: 0,
+            message: format!("Path does not exist or is not a directory: {}", path),
+        };
+    }
+
+    let tsw_exe = base.join("TheSecretWorld.exe");
+    let dx11_exe = base.join("TheSecretWorldDX11.exe");
+    let rdb_dir = base.join("RDB");
+    let local_config = base.join("LocalConfig.xml");
+    let version_file = base.join("Version.txt");
+
+    // Detect SWL (Secret World Legends) misidentification:
+    // If other markers exist but TheSecretWorld.exe is missing, it might be SWL.
+    let has_tsw_exe = tsw_exe.is_file();
+    let has_dx11_exe = dx11_exe.is_file();
+    let has_rdb = rdb_dir.is_dir();
+    let has_local_config = local_config.is_file();
+
+    if !has_tsw_exe && (has_dx11_exe || has_rdb || has_local_config) {
+        return InstallValidation {
+            valid: false,
+            version: None,
+            rdb_count: 0,
+            message: "TheSecretWorld.exe not found but other game files are present. \
+                      This might be a Secret World Legends (SWL) install, not The Secret World (TSW)."
+                .into(),
+        };
+    }
+
+    let mut missing = Vec::new();
+    if !has_tsw_exe {
+        missing.push("TheSecretWorld.exe");
+    }
+    if !has_dx11_exe {
+        missing.push("TheSecretWorldDX11.exe");
+    }
+    if !has_rdb {
+        missing.push("RDB/");
+    }
+    if !has_local_config {
+        missing.push("LocalConfig.xml");
+    }
+
+    if !missing.is_empty() {
+        return InstallValidation {
+            valid: false,
+            version: None,
+            rdb_count: 0,
+            message: format!("Missing required files: {}", missing.join(", ")),
+        };
+    }
+
+    // Count .rdbdata files in RDB/
+    let rdb_count = fs::read_dir(&rdb_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |ext| ext == "rdbdata")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    // Read version string
+    let version = fs::read_to_string(&version_file)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    InstallValidation {
+        valid: true,
+        version,
+        rdb_count,
+        message: "Valid TSW install directory.".into(),
+    }
+}
+
+#[tauri::command]
+fn validate_install_dir(path: String) -> Result<InstallValidation, String> {
+    Ok(validate_install_dir_inner(&path))
+}
+
+#[tauri::command]
+fn authenticate(username: String, password: String) -> Result<AuthResult, String> {
+    Ok(authenticate_inner(&username, &password))
+}
+
+#[tauri::command]
+fn launch_game(install_path: String, dx_version: String, login_key: Option<String>) -> Result<(), String> {
+    let exe_name = if dx_version.eq_ignore_ascii_case("dx9") {
+        "TheSecretWorld.exe"
+    } else {
+        "TheSecretWorldDX11.exe"
+    };
+
+    let base = Path::new(&install_path);
+    let exe_path = base.join(exe_name);
+
+    if !exe_path.is_file() {
+        return Err(format!(
+            "Executable not found: {} (resolved: {})",
+            exe_name,
+            exe_path.display()
+        ));
+    }
+
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.current_dir(&install_path);
+
+    if let Some(key) = login_key {
+        cmd.args(["-loginkey", &key]);
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("Failed to launch {}: {}", exe_name, e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_for_updates_cmd(install_path: String) -> Result<PatchStatus, String> {
+    let path = std::path::PathBuf::from(&install_path);
+    let status = check_updates_inner(&path).map_err(|e| e.to_string())?;
+
+    // Cache the result
+    if let Ok(mut cache) = PATCH_STATUS_CACHE.lock() {
+        *cache = Some(status.clone());
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+fn get_patch_status_cmd() -> Result<PatchStatus, String> {
+    match PATCH_STATUS_CACHE.lock() {
+        Ok(cache) => cache
+            .clone()
+            .ok_or_else(|| "No patch status cached. Run check_for_updates first.".to_string()),
+        Err(e) => Err(format!("Failed to read cache: {}", e)),
+    }
+}
+
+#[tauri::command]
+async fn start_patching(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
+    // Prevent concurrent patching
+    {
+        let mut in_progress = PATCHING_IN_PROGRESS.lock().map_err(|e| e.to_string())?;
+        if *in_progress {
+            return Err("Patching is already in progress.".to_string());
+        }
+        *in_progress = true;
+    }
+
+    // Spawn the download work on a background task so this command returns immediately
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result = run_patching_inner(&app_clone, &install_path).await;
+
+        // Clear the in-progress flag
+        if let Ok(mut in_progress) = PATCHING_IN_PROGRESS.lock() {
+            *in_progress = false;
+        }
+
+        if let Err(e) = result {
+            use tauri::Emitter;
+            let _ = app_clone.emit(
+                "patch:progress",
+                &download::DownloadProgress {
+                    bytes_downloaded: 0,
+                    total_bytes: 0,
+                    files_completed: 0,
+                    files_total: 0,
+                    speed_bps: 0,
+                    current_file: String::new(),
+                    phase: "error".into(),
+                    failed_files: 0,
+                },
+            );
+            log::error!("Patching failed: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
+/// Inner patching logic — parses configs, computes plan, runs downloads.
+async fn run_patching_inner(
+    app: &tauri::AppHandle,
+    install_path: &str,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let base = std::path::PathBuf::from(install_path);
+
+    // Emit checking phase
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0,
+            total_bytes: 0,
+            files_completed: 0,
+            files_total: 0,
+            speed_bps: 0,
+            current_file: String::new(),
+            phase: "checking".into(),
+            failed_files: 0,
+        },
+    );
+
+    // Parse configs
+    let patch_config =
+        config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
+    let le_index =
+        rdb::parse_le_index(&base.join("RDB").join("le.idx")).map_err(|e| e.to_string())?;
+    let hash_index =
+        rdb::parse_hash_index(&base.join("RDB").join("RDBHashIndex.bin"))
+            .map_err(|e| e.to_string())?;
+
+    // CDN resources use http_patch_addr only (D010)
+    let cdn_base_url = &patch_config.http_patch_addr;
+    let staging_dir = base.join("staging");
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+
+    let manifest = DownloadManifest::load(&staging_dir);
+    let tasks = compute_download_plan(&le_index, &hash_index, cdn_base_url, &staging_dir, &manifest);
+
+    if tasks.is_empty() {
+        // Already up to date
+        let _ = app.emit(
+            "patch:progress",
+            &download::DownloadProgress {
+                bytes_downloaded: 0,
+                total_bytes: 0,
+                files_completed: 0,
+                files_total: 0,
+                speed_bps: 0,
+                current_file: String::new(),
+                phase: "complete".into(),
+                failed_files: 0,
+            },
+        );
+        return Ok(());
+    }
+
+    let dl_config = DownloadConfig {
+        cdn_base_url: cdn_base_url.clone(),
+        staging_dir: staging_dir.clone(),
+        ..Default::default()
+    };
+    let client = create_client(&dl_config).map_err(|e| e.to_string())?;
+    let manifest_arc = std::sync::Arc::new(tokio::sync::Mutex::new(manifest));
+
+    let result = run_downloads(app, &dl_config, &client, tasks, manifest_arc)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if result.files_failed > 0 {
+        return Err(format!(
+            "{} files failed to download out of {} total",
+            result.files_failed,
+            result.files_completed + result.files_failed
+        ));
+    }
+
+    Ok(())
+}
+
+// ─── Verification commands ───────────────────────────────────────────────────
+
+#[tauri::command]
+async fn start_verification(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
+    // Prevent concurrent verification
+    {
+        let mut in_progress = VERIFY_IN_PROGRESS.lock().map_err(|e| e.to_string())?;
+        if *in_progress {
+            return Err("Verification is already in progress.".to_string());
+        }
+        *in_progress = true;
+    }
+
+    // Reset cancel flag
+    VERIFY_CANCEL.store(false, Ordering::Relaxed);
+
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result = run_verification_inner(&app_clone, &install_path);
+
+        // Clear the in-progress flag
+        if let Ok(mut in_progress) = VERIFY_IN_PROGRESS.lock() {
+            *in_progress = false;
+        }
+
+        match result {
+            Ok(verify_result) => {
+                // Cache the result
+                if let Ok(mut cache) = VERIFY_RESULT_CACHE.lock() {
+                    *cache = Some(verify_result);
+                }
+            }
+            Err(e) => {
+                use tauri::Emitter;
+                let _ = app_clone.emit(
+                    "verify:progress",
+                    &verify::VerifyProgress {
+                        entries_checked: 0,
+                        entries_total: 0,
+                        corrupted_count: 0,
+                        bytes_scanned: 0,
+                        current_file: String::new(),
+                        phase: format!("error: {}", e),
+                    },
+                );
+                log::error!("Verification failed: {}", e);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Inner verification logic — runs on a blocking thread since it does synchronous I/O.
+fn run_verification_inner(
+    app: &tauri::AppHandle,
+    install_path: &str,
+) -> Result<VerifyResult, String> {
+    use tauri::Emitter;
+
+    let base = std::path::PathBuf::from(install_path);
+    let le_index =
+        rdb::parse_le_index(&base.join("RDB").join("le.idx")).map_err(|e| e.to_string())?;
+
+    let cancel_flag = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel_ref = cancel_flag.clone();
+
+    // Bridge the global cancel flag to the local Arc
+    let app_for_progress = app.clone();
+    let result = verify::verify_integrity(&base, &le_index, &cancel_flag, move |progress| {
+        // Check global cancel and propagate to local flag
+        if VERIFY_CANCEL.load(Ordering::Relaxed) {
+            cancel_ref.store(true, Ordering::Relaxed);
+        }
+        let _ = app_for_progress.emit("verify:progress", progress);
+    })?;
+
+    Ok(result)
+}
+
+#[tauri::command]
+fn cancel_verification() -> Result<(), String> {
+    VERIFY_CANCEL.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_verification_status() -> Result<Option<VerifyResult>, String> {
+    match VERIFY_RESULT_CACHE.lock() {
+        Ok(cache) => Ok(cache.clone()),
+        Err(e) => Err(format!("Failed to read verification cache: {}", e)),
+    }
+}
+
+// ─── Repair command ──────────────────────────────────────────────────────────
+
+/// Repair result sent to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairResult {
+    pub files_repaired: u32,
+    pub files_failed: u32,
+    pub total_files: u32,
+}
+
+#[tauri::command]
+async fn repair_corrupted(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
+    use tauri::Emitter;
+
+    // Get cached corrupted entries
+    let corrupted: Vec<CorruptedEntry> = {
+        let cache = VERIFY_RESULT_CACHE.lock().map_err(|e| e.to_string())?;
+        match cache.as_ref() {
+            Some(result) if !result.corrupted.is_empty() => result.corrupted.clone(),
+            Some(_) => return Err("No corrupted files found. Run verification first.".to_string()),
+            None => return Err("No verification result cached. Run verification first.".to_string()),
+        }
+    };
+
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result = run_repair_inner(&app_clone, &install_path, &corrupted).await;
+        match result {
+            Ok(_) => {
+                log::info!("Repair completed successfully");
+            }
+            Err(e) => {
+                let _ = app_clone.emit(
+                    "patch:progress",
+                    &download::DownloadProgress {
+                        bytes_downloaded: 0,
+                        total_bytes: 0,
+                        files_completed: 0,
+                        files_total: 0,
+                        speed_bps: 0,
+                        current_file: String::new(),
+                        phase: "error".into(),
+                        failed_files: 0,
+                    },
+                );
+                log::error!("Repair failed: {}", e);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Inner repair logic — downloads corrupted entries from CDN, decompresses, writes back.
+async fn run_repair_inner(
+    app: &tauri::AppHandle,
+    install_path: &str,
+    corrupted: &[CorruptedEntry],
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let base = std::path::PathBuf::from(install_path);
+    let patch_config =
+        config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
+    let cdn_base_url = &patch_config.http_patch_addr;
+
+    let dl_config = DownloadConfig::default();
+    let client = create_client(&dl_config).map_err(|e| e.to_string())?;
+
+    let total = corrupted.len() as u32;
+    let mut repaired = 0u32;
+    let mut failed = 0u32;
+
+    for (_i, entry) in corrupted.iter().enumerate() {
+        // Emit progress
+        let _ = app.emit(
+            "patch:progress",
+            &download::DownloadProgress {
+                bytes_downloaded: 0,
+                total_bytes: 0,
+                files_completed: repaired,
+                files_total: total,
+                speed_bps: 0,
+                current_file: format!("type={} id={}", entry.rdb_type, entry.id),
+                phase: "repairing".into(),
+                failed_files: failed,
+            },
+        );
+
+        // Build CDN URL from the expected hash
+        let hash_bytes = hash_hex_to_bytes(&entry.expected_hash);
+        let url = match hash_bytes {
+            Some(h) => rdb::cdn_url_from_hash(cdn_base_url, &h),
+            None => {
+                log::error!(
+                    "Invalid hash for type={} id={}: {}",
+                    entry.rdb_type, entry.id, entry.expected_hash
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Download to temp file
+        let tmp_dir = base.join("staging").join("repair");
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("Failed to create repair staging dir: {}", e))?;
+        let tmp_path = tmp_dir.join(format!("{}_{}", entry.rdb_type, entry.id));
+
+        // Download with retries (reuse download_single_file)
+        let mut download_ok = false;
+        let mut last_error = String::new();
+        for attempt in 0..=dl_config.max_retries {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_secs(1 << (attempt - 1));
+                tokio::time::sleep(delay).await;
+            }
+
+            match download::download_single_file(&client, &url, &tmp_path, 0, 0).await {
+                Ok(_) => {
+                    download_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    last_error = format!("{}", e);
+                    log::warn!(
+                        "Repair download attempt {}/{} failed for type={} id={}: {}",
+                        attempt + 1, dl_config.max_retries + 1,
+                        entry.rdb_type, entry.id, last_error
+                    );
+                }
+            }
+        }
+
+        if !download_ok {
+            log::error!(
+                "Failed to download repair for type={} id={}: {}",
+                entry.rdb_type, entry.id, last_error
+            );
+            failed += 1;
+            continue;
+        }
+
+        // Read downloaded data, decompress IOz1
+        let raw_data = match std::fs::read(&tmp_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to read repair file: {}", e);
+                failed += 1;
+                continue;
+            }
+        };
+
+        let decompressed = match verify::decompress_ioz1(&raw_data) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!(
+                    "Failed to decompress repair data for type={} id={}: {}",
+                    entry.rdb_type, entry.id, e
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Verify decompressed length matches expected
+        if decompressed.len() != entry.length as usize {
+            log::error!(
+                "Decompressed length mismatch for type={} id={}: expected {}, got {}",
+                entry.rdb_type, entry.id, entry.length, decompressed.len()
+            );
+            failed += 1;
+            continue;
+        }
+
+        // Write back to rdbdata
+        match verify::write_to_rdbdata(
+            &base,
+            entry.file_num,
+            entry.offset as u64,
+            &decompressed,
+            entry.length as usize,
+        ) {
+            Ok(()) => {
+                repaired += 1;
+                log::info!(
+                    "Repaired type={} id={} in {:02}.rdbdata",
+                    entry.rdb_type, entry.id, entry.file_num
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to write repair for type={} id={}: {}",
+                    entry.rdb_type, entry.id, e
+                );
+                failed += 1;
+            }
+        }
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    // Emit completion
+    let phase = if failed > 0 { "error" } else { "complete" };
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0,
+            total_bytes: 0,
+            files_completed: repaired,
+            files_total: total,
+            speed_bps: 0,
+            current_file: String::new(),
+            phase: phase.into(),
+            failed_files: failed,
+        },
+    );
+
+    if failed > 0 {
+        Err(format!("{} of {} files failed to repair", failed, total))
+    } else {
+        Ok(())
+    }
+}
+
+/// Parse a hex hash string back into 16 bytes.
+fn hash_hex_to_bytes(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+// ─── Fresh Install Downloader ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallerProgress {
+    pub bytes_downloaded: u64,
+    pub total_bytes: u64,
+    pub phase: String,
+}
+
+#[tauri::command]
+async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
+    use futures::StreamExt;
+    use tauri::Emitter;
+    use tokio::io::AsyncWriteExt;
+
+    let url = "http://cdn.funcom.com/downloads/tsw/client/TheSecretWorldInstaller.exe";
+    let dest = std::env::temp_dir().join("TheSecretWorldInstaller.exe");
+
+    let dl_config = DownloadConfig::default();
+    let client = create_client(&dl_config).map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded: 0, total_bytes: 0, phase: "error".into(),
+            });
+            format!("Failed to download installer: {}", e)
+        })?;
+
+    if !resp.status().is_success() {
+        let _ = app.emit("installer:progress", InstallerProgress {
+            bytes_downloaded: 0, total_bytes: 0, phase: "error".into(),
+        });
+        return Err(format!("CDN returned status {}", resp.status()));
+    }
+
+    let total_bytes = resp.content_length().unwrap_or(0);
+    let mut stream = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(&dest).await.map_err(|e| {
+        let _ = app.emit("installer:progress", InstallerProgress {
+            bytes_downloaded: 0, total_bytes, phase: "error".into(),
+        });
+        format!("Failed to create temp file: {}", e)
+    })?;
+
+    let mut bytes_downloaded: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded, total_bytes, phase: "error".into(),
+            });
+            format!("Download stream error: {}", e)
+        })?;
+
+        file.write_all(&chunk).await.map_err(|e| {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded, total_bytes, phase: "error".into(),
+            });
+            format!("Failed to write to temp file: {}", e)
+        })?;
+
+        bytes_downloaded += chunk.len() as u64;
+
+        // Emit progress every 64KB or 200ms
+        if bytes_downloaded - (bytes_downloaded % (64 * 1024)) != (bytes_downloaded - chunk.len() as u64) - ((bytes_downloaded - chunk.len() as u64) % (64 * 1024))
+            || last_emit.elapsed() >= std::time::Duration::from_millis(200)
+        {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded, total_bytes, phase: "downloading".into(),
+            });
+            last_emit = std::time::Instant::now();
+        }
+    }
+
+    file.flush().await.map_err(|e| format!("Failed to flush installer file: {}", e))?;
+
+    // Emit complete before spawning
+    let _ = app.emit("installer:progress", InstallerProgress {
+        bytes_downloaded, total_bytes, phase: "complete".into(),
+    });
+
+    // Spawn the installer
+    std::process::Command::new(&dest)
+        .spawn()
+        .map_err(|e| format!("Failed to launch installer: {}", e))?;
+
+    Ok(())
+}
+
+// ─── Reddit News Feed ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsPost {
+    pub title: String,
+    pub author: String,
+    pub created_utc: f64,
+    pub permalink: String,
+    pub score: i64,
+    pub num_comments: i64,
+}
+
+#[tauri::command]
+async fn fetch_news() -> Result<Vec<NewsPost>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("TSWModernLauncher/0.1.0")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let resp = client
+        .get("https://www.reddit.com/r/TheSecretWorld.json?limit=10")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch Reddit news: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Reddit returned status {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Reddit JSON: {}", e))?;
+
+    let children = body
+        .get("data")
+        .and_then(|d| d.get("children"))
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| "Unexpected Reddit JSON structure".to_string())?;
+
+    let posts: Vec<NewsPost> = children
+        .iter()
+        .filter_map(|child| {
+            let data = child.get("data")?;
+            Some(NewsPost {
+                title: data.get("title")?.as_str()?.to_string(),
+                author: data.get("author")?.as_str()?.to_string(),
+                created_utc: data.get("created_utc")?.as_f64()?,
+                permalink: data.get("permalink")?.as_str()?.to_string(),
+                score: data.get("score")?.as_i64()?,
+                num_comments: data.get("num_comments")?.as_i64()?,
+            })
+        })
+        .collect();
+
+    Ok(posts)
+}
+
+// ─── Bundle mode commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn set_bundle_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
+    use tauri_plugin_store::StoreExt;
+
+    if mode != "full" && mode != "minimum" {
+        return Err(format!("Invalid bundle mode '{}'. Must be 'full' or 'minimum'.", mode));
+    }
+
+    let store = app.store("settings.json").map_err(|e| {
+        log::warn!("Failed to open store for bundle_mode: {}", e);
+        format!("Failed to open settings store: {}", e)
+    })?;
+
+    store.set("bundle_mode", serde_json::Value::String(mode));
+    store.save().map_err(|e| {
+        log::warn!("Failed to save bundle_mode: {}", e);
+        format!("Failed to save settings: {}", e)
+    })?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_bundle_mode(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_store::StoreExt;
+
+    let store = match app.store("settings.json") {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to open store for bundle_mode read: {}, defaulting to 'full'", e);
+            return Ok("full".to_string());
+        }
+    };
+
+    match store.get("bundle_mode") {
+        Some(serde_json::Value::String(mode)) if mode == "full" || mode == "minimum" => {
+            Ok(mode.clone())
+        }
+        _ => Ok("full".to_string()),
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![
+            validate_install_dir,
+            launch_game,
+            authenticate,
+            check_for_updates_cmd,
+            get_patch_status_cmd,
+            start_patching,
+            start_verification,
+            cancel_verification,
+            get_verification_status,
+            repair_corrupted,
+            set_bundle_mode,
+            get_bundle_mode,
+            fetch_news,
+            download_installer
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Real TSW install directory, relative to src-tauri/
+    fn tsw_path() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../The Secret World");
+        // Canonicalize to resolve the ..
+        path.canonicalize()
+            .expect("TSW install directory must exist at '../The Secret World/' relative to src-tauri/")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn valid_tsw_directory() {
+        let result = validate_install_dir_inner(&tsw_path());
+        assert!(result.valid, "Expected valid=true, got: {:?}", result);
+        assert!(
+            result.version.is_some(),
+            "Expected version string, got None"
+        );
+        let version = result.version.as_ref().unwrap();
+        assert!(
+            version.contains("TSW") || version.contains("tsw"),
+            "Version string should mention TSW, got: {}",
+            version
+        );
+        // Real install has 42 .rdbdata files
+        assert!(
+            result.rdb_count > 0,
+            "Expected rdb_count > 0, got {}",
+            result.rdb_count
+        );
+        assert_eq!(result.message, "Valid TSW install directory.");
+    }
+
+    #[test]
+    fn nonexistent_directory() {
+        let result = validate_install_dir_inner("/tmp/definitely_does_not_exist_tsw_12345");
+        assert!(!result.valid);
+        assert!(result.message.contains("does not exist"));
+        assert_eq!(result.rdb_count, 0);
+        assert!(result.version.is_none());
+    }
+
+    #[test]
+    fn empty_string_path() {
+        let result = validate_install_dir_inner("");
+        assert!(!result.valid);
+        assert!(result.message.contains("empty"));
+    }
+
+    #[test]
+    fn path_to_file_not_directory() {
+        // Use Cargo.toml as a path that exists but is a file
+        let path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = validate_install_dir_inner(&path);
+        assert!(!result.valid);
+        assert!(result.message.contains("not a directory"));
+    }
+
+    #[test]
+    fn empty_directory_missing_all_markers() {
+        let tmp = std::env::temp_dir().join("tsw_test_empty_dir");
+        let _ = fs::create_dir_all(&tmp);
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(!result.valid);
+        assert!(result.message.contains("Missing required files"));
+        assert!(result.message.contains("TheSecretWorld.exe"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swl_detection_missing_tsw_exe() {
+        // Simulate a directory that has DX11 exe and RDB but no TheSecretWorld.exe
+        let tmp = std::env::temp_dir().join("tsw_test_swl_detect");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("RDB")).unwrap();
+        fs::write(tmp.join("TheSecretWorldDX11.exe"), b"fake").unwrap();
+        fs::write(tmp.join("LocalConfig.xml"), b"<config/>").unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(!result.valid);
+        assert!(
+            result.message.contains("Secret World Legends")
+                || result.message.contains("SWL"),
+            "Should mention SWL, got: {}",
+            result.message
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn directory_with_no_rdbdata_files() {
+        // Has all marker files but RDB/ is empty
+        let tmp = std::env::temp_dir().join("tsw_test_empty_rdb");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("RDB")).unwrap();
+        fs::write(tmp.join("TheSecretWorld.exe"), b"fake").unwrap();
+        fs::write(tmp.join("TheSecretWorldDX11.exe"), b"fake").unwrap();
+        fs::write(tmp.join("LocalConfig.xml"), b"<config/>").unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(result.valid, "Should be valid even with 0 rdbdata files");
+        assert_eq!(result.rdb_count, 0);
+        assert!(result.version.is_none()); // No Version.txt
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn directory_with_only_some_markers() {
+        // Only TheSecretWorld.exe, missing everything else
+        let tmp = std::env::temp_dir().join("tsw_test_partial");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("TheSecretWorld.exe"), b"fake").unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(!result.valid);
+        assert!(result.message.contains("Missing required files"));
+        assert!(result.message.contains("TheSecretWorldDX11.exe"));
+        assert!(result.message.contains("RDB/"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn path_with_special_characters() {
+        let tmp = std::env::temp_dir().join("tsw test (special) chars & stuff!");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(!result.valid); // Missing files, but shouldn't crash
+        assert!(result.message.contains("Missing required files"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn launch_game_validates_exe_exists() {
+        // launch_game with a nonexistent path should return an error
+        let result = launch_game(
+            "/tmp/nonexistent_tsw_path".into(),
+            "dx9".into(),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "Error should mention not found, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn launch_game_dx_version_mapping() {
+        // "dx9" → TheSecretWorld.exe, "dx11" → TheSecretWorldDX11.exe
+        // We can't actually launch, but we can test error messages mention the right exe
+        let err9 = launch_game("/tmp/nonexistent".into(), "dx9".into(), None).unwrap_err();
+        assert!(
+            err9.contains("TheSecretWorld.exe"),
+            "dx9 should map to TheSecretWorld.exe, got: {}",
+            err9
+        );
+
+        let err11 = launch_game("/tmp/nonexistent".into(), "dx11".into(), None).unwrap_err();
+        assert!(
+            err11.contains("TheSecretWorldDX11.exe"),
+            "dx11 should map to TheSecretWorldDX11.exe, got: {}",
+            err11
+        );
+    }
+
+    #[test]
+    fn launch_game_dx9_case_insensitive() {
+        let err = launch_game("/tmp/nonexistent".into(), "DX9".into(), None).unwrap_err();
+        assert!(
+            err.contains("TheSecretWorld.exe") && !err.contains("DX11"),
+            "DX9 (uppercase) should map to TheSecretWorld.exe, got: {}",
+            err
+        );
+    }
+
+    // ─── authenticate tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn authenticate_empty_username() {
+        let result = authenticate_inner("", "password123");
+        assert!(!result.success);
+        assert!(
+            result.message.contains("Username"),
+            "Should mention username, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn authenticate_whitespace_username() {
+        let result = authenticate_inner("   ", "password123");
+        assert!(!result.success);
+        assert!(result.message.contains("Username"));
+    }
+
+    #[test]
+    fn authenticate_empty_password() {
+        let result = authenticate_inner("user@example.com", "");
+        assert!(!result.success);
+        assert!(
+            result.message.contains("Password"),
+            "Should mention password, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn authenticate_both_empty() {
+        // Username error takes priority
+        let result = authenticate_inner("", "");
+        assert!(!result.success);
+        assert!(
+            result.message.contains("Username"),
+            "Username error should take priority when both empty, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn authenticate_valid_credentials() {
+        let result = authenticate_inner("user@example.com", "secret123");
+        assert!(result.success);
+        assert!(
+            result.message.contains("accepted"),
+            "Should confirm acceptance, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn launch_game_login_key_none_backward_compatible() {
+        // login_key: None should behave identically to the original signature
+        let err = launch_game("/tmp/nonexistent".into(), "dx11".into(), None).unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "login_key: None should not change behavior, got: {}",
+            err
+        );
+    }
+}
