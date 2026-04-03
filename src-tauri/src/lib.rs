@@ -766,6 +766,9 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
     }
 
     file.flush().await.map_err(|e| format!("Failed to flush installer file: {}", e))?;
+    // Explicitly close the file handle before spawning — Windows holds an
+    // exclusive lock on open files (ERROR_SHARING_VIOLATION / os error 32)
+    drop(file);
 
     // Emit complete before spawning
     let _ = app.emit("installer:progress", InstallerProgress {
