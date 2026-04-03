@@ -507,7 +507,7 @@ async fn run_patching_inner(
     let dl_config = DownloadConfig {
         cdn_base_url: cdn_base_url.clone(),
         staging_dir: staging_dir.clone(),
-        max_concurrent: 64,
+        max_concurrent: 128,
         ..Default::default()
     };
     let client = create_client(&dl_config).map_err(|e| e.to_string())?;

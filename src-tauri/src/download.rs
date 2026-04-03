@@ -47,7 +47,7 @@ impl Default for DownloadConfig {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
             pool_idle_timeout: Duration::from_secs(90),
-            pool_max_idle_per_host: 10,
+            pool_max_idle_per_host: 128,
             cdn_base_url: String::new(),
             staging_dir: PathBuf::from("staging"),
         }
@@ -269,11 +269,6 @@ pub async fn download_single_file(
 ) -> Result<u64, DownloadError> {
     use futures::StreamExt;
 
-    // Ensure parent directory exists
-    if let Some(parent) = dest_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
     let mut request = client.get(url);
 
     // Resume support: seek to partial offset
@@ -296,6 +291,38 @@ pub async fn download_single_file(
                 });
             }
         }
+    }
+
+    // Small files (<64KB): download entire body to memory, write in one shot.
+    // Avoids streaming overhead (file open, chunk loop, flush) and reduces
+    // NTFS file creation overhead on Windows (single write vs stream).
+    // 93% of files are under 100KB — this path handles most of them.
+    if expected_size < 65536 && !append {
+        let body = response.bytes().await.map_err(DownloadError::Http)?;
+        let bytes_written = body.len() as u64;
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        tokio::fs::write(dest_path, &body).await?;
+
+        // Size check
+        if expected_size > 0 && bytes_written != expected_size {
+            let _ = tokio::fs::remove_file(dest_path).await;
+            return Err(DownloadError::SizeMismatch {
+                expected: expected_size,
+                got: bytes_written,
+            });
+        }
+
+        return Ok(bytes_written);
+    }
+
+    // Ensure parent directory exists for large file streaming path
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
 
     // Open file for writing (append if resuming, create if fresh)
@@ -667,20 +694,23 @@ pub async fn run_downloads(
 
                         let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
 
-                        // Emit progress
-                        let _ = app_handle.emit(
-                            "patch:progress",
-                            &DownloadProgress {
-                                bytes_downloaded: new_total,
-                                total_bytes: total_bytes_val,
-                                files_completed: completed,
-                                files_total: files_total_val,
-                                speed_bps: speed,
-                                current_file: task.hash_hex.clone(),
-                                phase: "downloading".into(),
-                                failed_files: failed,
-                            },
-                        );
+                        // Emit progress — throttle to every 20 files or when significant
+                        // bytes are downloaded to avoid 650K IPC events
+                        if completed % 20 == 0 || bytes_written > 100_000 || completed == files_total_val {
+                            let _ = app_handle.emit(
+                                "patch:progress",
+                                &DownloadProgress {
+                                    bytes_downloaded: new_total,
+                                    total_bytes: total_bytes_val,
+                                    files_completed: completed,
+                                    files_total: files_total_val,
+                                    speed_bps: speed,
+                                    current_file: task.hash_hex.clone(),
+                                    phase: "downloading".into(),
+                                    failed_files: failed,
+                                },
+                            );
+                        }
 
                         return Ok(());
                     }
@@ -833,7 +863,7 @@ mod tests {
         assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
         assert_eq!(cfg.read_timeout, Duration::from_secs(60));
         assert_eq!(cfg.pool_idle_timeout, Duration::from_secs(90));
-        assert_eq!(cfg.pool_max_idle_per_host, 10);
+        assert_eq!(cfg.pool_max_idle_per_host, 128);
     }
 
     // ── Client creation ──────────────────────────────────────────────
