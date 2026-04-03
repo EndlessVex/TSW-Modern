@@ -67,6 +67,9 @@ pub fn authenticate_inner(username: &str, password: &str) -> AuthResult {
 ///
 /// Checks: TheSecretWorld.exe, TheSecretWorldDX11.exe, RDB/ with .rdbdata files,
 /// LocalConfig.xml, and optionally reads Version.txt.
+///
+/// A directory is also valid if it contains LocalConfig.xml and RDB/ but no game
+/// executables — this is the state after a fresh install before patching completes.
 pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
     let base = Path::new(path);
 
@@ -94,19 +97,56 @@ pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
     let local_config = base.join("LocalConfig.xml");
     let version_file = base.join("Version.txt");
 
-    // Detect SWL (Secret World Legends) misidentification:
-    // If other markers exist but TheSecretWorld.exe is missing, it might be SWL.
     let has_tsw_exe = tsw_exe.is_file();
     let has_dx11_exe = dx11_exe.is_file();
     let has_rdb = rdb_dir.is_dir();
     let has_local_config = local_config.is_file();
 
-    if !has_tsw_exe && (has_dx11_exe || has_rdb || has_local_config) {
+    // Count .rdbdata files in RDB/
+    let rdb_count = if has_rdb {
+        fs::read_dir(&rdb_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |ext| ext == "rdbdata")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Read version string
+    let version = fs::read_to_string(&version_file)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    // Fresh install state: LocalConfig.xml + RDB/ exist, but no game executables yet.
+    // The Funcom installer creates these before patching adds the .exe files.
+    // This is NOT an SWL misidentification — it's a valid pre-patch state.
+    if has_local_config && has_rdb && !has_tsw_exe && !has_dx11_exe {
+        return InstallValidation {
+            valid: true,
+            version,
+            rdb_count,
+            message: "Fresh TSW install detected — game files need patching.".into(),
+        };
+    }
+
+    // Detect SWL (Secret World Legends) misidentification:
+    // If DX11 exe or other markers exist but TheSecretWorld.exe is missing,
+    // and it doesn't look like a fresh install, it might be SWL.
+    if !has_tsw_exe && has_dx11_exe {
         return InstallValidation {
             valid: false,
             version: None,
             rdb_count: 0,
-            message: "TheSecretWorld.exe not found but other game files are present. \
+            message: "TheSecretWorld.exe not found but TheSecretWorldDX11.exe is present. \
                       This might be a Secret World Legends (SWL) install, not The Secret World (TSW)."
                 .into(),
         };
@@ -135,26 +175,6 @@ pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
         };
     }
 
-    // Count .rdbdata files in RDB/
-    let rdb_count = fs::read_dir(&rdb_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map_or(false, |ext| ext == "rdbdata")
-                })
-                .count()
-        })
-        .unwrap_or(0);
-
-    // Read version string
-    let version = fs::read_to_string(&version_file)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-
     InstallValidation {
         valid: true,
         version,
@@ -166,6 +186,48 @@ pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
 #[tauri::command]
 fn validate_install_dir(path: String) -> Result<InstallValidation, String> {
     Ok(validate_install_dir_inner(&path))
+}
+
+/// Check common Windows install locations for an existing TSW install.
+/// Returns the first valid path found, or None.
+fn auto_detect_install_dir_inner() -> Option<String> {
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut paths = Vec::new();
+
+        // Standard Funcom installer default paths
+        paths.push(std::path::PathBuf::from(r"C:\Program Files (x86)\Funcom\The Secret World"));
+        paths.push(std::path::PathBuf::from(r"C:\Program Files\Funcom\The Secret World"));
+
+        // Steam common install locations
+        paths.push(std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\The Secret World"));
+        paths.push(std::path::PathBuf::from(r"C:\Program Files\Steam\steamapps\common\The Secret World"));
+
+        // Check all drive letters for the Funcom default path
+        for letter in b'D'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            paths.push(std::path::PathBuf::from(format!(r"{}\Program Files (x86)\Funcom\The Secret World", drive)));
+            paths.push(std::path::PathBuf::from(format!(r"{}\Funcom\The Secret World", drive)));
+            paths.push(std::path::PathBuf::from(format!(r"{}\Games\The Secret World", drive)));
+        }
+
+        paths
+    };
+
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            let result = validate_install_dir_inner(&candidate.to_string_lossy());
+            if result.valid {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
+#[tauri::command]
+fn auto_detect_install_dir() -> Result<Option<String>, String> {
+    Ok(auto_detect_install_dir_inner())
 }
 
 #[tauri::command]
@@ -770,15 +832,68 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
     // exclusive lock on open files (ERROR_SHARING_VIOLATION / os error 32)
     drop(file);
 
-    // Emit complete before spawning
+    // Emit installing phase
     let _ = app.emit("installer:progress", InstallerProgress {
-        bytes_downloaded, total_bytes, phase: "complete".into(),
+        bytes_downloaded, total_bytes, phase: "installing".into(),
     });
 
-    // Spawn the installer
-    std::process::Command::new(&dest)
-        .spawn()
+    // Run the installer silently (/S = silent for NSIS installers) and wait for it to finish.
+    // This keeps the user in our launcher instead of the Funcom installer UI.
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&dest)
+            .arg("/S")
+            .status()
+    })
+    .await
+    .map_err(|e| format!("Installer task panicked: {}", e))?
+    .map_err(|e| format!("Failed to launch installer: {}", e))?;
+
+    if !status.success() {
+        // Silent install failed — might not support /S. Fall back to normal launch.
+        let dest_fallback = std::env::temp_dir().join("TheSecretWorldInstaller.exe");
+        let _ = app.emit("installer:progress", InstallerProgress {
+            bytes_downloaded, total_bytes, phase: "installing".into(),
+        });
+        let status2 = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(&dest_fallback)
+                .status()
+        })
+        .await
+        .map_err(|e| format!("Installer task panicked: {}", e))?
         .map_err(|e| format!("Failed to launch installer: {}", e))?;
+
+        if !status2.success() {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded, total_bytes, phase: "error".into(),
+            });
+            return Err(format!("Installer exited with code {:?}", status2.code()));
+        }
+    }
+
+    // Kill ClientPatcher.exe if the installer auto-launched it — we handle patching ourselves.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = tokio::task::spawn_blocking(|| {
+            // Give it a moment to spawn
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", "ClientPatcher.exe"])
+                .output();
+        }).await;
+    }
+
+    // Try to auto-detect the install path
+    let detected_path = auto_detect_install_dir_inner();
+
+    // Emit complete with detected path
+    let _ = app.emit("installer:progress", InstallerProgress {
+        bytes_downloaded, total_bytes,
+        phase: if let Some(ref p) = detected_path {
+            format!("complete:{}", p)
+        } else {
+            "complete".into()
+        },
+    });
 
     Ok(())
 }
@@ -894,6 +1009,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             validate_install_dir,
+            auto_detect_install_dir,
             launch_game,
             authenticate,
             check_for_updates_cmd,
@@ -1004,6 +1120,22 @@ mod tests {
             "Should mention SWL, got: {}",
             result.message
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fresh_install_no_executables() {
+        // After Funcom installer runs but before patching: LocalConfig.xml + RDB/ exist, no .exe
+        let tmp = std::env::temp_dir().join("tsw_test_fresh_install");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("RDB")).unwrap();
+        fs::write(tmp.join("LocalConfig.xml"), b"<config/>").unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(result.valid, "Fresh install should be valid, got: {}", result.message);
+        assert!(result.message.contains("Fresh") || result.message.contains("patching"),
+            "Should indicate fresh install state, got: {}", result.message);
 
         let _ = fs::remove_dir_all(&tmp);
     }
