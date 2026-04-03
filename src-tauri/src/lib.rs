@@ -851,6 +851,10 @@ async fn download_installer(app: tauri::AppHandle, install_dir: Option<String>) 
 
     let install_target = install_dir.unwrap_or_else(|| r"C:\Program Files (x86)\Funcom\The Secret World".to_string());
 
+    // Use the install_target the user chose — we told the installer to put files there.
+    // Fall back to auto-detect only if that path doesn't validate (shouldn't happen).
+    let target_for_result = install_target.clone();
+
     // Elevate our own executable with --install flag. This makes the UAC dialog
     // show "TSW Modern Launcher" instead of "Windows Command Processor".
     // The elevated child process runs the installer silently and kills ClientPatcher.
@@ -895,8 +899,16 @@ async fn download_installer(app: tauri::AppHandle, install_dir: Option<String>) 
         }
     }
 
-    // Try to auto-detect the install path
-    let detected_path = auto_detect_install_dir_inner();
+    // Use the install target path — we told the installer to put files there.
+    // Validate it; fall back to auto-detect if somehow invalid.
+    let detected_path = {
+        let result = validate_install_dir_inner(&target_for_result);
+        if result.valid {
+            Some(target_for_result)
+        } else {
+            auto_detect_install_dir_inner()
+        }
+    };
 
     // Emit complete with detected path
     let _ = app.emit("installer:progress", InstallerProgress {
