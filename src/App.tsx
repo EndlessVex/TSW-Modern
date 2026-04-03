@@ -68,22 +68,6 @@ function App() {
     };
   }, []);
 
-  // Listen for installer:progress events
-  useEffect(() => {
-    const unlisten = listen<{ bytes_downloaded: number; total_bytes: number; phase: string }>("installer:progress", (event) => {
-      const { bytes_downloaded, total_bytes, phase } = event.payload;
-      setInstallerProgress({ bytes_downloaded, total_bytes });
-      setInstallerPhase(phase);
-      if (phase === "complete" || phase === "error") {
-        setInstallerDownloading(false);
-      }
-    });
-
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
   const validatePath = useCallback(async (path: string) => {
     try {
       const result = await invoke<InstallValidation>("validate_install_dir", { path });
@@ -111,6 +95,57 @@ function App() {
     }
   }, []);
 
+  // Listen for installer:progress events
+  useEffect(() => {
+    const unlisten = listen<{ bytes_downloaded: number; total_bytes: number; phase: string }>("installer:progress", async (event) => {
+      const { bytes_downloaded, total_bytes, phase } = event.payload;
+      setInstallerProgress({ bytes_downloaded, total_bytes });
+
+      if (phase === "installing") {
+        setInstallerPhase("installing");
+      } else if (phase.startsWith("complete:")) {
+        // Installer finished and auto-detected install path
+        const detectedPath = phase.substring("complete:".length);
+        setInstallerPhase("complete");
+        setInstallerDownloading(false);
+        setInstallPath(detectedPath);
+        await store.set("install_path", detectedPath);
+        await store.save();
+        const result = await validatePath(detectedPath);
+        if (result?.valid) {
+          await checkForUpdates(detectedPath);
+        }
+      } else if (phase === "complete") {
+        setInstallerPhase("complete");
+        setInstallerDownloading(false);
+        // No path detected — try auto-detect ourselves
+        try {
+          const detected = await invoke<string | null>("auto_detect_install_dir");
+          if (detected) {
+            setInstallPath(detected);
+            await store.set("install_path", detected);
+            await store.save();
+            const result = await validatePath(detected);
+            if (result?.valid) {
+              await checkForUpdates(detected);
+            }
+          }
+        } catch {
+          // User will need to browse manually
+        }
+      } else if (phase === "error") {
+        setInstallerPhase("error");
+        setInstallerDownloading(false);
+      } else {
+        setInstallerPhase(phase);
+      }
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [validatePath, checkForUpdates]);
+
   // Load saved settings on startup
   useEffect(() => {
     async function loadSettings() {
@@ -122,11 +157,27 @@ function App() {
           setDxVersion(savedDx);
         }
 
-        if (savedPath) {
-          setInstallPath(savedPath);
-          const result = await validatePath(savedPath);
+        let pathToUse = savedPath;
+
+        // If no saved path, try auto-detection
+        if (!pathToUse) {
+          try {
+            const detected = await invoke<string | null>("auto_detect_install_dir");
+            if (detected) {
+              pathToUse = detected;
+              await store.set("install_path", detected);
+              await store.save();
+            }
+          } catch {
+            // Auto-detect failed silently — user can still browse manually
+          }
+        }
+
+        if (pathToUse) {
+          setInstallPath(pathToUse);
+          const result = await validatePath(pathToUse);
           if (result?.valid) {
-            await checkForUpdates(savedPath);
+            await checkForUpdates(pathToUse);
           }
         }
 

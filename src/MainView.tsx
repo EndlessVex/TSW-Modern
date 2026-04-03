@@ -121,7 +121,14 @@ export default function MainView({
           {installerPhase === "complete" ? (
             <div className="installer-complete">
               <span className="validation-icon">✓</span>
-              <span>Installer launched! After installation completes, click Browse above to select your install directory.</span>
+              <span>Installation complete! {installPath ? "Install directory detected automatically." : "Click Browse above to select your install directory."}</span>
+            </div>
+          ) : installerPhase === "installing" ? (
+            <div className="installer-progress">
+              <div className="patch-phase">Installing The Secret World…</div>
+              <div className="progress-stats">
+                <span className="progress-pct">Please wait — this may take a few minutes</span>
+              </div>
             </div>
           ) : installerPhase === "error" ? (
             <div className="installer-error">
