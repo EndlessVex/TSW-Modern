@@ -84,27 +84,6 @@ export default function MainView({
 
   return (
     <>
-      {/* Install Directory Section — only shown when a valid install is detected */}
-      {isValid && (
-        <section className="section">
-          <label className="section-label">Install Directory</label>
-          <div className="path-row">
-            <span className="path-display">
-              {installPath}
-            </span>
-            <button className="btn btn-secondary" onClick={onSelectDirectory}>
-              Change
-            </button>
-          </div>
-          <div className="validation validation-ok">
-            <span className="validation-icon">✓</span>
-            <span>
-              {validationResult?.version ?? "TSW"} —{" "}
-              {validationResult?.rdb_count ?? 0} RDB files
-            </span>
-          </div>
-        </section>
-      )}
 
       {/* Fresh Install Section — shown when no valid install detected */}
       {!isValid && (
@@ -196,11 +175,12 @@ export default function MainView({
           {!checkingUpdates && needsUpdate && !patching && (
             <div className="patch-status patch-status-update">
               <span>
-                {patchStatus.files_to_download} files need updating
-                ({formatBytesSimple(patchStatus.total_bytes)})
+                {patchStatus.files_to_download > 0
+                  ? `${patchStatus.files_to_download} files need updating (${formatBytesSimple(patchStatus.total_bytes)})`
+                  : "Game files need to be downloaded"}
               </span>
               <button className="btn btn-update" onClick={onStartPatching}>
-                Update
+                {patchStatus.files_to_download > 0 ? "Update" : "Download Game Files"}
               </button>
             </div>
           )}

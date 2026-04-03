@@ -9,7 +9,7 @@ export interface DownloadProgress {
   files_total: number;
   speed_bps: number;
   current_file: string;
-  phase: "checking" | "downloading" | "complete" | "error" | "repairing";
+  phase: "checking" | "downloading" | "complete" | "error" | "repairing" | "bootstrapping";
   failed_files: number;
 }
 
@@ -78,6 +78,7 @@ export default function PatchProgress() {
     <div className="patch-progress">
       <div className="patch-phase">
         {phase === "checking" && "Checking for updates…"}
+        {phase === "bootstrapping" && "Downloading patch index…"}
         {phase === "downloading" && "Downloading updates…"}
         {phase === "complete" && "✓ Update complete"}
         {phase === "error" && "✗ Update failed"}
