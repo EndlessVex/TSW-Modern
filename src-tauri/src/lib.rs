@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use download::{
     check_for_updates as check_updates_inner, create_client, compute_download_plan,
     run_downloads, DownloadConfig, DownloadManifest, PatchStatus,
