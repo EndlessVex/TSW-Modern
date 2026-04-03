@@ -284,10 +284,10 @@ export default function MainView({
       <section className="section">
         <button
           className="btn btn-launch"
-          disabled={!isValid || launching || patching || verifying || repairing}
+          disabled={!isValid || launching || patching || verifying || repairing || needsUpdate}
           onClick={onLaunch}
         >
-          {launching ? "Launching…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : "Launch Game"}
+          {launching ? "Launching…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : needsUpdate ? "Update Required" : "Launch Game"}
         </button>
       </section>
 
