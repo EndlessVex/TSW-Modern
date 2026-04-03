@@ -837,11 +837,12 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
         bytes_downloaded, total_bytes, phase: "installing".into(),
     });
 
-    // Run the installer silently (/S = silent for NSIS installers) and wait for it to finish.
-    // This keeps the user in our launcher instead of the Funcom installer UI.
+    // Run the installer and wait for it to finish.
+    // The Funcom installer is not NSIS — /S silent flag has no effect.
+    // The user clicks through the installer wizard; we wait for the process to exit.
+    let dest_clone = dest.clone();
     let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&dest)
-            .arg("/S")
+        std::process::Command::new(&dest_clone)
             .status()
     })
     .await
@@ -849,36 +850,29 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
     .map_err(|e| format!("Failed to launch installer: {}", e))?;
 
     if !status.success() {
-        // Silent install failed — might not support /S. Fall back to normal launch.
-        let dest_fallback = std::env::temp_dir().join("TheSecretWorldInstaller.exe");
         let _ = app.emit("installer:progress", InstallerProgress {
-            bytes_downloaded, total_bytes, phase: "installing".into(),
+            bytes_downloaded, total_bytes, phase: "error".into(),
         });
-        let status2 = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&dest_fallback)
-                .status()
-        })
-        .await
-        .map_err(|e| format!("Installer task panicked: {}", e))?
-        .map_err(|e| format!("Failed to launch installer: {}", e))?;
-
-        if !status2.success() {
-            let _ = app.emit("installer:progress", InstallerProgress {
-                bytes_downloaded, total_bytes, phase: "error".into(),
-            });
-            return Err(format!("Installer exited with code {:?}", status2.code()));
-        }
+        return Err(format!("Installer exited with code {:?}", status.code()));
     }
 
-    // Kill ClientPatcher.exe if the installer auto-launched it — we handle patching ourselves.
+    // Kill ClientPatcher.exe if the installer auto-launched it.
+    // The Funcom installer spawns ClientPatcher as a child process on finish.
+    // We poll-kill for up to 10 seconds to catch it even if it spawns slowly.
     #[cfg(target_os = "windows")]
     {
         let _ = tokio::task::spawn_blocking(|| {
-            // Give it a moment to spawn
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", "ClientPatcher.exe"])
-                .output();
+            for _ in 0..10 {
+                let output = std::process::Command::new("taskkill")
+                    .args(["/F", "/IM", "ClientPatcher.exe"])
+                    .output();
+                if let Ok(out) = output {
+                    if out.status.success() {
+                        break; // Killed it
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         }).await;
     }
 
