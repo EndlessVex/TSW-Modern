@@ -452,40 +452,62 @@ pub fn compute_download_plan_from_hash_index(
 
 // ─── Speed tracking ──────────────────────────────────────────────────────────
 
-/// Rolling window speed calculator. Keeps the last N samples to smooth speed display.
+/// Rolling window speed calculator using time-bucketed byte counts.
+/// More stable than per-file samples — records bytes every time they're written,
+/// not just when files complete. Produces smooth speed readings even for tiny files.
 struct SpeedTracker {
-    samples: Vec<(Instant, u64)>,
+    /// (timestamp, cumulative_bytes) snapshots taken periodically
+    snapshots: Vec<(Instant, u64)>,
+    /// Window duration for speed calculation
     window: Duration,
 }
 
 impl SpeedTracker {
     fn new(window: Duration) -> Self {
         Self {
-            samples: Vec::new(),
+            snapshots: Vec::new(),
             window,
         }
     }
 
-    fn record(&mut self, bytes: u64) {
+    fn record(&mut self, cumulative_bytes: u64) {
         let now = Instant::now();
-        self.samples.push((now, bytes));
-        // Prune old samples
-        let cutoff = now - self.window;
-        self.samples.retain(|(t, _)| *t >= cutoff);
+        // Only keep one snapshot per 200ms to avoid memory bloat
+        if let Some(last) = self.snapshots.last() {
+            if now.duration_since(last.0) < Duration::from_millis(200) {
+                // Update the last snapshot's byte count instead of adding new
+                if let Some(last_mut) = self.snapshots.last_mut() {
+                    last_mut.1 = cumulative_bytes;
+                }
+                return;
+            }
+        }
+        self.snapshots.push((now, cumulative_bytes));
+        // Prune old snapshots
+        let cutoff = now - self.window - Duration::from_secs(1);
+        self.snapshots.retain(|(t, _)| *t >= cutoff);
     }
 
     fn speed_bps(&self) -> u64 {
-        if self.samples.len() < 2 {
+        if self.snapshots.len() < 2 {
             return 0;
         }
-        let first = self.samples.first().unwrap();
-        let last = self.samples.last().unwrap();
-        let elapsed = last.0.duration_since(first.0).as_secs_f64();
-        if elapsed < 0.001 {
-            return 0;
+        // Calculate speed over the last `window` duration
+        let now = self.snapshots.last().unwrap().0;
+        let cutoff = now - self.window;
+        // Find the earliest snapshot within the window
+        let earliest = self.snapshots.iter().find(|(t, _)| *t >= cutoff);
+        let latest = self.snapshots.last().unwrap();
+        if let Some(earliest) = earliest {
+            let elapsed = latest.0.duration_since(earliest.0).as_secs_f64();
+            if elapsed < 0.5 {
+                return 0;
+            }
+            let bytes_delta = latest.1.saturating_sub(earliest.1);
+            (bytes_delta as f64 / elapsed) as u64
+        } else {
+            0
         }
-        let total_bytes: u64 = self.samples.iter().map(|(_, b)| b).sum();
-        (total_bytes as f64 / elapsed) as u64
     }
 }
 
@@ -536,7 +558,7 @@ pub async fn run_downloads(
     let bytes_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let failed_files = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let speed_tracker = Arc::new(Mutex::new(SpeedTracker::new(Duration::from_secs(5))));
+    let speed_tracker = Arc::new(Mutex::new(SpeedTracker::new(Duration::from_secs(15))));
 
     // Emit initial progress
     let _ = app_handle.emit(
@@ -626,18 +648,21 @@ pub async fn run_downloads(
 
                         {
                             let mut t = tracker.lock().await;
-                            t.record(bytes_written);
+                            t.record(new_total);
                         }
                         let speed = {
                             let t = tracker.lock().await;
                             t.speed_bps()
                         };
 
-                        // Update manifest
+                        // Update manifest — save every 50 files instead of every file
+                        // to reduce disk I/O overhead with 650K small files
                         {
                             let mut m = manifest.lock().await;
                             m.files.insert(task.hash_hex.clone(), FileState::Complete);
-                            let _ = m.save(&staging_dir);
+                            if completed % 50 == 0 || completed == files_total_val {
+                                let _ = m.save(&staging_dir);
+                            }
                         }
 
                         let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
