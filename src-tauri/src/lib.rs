@@ -1026,6 +1026,95 @@ async fn get_bundle_mode(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Query the system for available display resolutions.
+/// On Windows, uses EnumDisplaySettingsW to get actual monitor modes.
+/// Returns deduplicated, sorted list of "WIDTHxHEIGHT" strings.
+#[tauri::command]
+fn get_display_modes() -> Vec<String> {
+    let mut modes: Vec<String> = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem;
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct DEVMODEW {
+            dmDeviceName: [u16; 32],
+            dmSpecVersion: u16,
+            dmDriverVersion: u16,
+            dmSize: u16,
+            dmDriverExtra: u16,
+            dmFields: u32,
+            // Union: position/display
+            dmPosition_x: i32,
+            dmPosition_y: i32,
+            dmDisplayOrientation: u32,
+            dmDisplayFixedOutput: u32,
+            dmColor: i16,
+            dmDuplex: i16,
+            dmYResolution: i16,
+            dmTTOption: i16,
+            dmCollate: i16,
+            dmFormName: [u16; 32],
+            dmLogPixels: u16,
+            dmBitsPerPel: u32,
+            dmPelsWidth: u32,
+            dmPelsHeight: u32,
+            dmDisplayFlags: u32,
+            dmDisplayFrequency: u32,
+            // ... remaining fields not needed
+            _pad: [u8; 128],
+        }
+
+        extern "system" {
+            fn EnumDisplaySettingsW(
+                lpszDeviceName: *const u16,
+                iModeNum: u32,
+                lpDevMode: *mut DEVMODEW,
+            ) -> i32;
+        }
+
+        let mut i = 0u32;
+        loop {
+            let mut dm: DEVMODEW = unsafe { mem::zeroed() };
+            dm.dmSize = mem::size_of::<DEVMODEW>() as u16;
+            let result = unsafe { EnumDisplaySettingsW(std::ptr::null(), i, &mut dm) };
+            if result == 0 {
+                break;
+            }
+            // Only include modes with at least 32-bit color and reasonable size
+            if dm.dmBitsPerPel >= 32 && dm.dmPelsWidth >= 800 && dm.dmPelsHeight >= 600 {
+                modes.push(format!("{}x{}", dm.dmPelsWidth, dm.dmPelsHeight));
+            }
+            i += 1;
+        }
+    }
+
+    // Deduplicate and sort by width then height
+    modes.sort_by(|a, b| {
+        let parse = |s: &str| -> (u32, u32) {
+            let parts: Vec<&str> = s.split('x').collect();
+            let w = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+            let h = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+            (w, h)
+        };
+        parse(a).cmp(&parse(b))
+    });
+    modes.dedup();
+
+    // Fallback if detection returned nothing (non-Windows or no modes found)
+    if modes.is_empty() {
+        modes = vec![
+            "800x600", "1024x768", "1280x720", "1280x800", "1280x1024",
+            "1366x768", "1440x900", "1600x900", "1680x1050", "1920x1080",
+            "2560x1440", "3840x2160",
+        ].into_iter().map(String::from).collect();
+    }
+
+    modes
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1047,7 +1136,8 @@ pub fn run() {
             set_bundle_mode,
             get_bundle_mode,
             fetch_news,
-            download_installer
+            download_installer,
+            get_display_modes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
