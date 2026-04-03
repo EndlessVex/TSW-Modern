@@ -1,3 +1,4 @@
+pub mod client_files;
 pub mod config;
 pub mod download;
 pub mod rdb;
@@ -310,6 +311,162 @@ fn get_patch_status_cmd() -> Result<PatchStatus, String> {
             .ok_or_else(|| "No patch status cached. Run check_for_updates first.".to_string()),
         Err(e) => Err(format!("Failed to read cache: {}", e)),
     }
+}
+
+/// Full install: write static files + download client files + download RDB resources.
+/// This replaces the Funcom installer + ClientPatcher entirely.
+#[tauri::command]
+async fn start_full_install(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
+    use tauri::Emitter;
+
+    // Prevent concurrent patching
+    {
+        let mut in_progress = PATCHING_IN_PROGRESS.lock().map_err(|e| e.to_string())?;
+        if *in_progress {
+            return Err("Installation is already in progress.".to_string());
+        }
+        *in_progress = true;
+    }
+
+    PATCH_PAUSED.store(false, Ordering::Relaxed);
+    PATCH_CANCEL.store(false, Ordering::Relaxed);
+
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result = run_full_install_inner(&app_clone, &install_path).await;
+
+        if let Ok(mut in_progress) = PATCHING_IN_PROGRESS.lock() {
+            *in_progress = false;
+        }
+
+        if let Err(e) = result {
+            use tauri::Emitter;
+            let _ = app_clone.emit(
+                "patch:progress",
+                &download::DownloadProgress {
+                    bytes_downloaded: 0,
+                    total_bytes: 0,
+                    files_completed: 0,
+                    files_total: 0,
+                    speed_bps: 0,
+                    current_file: format!("Error: {}", e),
+                    phase: "error".into(),
+                    failed_files: 0,
+                },
+            );
+            log::error!("Full install failed: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
+async fn run_full_install_inner(
+    app: &tauri::AppHandle,
+    install_path: &str,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let base = std::path::PathBuf::from(install_path);
+
+    // Ensure install directory exists
+    std::fs::create_dir_all(&base)
+        .map_err(|e| format!("Failed to create install directory: {}", e))?;
+
+    // Phase 1: Write static files (LocalConfig.xml, LanguagePrefs.xml, RDB/ dir)
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Preparing install directory...".into(),
+            phase: "checking".into(), failed_files: 0,
+        },
+    );
+    client_files::write_static_files(&base)?;
+
+    // Parse CDN config from the LocalConfig.xml we just wrote
+    let patch_config =
+        config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
+    let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
+
+    // Phase 2: Download client files (exe, dll, Data/) via /client/ path
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Downloading game files...".into(),
+            phase: "bootstrapping".into(), failed_files: 0,
+        },
+    );
+    client_files::download_client_files(
+        app, &cdn_base_url, &base, &PATCH_PAUSED, &PATCH_CANCEL,
+    )
+    .await?;
+
+    if PATCH_CANCEL.load(Ordering::Relaxed) {
+        return Err("Installation cancelled by user".into());
+    }
+
+    // Phase 3: Download RDBHashIndex.bin
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Downloading patch index...".into(),
+            phase: "bootstrapping".into(), failed_files: 0,
+        },
+    );
+
+    let rdb_dir = base.join("RDB");
+    std::fs::create_dir_all(&rdb_dir)
+        .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
+
+    let hash_idx_path = rdb_dir.join("RDBHashIndex.bin");
+    if !hash_idx_path.exists() {
+        let patch_info_url = format!("{}/PatchInfoClient.txt", patch_config.patch_base_url());
+        let dl_config = download::DownloadConfig::default();
+        let client = download::create_client(&dl_config).map_err(|e| e.to_string())?;
+
+        let patch_info_text = client.get(&patch_info_url)
+            .send().await.map_err(|e| format!("PatchInfoClient.txt: {}", e))?
+            .text().await.map_err(|e| format!("PatchInfoClient.txt read: {}", e))?;
+
+        let rdb_hash = patch_info_text.lines()
+            .find(|l| l.starts_with("RDBHash="))
+            .and_then(|l| l.strip_prefix("RDBHash="))
+            .ok_or("RDBHash not found in PatchInfoClient.txt")?
+            .to_string();
+
+        let hash_idx_url = format!("{}/rdb/full/{}", cdn_base_url.trim_end_matches('/'), rdb_hash);
+        let response = client.get(&hash_idx_url)
+            .send().await.map_err(|e| format!("RDBHashIndex.bin: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("CDN returned {} for RDBHashIndex.bin", response.status()));
+        }
+
+        let hash_idx_bytes = response.bytes().await
+            .map_err(|e| format!("RDBHashIndex.bin read: {}", e))?;
+
+        let final_bytes = if hash_idx_bytes.len() > 4 && &hash_idx_bytes[..4] == b"IOz1" {
+            verify::decompress_ioz1(&hash_idx_bytes)?
+        } else {
+            hash_idx_bytes.to_vec()
+        };
+
+        tokio::fs::write(&hash_idx_path, &final_bytes).await
+            .map_err(|e| format!("Write RDBHashIndex.bin: {}", e))?;
+    }
+
+    if PATCH_CANCEL.load(Ordering::Relaxed) {
+        return Err("Installation cancelled by user".into());
+    }
+
+    // Phase 4: Download RDB resources — delegate to existing patching logic
+    run_patching_inner(app, install_path).await
 }
 
 #[tauri::command]
@@ -1238,6 +1395,7 @@ pub fn run() {
             check_for_updates_cmd,
             get_patch_status_cmd,
             start_patching,
+            start_full_install,
             pause_patching,
             resume_patching,
             cancel_patching,

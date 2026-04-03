@@ -43,3 +43,13 @@ The Secret World/
 coverage/
 .cache/
 tmp/
+
+# Test/research artifacts
+test_full_download/
+bench_staging/
+*.json
+!package.json
+!tsconfig.json
+!tsconfig.node.json
+!src-tauri/tauri.conf.json
+interceptor_output.txt
