@@ -84,43 +84,32 @@ export default function MainView({
 
   return (
     <>
-      {/* Install Directory Section */}
-      <section className="section">
-        <label className="section-label">Install Directory</label>
-        <div className="path-row">
-          <span className="path-display">
-            {installPath ?? "No directory selected"}
-          </span>
-          <button className="btn btn-secondary" onClick={onSelectDirectory}>
-            Browse…
-          </button>
-        </div>
-
-        {/* Validation Status */}
-        {validationResult && (
-          <div className={`validation ${isValid ? "validation-ok" : "validation-err"}`}>
-            {isValid ? (
-              <>
-                <span className="validation-icon">✓</span>
-                <span>
-                  {validationResult.version ?? "TSW"} —{" "}
-                  {validationResult.rdb_count} RDB files
-                </span>
-              </>
-            ) : (
-              <>
-                <span className="validation-icon">✗</span>
-                <span>{validationResult.message}</span>
-              </>
-            )}
+      {/* Install Directory Section — only shown when a valid install is detected */}
+      {isValid && (
+        <section className="section">
+          <label className="section-label">Install Directory</label>
+          <div className="path-row">
+            <span className="path-display">
+              {installPath}
+            </span>
+            <button className="btn btn-secondary" onClick={onSelectDirectory}>
+              Change
+            </button>
           </div>
-        )}
-      </section>
+          <div className="validation validation-ok">
+            <span className="validation-icon">✓</span>
+            <span>
+              {validationResult?.version ?? "TSW"} —{" "}
+              {validationResult?.rdb_count ?? 0} RDB files
+            </span>
+          </div>
+        </section>
+      )}
 
       {/* Fresh Install Section — shown when no valid install detected */}
       {!isValid && (
         <section className="section fresh-install-section">
-          <label className="section-label">Don't have The Secret World installed?</label>
+          <label className="section-label">Get Started</label>
 
           {installerPhase === "complete" ? (
             <div className="installer-complete">
@@ -174,6 +163,12 @@ export default function MainView({
               </div>
               <button className="btn btn-install" onClick={onDownloadInstaller}>
                 Download &amp; Install TSW
+              </button>
+              <div className="fresh-install-divider">
+                <span>or</span>
+              </div>
+              <button className="btn btn-secondary" onClick={onSelectDirectory}>
+                I already have the game installed
               </button>
             </div>
           )}

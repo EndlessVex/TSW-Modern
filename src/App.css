@@ -559,6 +559,23 @@ body {
   font-size: 0.75rem;
 }
 
+.fresh-install-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.25rem 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.fresh-install-divider::before,
+.fresh-install-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
 .btn-install {
   width: 100%;
   padding: 0.65rem 1rem;
