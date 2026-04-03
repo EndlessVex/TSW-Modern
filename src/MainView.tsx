@@ -21,8 +21,10 @@ interface MainViewProps {
   installerDownloading: boolean;
   installerProgress: { bytes_downloaded: number; total_bytes: number } | null;
   installerPhase: string | null;
+  freshInstallDir: string;
   onSelectDirectory: () => void;
   onDownloadInstaller: () => void;
+  onChooseFreshInstallDir: () => void;
   onStartPatching: () => void;
   onCheckForUpdates: () => void;
   onStartVerification: () => void;
@@ -61,8 +63,10 @@ export default function MainView({
   installerDownloading,
   installerProgress,
   installerPhase,
+  freshInstallDir,
   onSelectDirectory,
   onDownloadInstaller,
+  onChooseFreshInstallDir,
   onStartPatching,
   onCheckForUpdates,
   onStartVerification,
@@ -160,9 +164,18 @@ export default function MainView({
               )}
             </div>
           ) : (
-            <button className="btn btn-install" onClick={onDownloadInstaller}>
-              Download &amp; Install TSW
-            </button>
+            <div className="fresh-install-controls">
+              <div className="fresh-install-dir">
+                <span className="fresh-install-dir-label">Install to:</span>
+                <span className="fresh-install-dir-path">{freshInstallDir}</span>
+                <button className="btn btn-secondary btn-small" onClick={onChooseFreshInstallDir}>
+                  Change
+                </button>
+              </div>
+              <button className="btn btn-install" onClick={onDownloadInstaller}>
+                Download &amp; Install TSW
+              </button>
+            </div>
           )}
         </section>
       )}

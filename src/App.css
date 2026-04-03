@@ -522,6 +522,43 @@ body {
   padding: 0.75rem;
 }
 
+.fresh-install-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.fresh-install-dir {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.fresh-install-dir-label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.fresh-install-dir-path {
+  flex: 1;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: monospace;
+  font-size: 0.8rem;
+  background: var(--bg-main);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.btn-small {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+}
+
 .btn-install {
   width: 100%;
   padding: 0.65rem 1rem;
