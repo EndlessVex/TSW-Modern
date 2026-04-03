@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /** Matches the Rust DownloadProgress struct from download.rs */
@@ -50,6 +51,7 @@ function formatEta(bytesRemaining: number, speedBps: number): string {
 
 export default function PatchProgress() {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [paused, setPaused] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<DownloadProgress>("patch:progress", (event) => {
@@ -60,6 +62,21 @@ export default function PatchProgress() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  async function handlePauseResume() {
+    if (paused) {
+      await invoke("resume_patching");
+      setPaused(false);
+    } else {
+      await invoke("pause_patching");
+      setPaused(true);
+    }
+  }
+
+  async function handleCancel() {
+    await invoke("cancel_patching");
+    setPaused(false);
+  }
 
   if (!progress) {
     return null;
@@ -116,6 +133,17 @@ export default function PatchProgress() {
           {failed_files > 0 && (
             <div className="progress-failed">
               {failed_files} file{failed_files !== 1 ? "s" : ""} failed
+            </div>
+          )}
+
+          {phase === "downloading" && (
+            <div className="progress-controls">
+              <button className="btn btn-secondary btn-small" onClick={handlePauseResume}>
+                {paused ? "▶ Resume" : "⏸ Pause"}
+              </button>
+              <button className="btn btn-secondary btn-small btn-cancel" onClick={handleCancel}>
+                ✕ Cancel
+              </button>
             </div>
           )}
         </>
