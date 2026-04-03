@@ -409,6 +409,46 @@ pub fn compute_download_plan(
     tasks
 }
 
+/// Compute download plan from hash index alone (no le.idx needed).
+/// Used for fresh installs where le.idx doesn't exist yet.
+/// The hash index contains all the same data: type, id, hash, file_num, offset, length.
+pub fn compute_download_plan_from_hash_index(
+    hash_index: &RdbHashIndex,
+    cdn_base_url: &str,
+    staging_dir: &Path,
+    manifest: &DownloadManifest,
+) -> Vec<DownloadTask> {
+    let mut tasks = Vec::new();
+
+    for ((_rdb_type, _id), entry) in &hash_index.entries {
+        let hash_hex = hex_encode(&entry.hash);
+
+        // Skip already-completed files
+        if matches!(manifest.files.get(&hash_hex), Some(FileState::Complete)) {
+            continue;
+        }
+
+        let url = cdn_url_from_hash(cdn_base_url, &entry.hash);
+        let dest_path = staging_dir.join(&hash_hex[..2]).join(&hash_hex);
+        let partial_bytes = manifest.partial_bytes(&hash_hex);
+
+        tasks.push(DownloadTask {
+            url,
+            dest_path,
+            expected_hash: entry.hash,
+            expected_size: entry.file_size as u64,
+            partial_bytes,
+            hash_hex,
+        });
+    }
+
+    // Deduplicate by hash
+    tasks.sort_by(|a, b| a.hash_hex.cmp(&b.hash_hex));
+    tasks.dedup_by(|a, b| a.hash_hex == b.hash_hex);
+
+    tasks
+}
+
 // ─── Speed tracking ──────────────────────────────────────────────────────────
 
 /// Rolling window speed calculator. Keeps the last N samples to smooth speed display.

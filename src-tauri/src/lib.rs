@@ -274,6 +274,20 @@ fn launch_game(install_path: String, dx_version: String, login_key: Option<Strin
 #[tauri::command]
 async fn check_for_updates_cmd(install_path: String) -> Result<PatchStatus, String> {
     let path = std::path::PathBuf::from(&install_path);
+
+    // If RDB/le.idx doesn't exist, this is a fresh install that needs a full patch.
+    // We can't compute exact file counts without the index files, but we know it needs updating.
+    let le_idx_path = path.join("RDB").join("le.idx");
+    if !le_idx_path.exists() {
+        let status = PatchStatus {
+            up_to_date: false,
+            files_to_download: 0, // Unknown until index files are downloaded
+            total_bytes: 0,
+        };
+        *PATCH_STATUS_CACHE.lock().map_err(|e| e.to_string())? = Some(status.clone());
+        return Ok(status);
+    }
+
     let status = check_updates_inner(&path).map_err(|e| e.to_string())?;
 
     // Cache the result
@@ -364,11 +378,6 @@ async fn run_patching_inner(
     // Parse configs
     let patch_config =
         config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
-    let le_index =
-        rdb::parse_le_index(&base.join("RDB").join("le.idx")).map_err(|e| e.to_string())?;
-    let hash_index =
-        rdb::parse_hash_index(&base.join("RDB").join("RDBHashIndex.bin"))
-            .map_err(|e| e.to_string())?;
 
     // CDN resources use http_patch_addr only (D010)
     let cdn_base_url = &patch_config.http_patch_addr;
@@ -376,8 +385,78 @@ async fn run_patching_inner(
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("Failed to create staging dir: {}", e))?;
 
+    // Ensure RDB directory exists
+    let rdb_dir = base.join("RDB");
+    std::fs::create_dir_all(&rdb_dir)
+        .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
+
+    let le_idx_path = rdb_dir.join("le.idx");
+    let hash_idx_path = rdb_dir.join("RDBHashIndex.bin");
+
+    // Bootstrap: if RDBHashIndex.bin doesn't exist, download it from CDN
+    if !hash_idx_path.exists() {
+        let _ = app.emit(
+            "patch:progress",
+            &download::DownloadProgress {
+                bytes_downloaded: 0, total_bytes: 0,
+                files_completed: 0, files_total: 0,
+                speed_bps: 0, current_file: "Downloading patch index...".into(),
+                phase: "bootstrapping".into(), failed_files: 0,
+            },
+        );
+
+        // Download PatchInfoClient.txt to get RDBHash
+        let patch_info_url = format!("{}/PatchInfoClient.txt", patch_config.patch_base_url());
+        let dl_config = download::DownloadConfig::default();
+        let client = download::create_client(&dl_config).map_err(|e| e.to_string())?;
+
+        let patch_info_text = client.get(&patch_info_url)
+            .send().await.map_err(|e| format!("Failed to download PatchInfoClient.txt: {}", e))?
+            .text().await.map_err(|e| format!("Failed to read PatchInfoClient.txt: {}", e))?;
+
+        // Parse RDBHash from PatchInfoClient.txt
+        let rdb_hash = patch_info_text.lines()
+            .find(|l| l.starts_with("RDBHash="))
+            .and_then(|l| l.strip_prefix("RDBHash="))
+            .ok_or("RDBHash not found in PatchInfoClient.txt")?
+            .to_string();
+
+        // Download RDBHashIndex.bin from rdb/full/{RDBHash}
+        let hash_idx_url = format!("{}/rdb/full/{}", cdn_base_url.trim_end_matches('/'), rdb_hash);
+        let response = client.get(&hash_idx_url)
+            .send().await.map_err(|e| format!("Failed to download RDBHashIndex.bin: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("CDN returned {} for RDBHashIndex.bin", response.status()));
+        }
+
+        let hash_idx_bytes = response.bytes().await
+            .map_err(|e| format!("Failed to read RDBHashIndex.bin: {}", e))?;
+
+        // Check if it's IOz1 compressed and decompress if needed
+        let final_bytes = if hash_idx_bytes.len() > 4 && &hash_idx_bytes[..4] == b"IOz1" {
+            verify::decompress_ioz1(&hash_idx_bytes)
+                .map_err(|e| format!("Failed to decompress RDBHashIndex.bin: {}", e))?
+        } else {
+            hash_idx_bytes.to_vec()
+        };
+
+        tokio::fs::write(&hash_idx_path, &final_bytes).await
+            .map_err(|e| format!("Failed to write RDBHashIndex.bin: {}", e))?;
+    }
+
+    // Parse hash index (now guaranteed to exist)
+    let hash_index =
+        rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
+
+    // Compute download plan — use le.idx if available, otherwise hash-index-only
     let manifest = DownloadManifest::load(&staging_dir);
-    let tasks = compute_download_plan(&le_index, &hash_index, cdn_base_url, &staging_dir, &manifest);
+    let tasks = if le_idx_path.exists() {
+        let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
+        compute_download_plan(&le_index, &hash_index, cdn_base_url, &staging_dir, &manifest)
+    } else {
+        download::compute_download_plan_from_hash_index(&hash_index, cdn_base_url, &staging_dir, &manifest)
+    };
 
     if tasks.is_empty() {
         // Already up to date
