@@ -52,10 +52,18 @@ function formatEta(bytesRemaining: number, speedBps: number): string {
 export default function PatchProgress() {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [paused, setPaused] = useState(false);
+  const [smoothedSpeed, setSmoothedSpeed] = useState(0);
 
   useEffect(() => {
     const unlisten = listen<DownloadProgress>("patch:progress", (event) => {
       setProgress(event.payload);
+      // Exponential moving average for speed — smooths ETA display
+      const alpha = 0.15; // Lower = smoother, higher = more responsive
+      setSmoothedSpeed(prev => {
+        const raw = event.payload.speed_bps;
+        if (prev === 0) return raw;
+        return Math.round(alpha * raw + (1 - alpha) * prev);
+      });
     });
 
     return () => {
@@ -82,7 +90,7 @@ export default function PatchProgress() {
     return null;
   }
 
-  const { phase, bytes_downloaded, total_bytes, files_completed, files_total, speed_bps, failed_files } = progress;
+  const { phase, bytes_downloaded, total_bytes, files_completed, files_total, failed_files } = progress;
 
   // Defensive clamp: never exceed 100% even if bytes_downloaded > total_bytes
   const pct = total_bytes > 0
@@ -123,8 +131,8 @@ export default function PatchProgress() {
           </div>
 
           <div className="progress-details">
-            <span className="progress-speed">{formatSpeed(speed_bps)}</span>
-            <span className="progress-eta">ETA: {formatEta(bytesRemaining, speed_bps)}</span>
+            <span className="progress-speed">{formatSpeed(smoothedSpeed)}</span>
+            <span className="progress-eta">ETA: {formatEta(bytesRemaining, smoothedSpeed)}</span>
             <span className="progress-files">
               {files_completed} / {files_total} files
             </span>

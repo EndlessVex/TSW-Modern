@@ -406,8 +406,9 @@ async fn run_patching_inner(
     let patch_config =
         config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
 
-    // CDN resources use http_patch_addr only (D010)
-    let cdn_base_url = &patch_config.http_patch_addr;
+    // Upgrade to HTTPS for HTTP/2 multiplexing — drastically reduces per-request
+    // overhead for 650K small files. The CDN supports HTTP/2 over TLS.
+    let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
     let staging_dir = base.join("staging");
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("Failed to create staging dir: {}", e))?;
@@ -480,9 +481,9 @@ async fn run_patching_inner(
     let manifest = DownloadManifest::load(&staging_dir);
     let tasks = if le_idx_path.exists() {
         let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
-        compute_download_plan(&le_index, &hash_index, cdn_base_url, &staging_dir, &manifest)
+        compute_download_plan(&le_index, &hash_index, &cdn_base_url, &staging_dir, &manifest)
     } else {
-        download::compute_download_plan_from_hash_index(&hash_index, cdn_base_url, &staging_dir, &manifest)
+        download::compute_download_plan_from_hash_index(&hash_index, &cdn_base_url, &staging_dir, &manifest)
     };
 
     if tasks.is_empty() {
@@ -506,7 +507,7 @@ async fn run_patching_inner(
     let dl_config = DownloadConfig {
         cdn_base_url: cdn_base_url.clone(),
         staging_dir: staging_dir.clone(),
-        max_concurrent: 16,
+        max_concurrent: 64,
         ..Default::default()
     };
     let client = create_client(&dl_config).map_err(|e| e.to_string())?;
@@ -685,7 +686,7 @@ async fn run_repair_inner(
     let base = std::path::PathBuf::from(install_path);
     let patch_config =
         config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
-    let cdn_base_url = &patch_config.http_patch_addr;
+    let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
 
     let dl_config = DownloadConfig::default();
     let client = create_client(&dl_config).map_err(|e| e.to_string())?;
@@ -713,7 +714,7 @@ async fn run_repair_inner(
         // Build CDN URL from the expected hash
         let hash_bytes = hash_hex_to_bytes(&entry.expected_hash);
         let url = match hash_bytes {
-            Some(h) => rdb::cdn_url_from_hash(cdn_base_url, &h),
+            Some(h) => rdb::cdn_url_from_hash(&cdn_base_url, &h),
             None => {
                 log::error!(
                     "Invalid hash for type={} id={}: {}",
