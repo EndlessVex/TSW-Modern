@@ -71,6 +71,18 @@ function App() {
     };
   }, []);
 
+  // Listen for client_files:progress events (Phase 2 of full install)
+  useEffect(() => {
+    const unlisten = listen<{ files_completed: number; files_total: number; bytes_downloaded: number; total_bytes: number; phase: string; current_file: string }>("client_files:progress", (event) => {
+      const { phase } = event.payload;
+      setPatchPhase(phase === "downloading" ? "bootstrapping" : phase);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const validatePath = useCallback(async (path: string) => {
     try {
       const result = await invoke<InstallValidation>("validate_install_dir", { path });
@@ -234,17 +246,27 @@ function App() {
   // --- Action handlers passed to MainView ---
 
   async function handleDownloadInstaller() {
-    if (installerDownloading) return;
-    setInstallerDownloading(true);
-    setInstallerPhase("downloading");
-    setInstallerProgress(null);
+    if (patching) return;
+
+    // Set the install path and save it
+    const targetDir = freshInstallDir;
+    setInstallPath(targetDir);
+    await store.set("install_path", targetDir);
+    await store.save();
+
+    // Validate — write_static_files will create LocalConfig.xml
+    // so we'll validate after the install starts
+
+    setPatching(true);
+    setPatchPhase("checking");
+    setInstallerPhase(null);
     setError(null);
     try {
-      await invoke("download_installer", { installDir: freshInstallDir });
+      await invoke("start_full_install", { installPath: targetDir });
     } catch (err) {
-      setError(`Installer download failed: ${err}`);
-      setInstallerDownloading(false);
-      setInstallerPhase("error");
+      setError(`Install failed: ${err}`);
+      setPatching(false);
+      setPatchPhase("error");
     }
   }
 
@@ -311,7 +333,7 @@ function App() {
     setPatchPhase("checking");
     setError(null);
     try {
-      await invoke("start_patching", { installPath });
+      await invoke("start_full_install", { installPath });
     } catch (err) {
       setError(`Patching failed: ${err}`);
       setPatching(false);
