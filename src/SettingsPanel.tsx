@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { store } from "./store";
 
 type DxVersion = "dx9" | "dx11";
@@ -17,15 +18,10 @@ interface SettingsPanelProps {
   onStartVerification: () => void;
 }
 
-const RESOLUTIONS = [
-  "1024x768",
-  "1280x720",
-  "1280x1024",
-  "1366x768",
-  "1600x900",
-  "1920x1080",
-  "2560x1440",
-  "3840x2160",
+const FALLBACK_RESOLUTIONS = [
+  "800x600", "1024x768", "1280x720", "1280x800", "1280x1024",
+  "1366x768", "1440x900", "1600x900", "1680x1050", "1920x1080",
+  "2560x1440", "3840x2160",
 ];
 
 const LANGUAGES = ["English", "French", "German"];
@@ -52,6 +48,22 @@ export default function SettingsPanel({
   const [displayMode, setDisplayMode] = useState("Fullscreen");
   const [enableAudio, setEnableAudio] = useState(true);
   const [enableMusic, setEnableMusic] = useState(true);
+  const [availableResolutions, setAvailableResolutions] = useState<string[]>(FALLBACK_RESOLUTIONS);
+
+  // Query system display modes on mount
+  useEffect(() => {
+    async function loadDisplayModes() {
+      try {
+        const modes = await invoke<string[]>("get_display_modes");
+        if (modes && modes.length > 0) {
+          setAvailableResolutions(modes);
+        }
+      } catch {
+        // Fall back to static list
+      }
+    }
+    loadDisplayModes();
+  }, []);
 
   // Load persisted settings on mount
   useEffect(() => {
@@ -64,7 +76,13 @@ export default function SettingsPanel({
         if (al) setAudioLanguage(al);
 
         const res = await store.get<string>("resolution");
-        if (res) setResolution(res);
+        if (res) {
+          setResolution(res);
+        } else {
+          // Default to current screen resolution
+          const screenRes = `${window.screen.width}x${window.screen.height}`;
+          setResolution(screenRes);
+        }
 
         const dm = await store.get<string>("display_mode");
         if (dm) setDisplayMode(dm);
@@ -286,9 +304,13 @@ export default function SettingsPanel({
                 value={resolution}
                 onChange={(e) => handleResolutionChange(e.target.value)}
               >
-                {RESOLUTIONS.map((r) => (
+                {availableResolutions.map((r) => (
                   <option key={r} value={r}>{r}</option>
                 ))}
+                {/* Include current selection even if not in system list */}
+                {!availableResolutions.includes(resolution) && (
+                  <option key={resolution} value={resolution}>{resolution} (current)</option>
+                )}
               </select>
               <span className="settings-hint">
                 Advisory — the game validates on launch.

@@ -109,17 +109,20 @@ function App() {
       } else if (phase.startsWith("complete:")) {
         // Installer finished and auto-detected install path
         const detectedPath = phase.substring("complete:".length);
-        setInstallerPhase("complete");
         setInstallerDownloading(false);
         setInstallPath(detectedPath);
         await store.set("install_path", detectedPath);
         await store.save();
         const result = await validatePath(detectedPath);
         if (result?.valid) {
+          // Clear installer phase so the fresh install section hides
+          // and the normal install directory section shows
+          setInstallerPhase(null);
           await checkForUpdates(detectedPath);
+        } else {
+          setInstallerPhase("complete");
         }
       } else if (phase === "complete") {
-        setInstallerPhase("complete");
         setInstallerDownloading(false);
         // No path detected — try auto-detect ourselves
         try {
@@ -130,11 +133,16 @@ function App() {
             await store.save();
             const result = await validatePath(detected);
             if (result?.valid) {
+              setInstallerPhase(null);
               await checkForUpdates(detected);
+            } else {
+              setInstallerPhase("complete");
             }
+          } else {
+            setInstallerPhase("complete");
           }
         } catch {
-          // User will need to browse manually
+          setInstallerPhase("complete");
         }
       } else if (phase === "error") {
         setInstallerPhase("error");
