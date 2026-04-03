@@ -43,6 +43,9 @@ function App() {
   const [installerDownloading, setInstallerDownloading] = useState(false);
   const [installerProgress, setInstallerProgress] = useState<{ bytes_downloaded: number; total_bytes: number } | null>(null);
   const [installerPhase, setInstallerPhase] = useState<string | null>(null);
+  const [freshInstallDir, setFreshInstallDir] = useState<string>(
+    "C:\\Program Files (x86)\\Funcom\\The Secret World"
+  );
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; date: string; update: import("@tauri-apps/plugin-updater").Update } | null>(null);
   const [updating, setUpdating] = useState(false);
 
@@ -224,31 +227,31 @@ function App() {
 
   async function handleDownloadInstaller() {
     if (installerDownloading) return;
-
-    // Ask user to pick install directory
-    let selectedDir: string | null = null;
-    try {
-      selectedDir = await open({
-        directory: true,
-        title: "Choose where to install The Secret World",
-        defaultPath: "C:\\Program Files (x86)\\Funcom\\The Secret World",
-      }) as string | null;
-    } catch {
-      // User cancelled or dialog failed
-    }
-
-    if (!selectedDir) return; // User cancelled
-
     setInstallerDownloading(true);
     setInstallerPhase("downloading");
     setInstallerProgress(null);
     setError(null);
     try {
-      await invoke("download_installer", { installDir: selectedDir });
+      await invoke("download_installer", { installDir: freshInstallDir });
     } catch (err) {
       setError(`Installer download failed: ${err}`);
       setInstallerDownloading(false);
       setInstallerPhase("error");
+    }
+  }
+
+  async function handleChooseFreshInstallDir() {
+    try {
+      const selected = await open({
+        directory: true,
+        title: "Choose where to install The Secret World",
+        defaultPath: freshInstallDir,
+      });
+      if (selected) {
+        setFreshInstallDir(selected as string);
+      }
+    } catch {
+      // User cancelled
     }
   }
 
@@ -415,8 +418,10 @@ function App() {
             installerDownloading={installerDownloading}
             installerProgress={installerProgress}
             installerPhase={installerPhase}
+            freshInstallDir={freshInstallDir}
             onSelectDirectory={handleSelectDirectory}
             onDownloadInstaller={handleDownloadInstaller}
+            onChooseFreshInstallDir={handleChooseFreshInstallDir}
             onStartPatching={handleStartPatching}
             onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
             onStartVerification={handleStartVerification}
