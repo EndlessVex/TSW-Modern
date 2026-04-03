@@ -851,28 +851,13 @@ async fn download_installer(app: tauri::AppHandle, install_dir: Option<String>) 
 
     let install_target = install_dir.unwrap_or_else(|| r"C:\Program Files (x86)\Funcom\The Secret World".to_string());
 
-    // Build a batch script that:
-    // 1. Runs the installer silently
-    // 2. Kills ClientPatcher.exe (runs in the same elevated context)
-    // 3. Cleans up after itself
-    let batch_path = std::env::temp_dir().join("tsw_install.bat");
-    let batch_content = format!(
-        "@echo off\r\n\
-        \"{}\" /VERYSILENT /SP- /SUPPRESSMSGBOXES /DIR=\"{}\"\r\n\
-        timeout /t 2 /nobreak >nul\r\n\
-        taskkill /F /IM ClientPatcher.exe >nul 2>&1\r\n\
-        timeout /t 1 /nobreak >nul\r\n\
-        taskkill /F /IM ClientPatcher.exe >nul 2>&1\r\n\
-        del \"%~f0\"\r\n",
-        dest.display(),
-        install_target
-    );
-    tokio::fs::write(&batch_path, &batch_content).await
-        .map_err(|e| format!("Failed to write install script: {}", e))?;
+    // Elevate our own executable with --install flag. This makes the UAC dialog
+    // show "TSW Modern Launcher" instead of "Windows Command Processor".
+    // The elevated child process runs the installer silently and kills ClientPatcher.
 
-    // Run the batch script elevated via PowerShell Start-Process -Verb RunAs.
-    // This triggers one UAC prompt for the whole operation.
-    // -Wait ensures we block until the script (and thus the installer) finishes.
+    // Run the elevated install helper via PowerShell Start-Process -Verb RunAs.
+    // This triggers one UAC prompt showing our app name.
+    // -Wait ensures we block until the install completes.
     #[cfg(not(target_os = "windows"))]
     {
         return Err("Fresh install is only supported on Windows".into());
@@ -880,14 +865,19 @@ async fn download_installer(app: tauri::AppHandle, install_dir: Option<String>) 
 
     #[cfg(target_os = "windows")]
     {
+        let our_exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to get current exe path: {}", e))?;
+
         let status = tokio::task::spawn_blocking(move || {
             std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
                     &format!(
-                        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c \"{}\"' -Verb RunAs -Wait -WindowStyle Hidden",
-                        batch_path.display()
+                        "Start-Process -FilePath '{}' -ArgumentList '--install \"{}\" \"{}\"' -Verb RunAs -Wait -WindowStyle Hidden",
+                        our_exe.display(),
+                        dest.display(),
+                        install_target,
                     ),
                 ])
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
