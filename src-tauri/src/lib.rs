@@ -844,60 +844,65 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
     // install (no wizard, no progress bar — just the UAC prompt). /SP- suppresses the
     // "This will install..." confirmation. /SUPPRESSMSGBOXES catches any stray dialogs.
     //
-    // The installer's [Run] section auto-launches ClientPatcher.exe after install — we
-    // can't disable that via command line in Inno Setup 5.x, so we poll-kill it instead.
+    // The installer's [Run] section auto-launches ClientPatcher.exe after install.
+    // Since the installer runs elevated (UAC), ClientPatcher inherits admin privileges,
+    // so our non-elevated taskkill can't touch it. Solution: create a batch script that
+    // runs the installer AND kills ClientPatcher, then execute the whole script elevated.
 
-    // Start a background task to kill ClientPatcher.exe aggressively during install.
-    // The installer launches it near the end, so we need to catch it early.
-    #[cfg(target_os = "windows")]
-    let kill_handle = {
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let cancel_clone = cancel.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            while !cancel_clone.load(Ordering::Relaxed) {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/IM", "ClientPatcher.exe"])
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW — hide taskkill console flash
-                    .output();
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        });
-        (handle, cancel)
-    };
-
-    let dest_clone = dest.clone();
     let default_dir = r"C:\Program Files (x86)\Funcom\The Secret World";
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&dest_clone)
-            .args([
-                "/VERYSILENT",
-                "/SP-",
-                "/SUPPRESSMSGBOXES",
-                &format!("/DIR={}", default_dir),
-            ])
-            .status()
-    })
-    .await
-    .map_err(|e| format!("Installer task panicked: {}", e))?
-    .map_err(|e| format!("Failed to launch installer: {}", e))?;
 
-    // Stop the ClientPatcher killer
-    #[cfg(target_os = "windows")]
+    // Build a batch script that:
+    // 1. Runs the installer silently
+    // 2. Kills ClientPatcher.exe (runs in the same elevated context)
+    // 3. Cleans up after itself
+    let batch_path = std::env::temp_dir().join("tsw_install.bat");
+    let batch_content = format!(
+        "@echo off\r\n\
+        \"{}\" /VERYSILENT /SP- /SUPPRESSMSGBOXES /DIR=\"{}\"\r\n\
+        timeout /t 2 /nobreak >nul\r\n\
+        taskkill /F /IM ClientPatcher.exe >nul 2>&1\r\n\
+        timeout /t 1 /nobreak >nul\r\n\
+        taskkill /F /IM ClientPatcher.exe >nul 2>&1\r\n\
+        del \"%~f0\"\r\n",
+        dest.display(),
+        default_dir
+    );
+    tokio::fs::write(&batch_path, &batch_content).await
+        .map_err(|e| format!("Failed to write install script: {}", e))?;
+
+    // Run the batch script elevated via PowerShell Start-Process -Verb RunAs.
+    // This triggers one UAC prompt for the whole operation.
+    // -Wait ensures we block until the script (and thus the installer) finishes.
+    #[cfg(not(target_os = "windows"))]
     {
-        kill_handle.1.store(true, Ordering::Relaxed);
-        let _ = kill_handle.0.await;
-        // One final kill in case it spawned right at the end
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "ClientPatcher.exe"])
-            .creation_flags(0x08000000)
-            .output();
+        return Err("Fresh install is only supported on Windows".into());
     }
 
-    if !status.success() {
-        let _ = app.emit("installer:progress", InstallerProgress {
-            bytes_downloaded, total_bytes, phase: "error".into(),
-        });
-        return Err(format!("Installer exited with code {:?}", status.code()));
+    #[cfg(target_os = "windows")]
+    {
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c \"{}\"' -Verb RunAs -Wait",
+                        batch_path.display()
+                    ),
+                ])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .status()
+        })
+        .await
+        .map_err(|e| format!("Installer task panicked: {}", e))?
+        .map_err(|e| format!("Failed to launch installer: {}", e))?;
+
+        if !status.success() {
+            let _ = app.emit("installer:progress", InstallerProgress {
+                bytes_downloaded, total_bytes, phase: "error".into(),
+            });
+            return Err(format!("Installer exited with code {:?}", status.code()));
+        }
     }
 
     // Try to auto-detect the install path
