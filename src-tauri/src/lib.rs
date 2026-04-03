@@ -129,10 +129,11 @@ pub fn validate_install_dir_inner(path: &str) -> InstallValidation {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    // Fresh install state: LocalConfig.xml + RDB/ exist, but no game executables yet.
-    // The Funcom installer creates these before patching adds the .exe files.
+    // Fresh install state: LocalConfig.xml exists but no game executables yet.
+    // The Funcom installer creates LocalConfig.xml + Data/ directory.
+    // RDB/ directory may not exist yet — it's created during patching.
     // This is NOT an SWL misidentification — it's a valid pre-patch state.
-    if has_local_config && has_rdb && !has_tsw_exe && !has_dx11_exe {
+    if has_local_config && !has_tsw_exe && !has_dx11_exe {
         return InstallValidation {
             valid: true,
             version,
@@ -1241,16 +1242,30 @@ mod tests {
 
     #[test]
     fn fresh_install_no_executables() {
-        // After Funcom installer runs but before patching: LocalConfig.xml + RDB/ exist, no .exe
+        // After Funcom installer runs: LocalConfig.xml exists, no RDB/, no .exe files
         let tmp = std::env::temp_dir().join("tsw_test_fresh_install");
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join("RDB")).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("LocalConfig.xml"), b"<config/>").unwrap();
 
         let result = validate_install_dir_inner(tmp.to_str().unwrap());
         assert!(result.valid, "Fresh install should be valid, got: {}", result.message);
         assert!(result.message.contains("Fresh") || result.message.contains("patching"),
             "Should indicate fresh install state, got: {}", result.message);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fresh_install_with_rdb() {
+        // Partially patched state: LocalConfig.xml + RDB/ exist, no .exe files
+        let tmp = std::env::temp_dir().join("tsw_test_fresh_install_rdb");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("RDB")).unwrap();
+        fs::write(tmp.join("LocalConfig.xml"), b"<config/>").unwrap();
+
+        let result = validate_install_dir_inner(tmp.to_str().unwrap());
+        assert!(result.valid, "Fresh install with RDB should be valid, got: {}", result.message);
 
         let _ = fs::remove_dir_all(&tmp);
     }
