@@ -22,6 +22,10 @@ use verify::{CorruptedEntry, VerifyResult};
 static PATCH_STATUS_CACHE: Mutex<Option<PatchStatus>> = Mutex::new(None);
 /// Global flag to prevent concurrent patching.
 static PATCHING_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+/// Global pause flag for patching — checked between downloads.
+static PATCH_PAUSED: AtomicBool = AtomicBool::new(false);
+/// Global cancel flag for patching.
+static PATCH_CANCEL: AtomicBool = AtomicBool::new(false);
 /// Global flag to prevent concurrent verification.
 static VERIFY_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
 /// Global cancellation flag for verification.
@@ -309,6 +313,25 @@ fn get_patch_status_cmd() -> Result<PatchStatus, String> {
 }
 
 #[tauri::command]
+fn pause_patching() -> Result<(), String> {
+    PATCH_PAUSED.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_patching() -> Result<(), String> {
+    PATCH_PAUSED.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_patching() -> Result<(), String> {
+    PATCH_CANCEL.store(true, Ordering::Relaxed);
+    PATCH_PAUSED.store(false, Ordering::Relaxed); // Unpause so the loop can exit
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_patching(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
     // Prevent concurrent patching
     {
@@ -318,6 +341,10 @@ async fn start_patching(app: tauri::AppHandle, install_path: String) -> Result<(
         }
         *in_progress = true;
     }
+
+    // Reset pause/cancel flags
+    PATCH_PAUSED.store(false, Ordering::Relaxed);
+    PATCH_CANCEL.store(false, Ordering::Relaxed);
 
     // Spawn the download work on a background task so this command returns immediately
     let app_clone = app.clone();
@@ -479,12 +506,13 @@ async fn run_patching_inner(
     let dl_config = DownloadConfig {
         cdn_base_url: cdn_base_url.clone(),
         staging_dir: staging_dir.clone(),
+        max_concurrent: 16,
         ..Default::default()
     };
     let client = create_client(&dl_config).map_err(|e| e.to_string())?;
     let manifest_arc = std::sync::Arc::new(tokio::sync::Mutex::new(manifest));
 
-    let result = run_downloads(app, &dl_config, &client, tasks, manifest_arc)
+    let result = run_downloads(app, &dl_config, &client, tasks, manifest_arc, &PATCH_PAUSED, &PATCH_CANCEL)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1209,6 +1237,9 @@ pub fn run() {
             check_for_updates_cmd,
             get_patch_status_cmd,
             start_patching,
+            pause_patching,
+            resume_patching,
+            cancel_patching,
             start_verification,
             cancel_verification,
             get_verification_status,

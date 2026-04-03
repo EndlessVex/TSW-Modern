@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -500,6 +501,8 @@ pub async fn run_downloads(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
     manifest: Arc<Mutex<DownloadManifest>>,
+    pause_flag: &AtomicBool,
+    cancel_flag: &AtomicBool,
 ) -> Result<DownloadResult, DownloadError> {
     use tauri::Emitter;
 
@@ -553,6 +556,22 @@ pub async fn run_downloads(
     let mut handles = Vec::with_capacity(tasks.len());
 
     for task in tasks {
+        // Check cancel flag before dispatching each task
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        // Pause loop — wait until unpaused or cancelled
+        while pause_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let client = client.clone();
         let app_handle = app_handle.clone();

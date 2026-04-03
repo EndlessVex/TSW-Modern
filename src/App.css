@@ -364,6 +364,16 @@ body {
   word-break: break-all;
 }
 
+.progress-controls {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.progress-controls .btn-cancel {
+  color: var(--error);
+}
+
 /* ─── Login Form ────────────────────────────────────────────────────── */
 
 .login-form {
