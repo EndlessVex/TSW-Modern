@@ -205,8 +205,11 @@ pub struct RdbHashIndex {
 
 /// Parse an RDBHashIndex.bin file.
 ///
-/// Header: 4 magic (`RDHI`) + 4 version (7) + 4 num_entries + 4 num_types.
-/// Then `num_types` groups, each: 4 type + 4 count + count × 47-byte entries.
+/// Header: 4 magic (`RDHI`) + 4 version + 4 num_entries + 4 num_types.
+/// Then `num_types` groups, each: 4 type + 4 count + count × entry-bytes.
+///
+/// Version 4 (CDN): 29-byte entries (id + file_size + unknown + hash + flags).
+/// Version 7 (local): 47-byte entries (same fields + 18 bytes of location data).
 pub fn parse_hash_index(path: &Path) -> Result<RdbHashIndex, RdbParseError> {
     let data = fs::read(path).map_err(|e| {
         RdbParseError::Io(io::Error::new(
@@ -235,12 +238,17 @@ pub fn parse_hash_index(path: &Path) -> Result<RdbHashIndex, RdbParseError> {
     }
 
     let version = read_u32_le(&mut cur)?;
-    if version != RDHI_VERSION {
-        return Err(RdbParseError::BadVersion {
-            expected: RDHI_VERSION,
-            got: version,
-        });
-    }
+    // Version 4 = CDN format (29-byte entries), version 7 = local format (47-byte entries)
+    let entry_size: usize = match version {
+        4 => 29,
+        5 | 6 | 7 => 47,
+        _ => {
+            return Err(RdbParseError::BadVersion {
+                expected: RDHI_VERSION,
+                got: version,
+            })
+        }
+    };
 
     let num_entries = read_u32_le(&mut cur)?;
     let num_types = read_u32_le(&mut cur)?;
@@ -252,7 +260,7 @@ pub fn parse_hash_index(path: &Path) -> Result<RdbHashIndex, RdbParseError> {
         let count = read_u32_le(&mut cur)?;
 
         for _ in 0..count {
-            let mut raw = [0u8; 47];
+            let mut raw = vec![0u8; entry_size];
             cur.read_exact(&mut raw)?;
 
             let id = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
@@ -260,7 +268,7 @@ pub fn parse_hash_index(path: &Path) -> Result<RdbHashIndex, RdbParseError> {
             // raw[8..12] is u32 unknown
             let mut hash = [0u8; 16];
             hash.copy_from_slice(&raw[12..28]);
-            // raw[28..47] is 19 bytes unknown — skip
+            // remaining bytes (1 for v4, 19 for v7) are skipped
 
             entries.insert(
                 (rdb_type, id),
