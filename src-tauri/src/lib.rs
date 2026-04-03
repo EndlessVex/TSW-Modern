@@ -761,7 +761,7 @@ pub struct InstallerProgress {
 }
 
 #[tauri::command]
-async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
+async fn download_installer(app: tauri::AppHandle, install_dir: Option<String>) -> Result<(), String> {
     use futures::StreamExt;
     use tauri::Emitter;
     use tokio::io::AsyncWriteExt;
@@ -849,7 +849,7 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
     // so our non-elevated taskkill can't touch it. Solution: create a batch script that
     // runs the installer AND kills ClientPatcher, then execute the whole script elevated.
 
-    let default_dir = r"C:\Program Files (x86)\Funcom\The Secret World";
+    let install_target = install_dir.unwrap_or_else(|| r"C:\Program Files (x86)\Funcom\The Secret World".to_string());
 
     // Build a batch script that:
     // 1. Runs the installer silently
@@ -865,7 +865,7 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
         taskkill /F /IM ClientPatcher.exe >nul 2>&1\r\n\
         del \"%~f0\"\r\n",
         dest.display(),
-        default_dir
+        install_target
     );
     tokio::fs::write(&batch_path, &batch_content).await
         .map_err(|e| format!("Failed to write install script: {}", e))?;
@@ -886,7 +886,7 @@ async fn download_installer(app: tauri::AppHandle) -> Result<(), String> {
                     "-NoProfile",
                     "-Command",
                     &format!(
-                        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c \"{}\"' -Verb RunAs -Wait",
+                        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c \"{}\"' -Verb RunAs -Wait -WindowStyle Hidden",
                         batch_path.display()
                     ),
                 ])

@@ -224,12 +224,27 @@ function App() {
 
   async function handleDownloadInstaller() {
     if (installerDownloading) return;
+
+    // Ask user to pick install directory
+    let selectedDir: string | null = null;
+    try {
+      selectedDir = await open({
+        directory: true,
+        title: "Choose where to install The Secret World",
+        defaultPath: "C:\\Program Files (x86)\\Funcom\\The Secret World",
+      }) as string | null;
+    } catch {
+      // User cancelled or dialog failed
+    }
+
+    if (!selectedDir) return; // User cancelled
+
     setInstallerDownloading(true);
     setInstallerPhase("downloading");
     setInstallerProgress(null);
     setError(null);
     try {
-      await invoke("download_installer");
+      await invoke("download_installer", { installDir: selectedDir });
     } catch (err) {
       setError(`Installer download failed: ${err}`);
       setInstallerDownloading(false);
