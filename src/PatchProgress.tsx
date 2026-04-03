@@ -84,6 +84,11 @@ export default function PatchProgress() {
         {phase === "error" && "✗ Update failed"}
       </div>
 
+      {/* Show error detail from current_file when in error state */}
+      {phase === "error" && progress.current_file && (
+        <div className="progress-error-detail">{progress.current_file}</div>
+      )}
+
       {(phase === "downloading" || phase === "complete" || phase === "error") && (
         <>
           <div className="progress-bar-container">

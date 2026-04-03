@@ -339,7 +339,7 @@ async fn start_patching(app: tauri::AppHandle, install_path: String) -> Result<(
                     files_completed: 0,
                     files_total: 0,
                     speed_bps: 0,
-                    current_file: String::new(),
+                    current_file: format!("Error: {}", e),
                     phase: "error".into(),
                     failed_files: 0,
                 },
