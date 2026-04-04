@@ -520,9 +520,14 @@ async fn run_full_install_inner(
             .send().await.map_err(|e| format!("PatchInfoClient.txt: {}", e))?
             .text().await.map_err(|e| format!("PatchInfoClient.txt read: {}", e))?;
 
+        // Prefer RDBHash-7 (version 7, full index) over the default RDBHash (version 4, half-size).
+        // The game requires the version 7 hash index to locate all resources.
         let rdb_hash = patch_info_text.lines()
-            .find(|l| l.starts_with("RDBHash="))
-            .and_then(|l| l.strip_prefix("RDBHash="))
+            .find(|l| l.starts_with("RDBHash-7="))
+            .and_then(|l| l.strip_prefix("RDBHash-7="))
+            .or_else(|| patch_info_text.lines()
+                .find(|l| l.starts_with("RDBHash="))
+                .and_then(|l| l.strip_prefix("RDBHash=")))
             .ok_or("RDBHash not found in PatchInfoClient.txt")?
             .to_string();
 
@@ -772,9 +777,14 @@ async fn run_patching_inner(
             .send().await.map_err(|e| format!("PatchInfoClient.txt: {}", e))?
             .text().await.map_err(|e| format!("PatchInfoClient.txt read: {}", e))?;
 
+        // Prefer RDBHash-7 (version 7, full index) over the default RDBHash (version 4, half-size).
+        // The game requires the version 7 hash index to locate all resources.
         let rdb_hash = patch_info_text.lines()
-            .find(|l| l.starts_with("RDBHash="))
-            .and_then(|l| l.strip_prefix("RDBHash="))
+            .find(|l| l.starts_with("RDBHash-7="))
+            .and_then(|l| l.strip_prefix("RDBHash-7="))
+            .or_else(|| patch_info_text.lines()
+                .find(|l| l.starts_with("RDBHash="))
+                .and_then(|l| l.strip_prefix("RDBHash=")))
             .ok_or("RDBHash not found in PatchInfoClient.txt")?
             .to_string();
 
