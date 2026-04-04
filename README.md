@@ -1,8 +1,6 @@
 # TSW Downloader
 
-A fast, modern downloader for **The Secret World** — the original MMO by Funcom.
-
-The original ClientPatcher.exe downloads the game's 43 GB of data at a crawl, with speeds that degrade to 0 bytes/sec over time and a progress bar that goes past 100%. This replaces it with a downloader that actually works.
+A fast, modern downloader for **The Secret World**.
 
 ## Download
 
