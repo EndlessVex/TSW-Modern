@@ -330,5 +330,44 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Set up file logging for debugging
+    {
+        use std::io::Write;
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("tsw-downloader.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("tsw-downloader.log"));
+        
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path);
+        
+        if let Ok(file) = log_file {
+            let file = std::sync::Mutex::new(file);
+            env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Info)
+                .format(move |_buf, record| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = now.as_secs() % 86400;
+                    let timestamp = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+                    let line = format!("[{}] [{}] {}\n", timestamp, record.level(), record.args());
+                    eprint!("{}", line);
+                    if let Ok(mut f) = file.lock() {
+                        let _ = f.write_all(line.as_bytes());
+                        let _ = f.flush();
+                    }
+                    Ok(())
+                })
+                .init();
+        } else {
+            env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Info)
+                .init();
+        }
+    }
+
     tsw_modern_launcher::run();
 }

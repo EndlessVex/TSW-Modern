@@ -404,6 +404,7 @@ async fn run_full_install_inner(
     app: &tauri::AppHandle,
     install_path: &str,
 ) -> Result<(), String> {
+    log::info!("=== run_full_install_inner START === install_path={}", install_path);
     use tauri::Emitter;
 
     let base = std::path::PathBuf::from(install_path);
@@ -445,6 +446,7 @@ async fn run_full_install_inner(
         }
     }
 
+    log::info!("Phase 1: Writing static files...");
     // Phase 1: Write static files (LocalConfig.xml, LanguagePrefs.xml, RDB/ dir)
     let _ = app.emit(
         "patch:progress",
@@ -475,7 +477,9 @@ async fn run_full_install_inner(
     let patch_config =
         config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
     let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
+    log::info!("CDN base URL: {}", cdn_base_url);
 
+    log::info!("Phase 2: Downloading client files...");
     // Phase 2: Download client files (exe, dll, Data/) via /client/ path
     let _ = app.emit(
         "patch:progress",
@@ -495,6 +499,7 @@ async fn run_full_install_inner(
         return Err("Installation cancelled by user".into());
     }
 
+    log::info!("Phase 3: Downloading RDBHashIndex.bin...");
     // Phase 3: Download RDBHashIndex.bin
     let _ = app.emit(
         "patch:progress",
@@ -535,6 +540,7 @@ async fn run_full_install_inner(
             .ok_or("RDBHash not found in PatchInfoClient.txt")?
             .to_string();
 
+        log::info!("RDB hash: {}", rdb_hash);
         let hash_idx_url = format!("{}/rdb/full/{}", cdn_base_url.trim_end_matches('/'), rdb_hash);
         let response = client.get(&hash_idx_url)
             .send().await.map_err(|e| format!("RDBHashIndex.bin: {}", e))?;
@@ -545,8 +551,10 @@ async fn run_full_install_inner(
 
         let hash_idx_bytes = response.bytes().await
             .map_err(|e| format!("RDBHashIndex.bin read: {}", e))?;
+        log::info!("RDBHashIndex.bin downloaded: {} bytes, magic={:?}", hash_idx_bytes.len(), &hash_idx_bytes[..4.min(hash_idx_bytes.len())]);
 
         let final_bytes = verify::decompress_cdn(&hash_idx_bytes)?;
+        log::info!("RDBHashIndex.bin decompressed: {} bytes", final_bytes.len());
 
         tokio::fs::write(&hash_idx_path, &final_bytes).await
             .map_err(|e| format!("Write RDBHashIndex.bin: {}", e))?;
@@ -685,6 +693,7 @@ async fn run_patching_inner(
     app: &tauri::AppHandle,
     install_path: &str,
 ) -> Result<(), String> {
+    log::info!("=== run_patching_inner START === install_path={}", install_path);
     use tauri::Emitter;
 
     let base = std::path::PathBuf::from(install_path);
@@ -732,6 +741,7 @@ async fn run_patching_inner(
         );
 
         let le_idx_url = "https://github.com/EndlessVex/TSW-Modern/releases/download/game-data/le.idx.gz";
+        log::info!("Downloading le.idx from: {}", le_idx_url);
         let response = bootstrap_client.get(le_idx_url)
             .send().await.map_err(|e| format!("Failed to download le.idx: {}", e))?;
 

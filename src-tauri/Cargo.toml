@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["fs", "sync", "rt", "macros"] }
 futures = "0.3"
 rand = "0.8"
 log = "0.4"
+env_logger = "0.11"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 lzma-rs = "0.3"
 tauri-plugin-updater = "2"
