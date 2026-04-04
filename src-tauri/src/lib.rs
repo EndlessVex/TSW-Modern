@@ -856,10 +856,25 @@ async fn run_patching_inner(
         },
     );
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
-    // Limit concurrent large resource downloads to prevent memory spikes.
-    // 189 resources are >10MB (up to 368MB). At 4 concurrent, worst case = ~1.5GB.
-    let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    // Adapt concurrency to system resources.
+    // Large resources (>1MB, up to 368MB) are memory-bounded.
+    // Scale concurrent large downloads by available RAM.
+    let available_ram_mb = get_available_ram_mb();
+    let large_concurrent = if available_ram_mb > 16000 {
+        32  // 16GB+ RAM: aggressive
+    } else if available_ram_mb > 8000 {
+        16  // 8-16GB: moderate
+    } else if available_ram_mb > 4000 {
+        8   // 4-8GB: conservative
+    } else {
+        4   // <4GB: minimal
+    };
+    let main_concurrent = if available_ram_mb > 8000 { 128 } else { 64 };
+
+    log::info!("System RAM: {}MB, concurrency: main={}, large={}", available_ram_mb, main_concurrent, large_concurrent);
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
+    let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));
     let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1708,6 +1723,40 @@ fn get_display_modes() -> Vec<String> {
     }
 
     modes
+}
+
+/// Get available system RAM in megabytes.
+fn get_available_ram_mb() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct MEMORYSTATUSEX {
+            dwLength: u32,
+            dwMemoryLoad: u32,
+            ullTotalPhys: u64,
+            ullAvailPhys: u64,
+            ullTotalPageFile: u64,
+            ullAvailPageFile: u64,
+            ullTotalVirtual: u64,
+            ullAvailVirtual: u64,
+            ullAvailExtendedVirtual: u64,
+        }
+
+        extern "system" {
+            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+        }
+
+        let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let result = unsafe { GlobalMemoryStatusEx(&mut mem) };
+        if result != 0 {
+            return mem.ullTotalPhys / 1_048_576;
+        }
+    }
+
+    // Fallback: assume 8GB
+    8192
 }
 
 /// Get free disk space for the drive containing the given path.
