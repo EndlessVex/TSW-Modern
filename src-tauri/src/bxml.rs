@@ -1,14 +1,27 @@
-//! Write pre-compiled .bxml view cache files after install.
+//! Write pre-compiled .bxml cache files after install.
 //!
 //! The game generates these at runtime on first load, but the first-time
 //! compilation can crash when connecting with an existing character.
-//! The original ClientPatcher has these cached from a prior run.
 //! We embed them in the binary and write them post-install to avoid the issue.
 
 use std::path::Path;
 
 /// Each entry: (relative path from install dir, file bytes)
 const BXML_FILES: &[(&str, &[u8])] = &[
+    // Top-level config caches
+    ("Data/Gui/Default/FontConfig.bxml", include_bytes!("bxml_cache/Data/Gui/Default/FontConfig.bxml")),
+    ("Data/Gui/Default/Fonts.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Fonts.bxml")),
+    ("Data/Gui/Default/Modules.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Modules.bxml")),
+    ("Data/Gui/Default/TextColors.bxml", include_bytes!("bxml_cache/Data/Gui/Default/TextColors.bxml")),
+    ("Data/Gui/Default/Variables.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Variables.bxml")),
+    // Banner config
+    ("Data/Gui/Default/Flash/Banners/BannerConfig.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Flash/Banners/BannerConfig.bxml")),
+    // View templates
+    ("Data/Gui/Default/ViewTemplates/GUITKClasses.bxml", include_bytes!("bxml_cache/Data/Gui/Default/ViewTemplates/GUITKClasses.bxml")),
+    ("Data/Gui/Default/ViewTemplates/GameClasses.bxml", include_bytes!("bxml_cache/Data/Gui/Default/ViewTemplates/GameClasses.bxml")),
+    ("Data/Gui/Default/ViewTemplates/LargeClasses.bxml", include_bytes!("bxml_cache/Data/Gui/Default/ViewTemplates/LargeClasses.bxml")),
+    ("Data/Gui/Default/ViewTemplates/TeamGUIClasses.bxml", include_bytes!("bxml_cache/Data/Gui/Default/ViewTemplates/TeamGUIClasses.bxml")),
+    // Views
     ("Data/Gui/Default/Views/Chat/ChatWindowSkin.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/Chat/ChatWindowSkin.bxml")),
     ("Data/Gui/Default/Views/DebugCenter/BugReportBtnView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/DebugCenter/BugReportBtnView.bxml")),
     ("Data/Gui/Default/Views/DrowningBar.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/DrowningBar.bxml")),
@@ -31,6 +44,15 @@ const BXML_FILES: &[(&str, &[u8])] = &[
     ("Data/Gui/Default/Views/PortraitGUI/OverheadConfig.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/PortraitGUI/OverheadConfig.bxml")),
     ("Data/Gui/Default/Views/SplashScreenView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/SplashScreenView.bxml")),
     ("Data/Gui/Default/Views/TokenGUI/TokenIcons.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/TokenGUI/TokenIcons.bxml")),
+    // Waypoints (playfield data — crash if missing when entering these zones)
+    ("Data/Gui/Default/Waypoints/PF1000.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF1000.bxml")),
+    ("Data/Gui/Default/Waypoints/PF1100.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF1100.bxml")),
+    ("Data/Gui/Default/Waypoints/PF3030.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF3030.bxml")),
+    ("Data/Gui/Default/Waypoints/PF3040.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF3040.bxml")),
+    // Window skins
+    ("Data/Gui/Default/WindowSkins/Borderless.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/Borderless.bxml")),
+    ("Data/Gui/Default/WindowSkins/DialogWindow.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/DialogWindow.bxml")),
+    ("Data/Gui/Default/WindowSkins/Tabbed.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/Tabbed.bxml")),
 ];
 
 /// Write all cached bxml files to the install directory.
