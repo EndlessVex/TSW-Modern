@@ -4,53 +4,59 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // --prepare-dir <path>: Create install directory, set permissions,
-    // and register the game in Windows Add/Remove Programs.
+    // --prepare-dir <path>: Create install directory and set permissions.
     if args.len() >= 3 && args[1] == "--prepare-dir" {
         let target_dir = &args[2];
-        let path = std::path::Path::new(target_dir);
 
-        if let Err(e) = std::fs::create_dir_all(path) {
+        if let Err(e) = std::fs::create_dir_all(target_dir) {
             eprintln!("Failed to create directory: {}", e);
             std::process::exit(1);
         }
 
         #[cfg(target_os = "windows")]
         {
-            // Grant write permissions
             let _ = std::process::Command::new("icacls")
                 .args([target_dir, "/grant", "Everyone:(OI)(CI)F", "/T"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+        }
 
-            // Register in Add/Remove Programs
+        std::process::exit(0);
+    }
+
+    // --register <path>: Register the game in Windows Add/Remove Programs.
+    // Runs elevated so it can write to HKCU (no elevation needed).
+    if args.len() >= 3 && args[1] == "--register" {
+        #[cfg(target_os = "windows")]
+        {
+            let target_dir = &args[2];
             let our_exe = std::env::current_exe().unwrap_or_default();
             let uninstall_cmd = format!(
                 "\"{}\" --uninstall \"{}\"",
                 our_exe.display(),
                 target_dir
             );
-            let icon_path = std::path::Path::new(target_dir)
-                .join("ClientPatcher.exe");
+            let icon_path = std::path::Path::new(target_dir).join("ClientPatcher.exe");
 
-            let reg_key = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheSecretWorld_TSWDownloader";
+            let reg_key = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheSecretWorld_TSWDownloader";
 
-            let reg_cmds = [
-                format!("reg add \"{}\" /v DisplayName /t REG_SZ /d \"The Secret World\" /f", reg_key),
-                format!("reg add \"{}\" /v Publisher /t REG_SZ /d \"Funcom\" /f", reg_key),
-                format!("reg add \"{}\" /v DisplayVersion /t REG_SZ /d \"1.15\" /f", reg_key),
-                format!("reg add \"{}\" /v UninstallString /t REG_SZ /d \"{}\" /f", reg_key, uninstall_cmd),
-                format!("reg add \"{}\" /v InstallLocation /t REG_SZ /d \"{}\" /f", reg_key, target_dir),
-                format!("reg add \"{}\" /v DisplayIcon /t REG_SZ /d \"{}\" /f", reg_key, icon_path.display()),
-                format!("reg add \"{}\" /v EstimatedSize /t REG_DWORD /d 44040192 /f", reg_key), // ~42GB in KB
-                format!("reg add \"{}\" /v NoModify /t REG_DWORD /d 1 /f", reg_key),
-                format!("reg add \"{}\" /v NoRepair /t REG_DWORD /d 1 /f", reg_key),
+            let values = [
+                format!("/v DisplayName /t REG_SZ /d \"The Secret World\" /f"),
+                format!("/v Publisher /t REG_SZ /d \"Funcom\" /f"),
+                format!("/v DisplayVersion /t REG_SZ /d \"1.15\" /f"),
+                format!("/v UninstallString /t REG_SZ /d \"{}\" /f", uninstall_cmd),
+                format!("/v InstallLocation /t REG_SZ /d \"{}\" /f", target_dir),
+                format!("/v DisplayIcon /t REG_SZ /d \"{}\" /f", icon_path.display()),
+                format!("/v EstimatedSize /t REG_DWORD /d 44040192 /f"),
+                format!("/v NoModify /t REG_DWORD /d 1 /f"),
+                format!("/v NoRepair /t REG_DWORD /d 1 /f"),
             ];
 
-            for cmd in &reg_cmds {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", cmd])
+            for val in &values {
+                let _ = std::process::Command::new("reg")
+                    .args(["add", reg_key])
+                    .raw_arg(val)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
@@ -60,11 +66,10 @@ fn main() {
         std::process::exit(0);
     }
 
-    // --uninstall <path>: Remove the game installation and registry entry.
+    // --uninstall <path>: Remove the game and registry entry.
     if args.len() >= 3 && args[1] == "--uninstall" {
         let target_dir = &args[2];
 
-        // Confirm with the user via a simple message box
         #[cfg(target_os = "windows")]
         {
             extern "system" {
@@ -89,17 +94,15 @@ fn main() {
                 target_dir
             ));
             let caption = to_wide("Uninstall The Secret World");
-            // MB_YESNO | MB_ICONQUESTION = 0x24
+
             let result = unsafe {
                 MessageBoxW(std::ptr::null(), msg.as_ptr(), caption.as_ptr(), 0x24)
             };
 
             if result != 6 {
-                // IDYES = 6
                 std::process::exit(0);
             }
 
-            // Remove the install directory
             if let Err(e) = std::fs::remove_dir_all(target_dir) {
                 let err_msg = to_wide(&format!("Failed to remove files: {}", e));
                 let err_cap = to_wide("Uninstall Error");
@@ -107,8 +110,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            // Remove registry entry
-            let reg_key = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheSecretWorld_TSWDownloader";
+            let reg_key = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheSecretWorld_TSWDownloader";
             let _ = std::process::Command::new("reg")
                 .args(["delete", reg_key, "/f"])
                 .stdout(std::process::Stdio::null())
@@ -123,8 +125,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    // --install <installer_path> <target_dir>: Run Funcom installer silently.
-    // Kept as fallback — not used in normal flow.
+    // --install: Legacy Funcom installer fallback (not used in normal flow)
     if args.len() >= 4 && args[1] == "--install" {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -146,12 +147,7 @@ fn main() {
         });
 
         let status = std::process::Command::new(installer_path)
-            .args([
-                "/VERYSILENT",
-                "/SP-",
-                "/SUPPRESSMSGBOXES",
-                &format!("/DIR={}", target_dir),
-            ])
+            .args(["/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", &format!("/DIR={}", target_dir)])
             .status();
 
         std::thread::sleep(std::time::Duration::from_secs(3));
