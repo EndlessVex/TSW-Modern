@@ -368,9 +368,41 @@ async fn run_full_install_inner(
 
     let base = std::path::PathBuf::from(install_path);
 
-    // Ensure install directory exists
-    std::fs::create_dir_all(&base)
-        .map_err(|e| format!("Failed to create install directory: {}", e))?;
+    // Ensure install directory exists — may need elevation for Program Files.
+    // Try non-elevated first; if that fails, elevate our own exe with --prepare-dir.
+    if let Err(_) = std::fs::create_dir_all(&base) {
+        #[cfg(target_os = "windows")]
+        {
+            let our_exe = std::env::current_exe()
+                .map_err(|e| format!("Failed to get exe path: {}", e))?;
+
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Start-Process -FilePath '{}' -ArgumentList '--prepare-dir \"{}\"' -Verb RunAs -Wait -WindowStyle Hidden",
+                        our_exe.display(),
+                        install_path,
+                    ),
+                ])
+                .status()
+                .map_err(|e| format!("Failed to elevate: {}", e))?;
+
+            if !status.success() {
+                return Err("Failed to create install directory (elevation denied?)".into());
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err(format!("Failed to create install directory: access denied"));
+        }
+
+        // Verify it was created
+        if !base.exists() {
+            return Err("Install directory was not created after elevation".into());
+        }
+    }
 
     // Phase 1: Write static files (LocalConfig.xml, LanguagePrefs.xml, RDB/ dir)
     let _ = app.emit(
