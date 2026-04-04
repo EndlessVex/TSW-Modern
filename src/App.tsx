@@ -10,6 +10,7 @@ import NewsFeed from "./NewsFeed";
 import SettingsPanel from "./SettingsPanel";
 import BottomBar, { type TabId } from "./BottomBar";
 import type { PatchStatus, DownloadProgress } from "./PatchProgress";
+import type { VerifyProgressData } from "./VerifyProgress";
 import "./App.css";
 
 /** Matches the Rust InstallValidation struct from lib.rs */
@@ -68,6 +69,28 @@ function App() {
             validatePath(currentPath);
           }
         }
+      }
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Top-level verify:progress listener — handles state machine transitions
+  // even when VerifyProgress is unmounted (e.g. user switches tabs mid-verify).
+  // VerifyProgress keeps its own listener for rendering progress UI.
+  useEffect(() => {
+    const unlisten = listen<VerifyProgressData>("verify:progress", (event) => {
+      const { phase, corrupted_count } = event.payload;
+      if (phase === "complete") {
+        setVerifying(false);
+        setVerifyResult(corrupted_count);
+      } else if (phase === "cancelled") {
+        setVerifying(false);
+      } else if (phase.startsWith("error")) {
+        setVerifying(false);
+        setError(`Verification failed: ${phase}`);
       }
     });
 

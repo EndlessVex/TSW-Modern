@@ -1,6 +1,5 @@
 import PatchProgress, { type PatchStatus } from "./PatchProgress";
 import VerifyProgress from "./VerifyProgress";
-import NewsFeed from "./NewsFeed";
 
 
 interface MainViewProps {
@@ -175,14 +174,6 @@ export default function MainView({
               Check for Updates
             </button>
           )}
-        </section>
-      )}
-
-      {/* Community News Section */}
-      {isValid && (
-        <section className="section">
-          <label className="section-label">Community News</label>
-          <NewsFeed />
         </section>
       )}
 
