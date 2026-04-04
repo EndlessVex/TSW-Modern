@@ -546,11 +546,7 @@ async fn run_full_install_inner(
         let hash_idx_bytes = response.bytes().await
             .map_err(|e| format!("RDBHashIndex.bin read: {}", e))?;
 
-        let final_bytes = if hash_idx_bytes.len() > 4 && &hash_idx_bytes[..4] == b"IOz1" {
-            verify::decompress_ioz1(&hash_idx_bytes)?
-        } else {
-            hash_idx_bytes.to_vec()
-        };
+        let final_bytes = verify::decompress_cdn(&hash_idx_bytes)?;
 
         tokio::fs::write(&hash_idx_path, &final_bytes).await
             .map_err(|e| format!("Write RDBHashIndex.bin: {}", e))?;
@@ -807,11 +803,7 @@ async fn run_patching_inner(
         let hash_idx_bytes = response.bytes().await
             .map_err(|e| format!("RDBHashIndex.bin read: {}", e))?;
 
-        let final_bytes = if hash_idx_bytes.len() > 4 && &hash_idx_bytes[..4] == b"IOz1" {
-            verify::decompress_ioz1(&hash_idx_bytes)?
-        } else {
-            hash_idx_bytes.to_vec()
-        };
+        let final_bytes = verify::decompress_cdn(&hash_idx_bytes)?;
 
         tokio::fs::write(&hash_idx_path, &final_bytes).await
             .map_err(|e| format!("Write RDBHashIndex.bin: {}", e))?;
