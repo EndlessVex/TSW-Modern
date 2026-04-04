@@ -426,6 +426,7 @@ async fn run_full_install_inner(
                         install_path,
                     ),
                 ])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .status()
                 .map_err(|e| format!("Failed to elevate: {}", e))?;
 
