@@ -24,27 +24,48 @@ pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<()
     std::fs::create_dir_all(&rdb_dir)
         .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
 
-    // Find all unique file_nums that have actual resources
+    // Find all unique file_nums and their max end offsets for pre-allocation
     let mut file_nums: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut max_end_by_file: HashMap<u8, u64> = HashMap::new();
+
     for entry in &le_index.entries {
         if entry.file_num == 255 {
             continue;
         }
         file_nums.insert(entry.file_num);
+        let end = entry.offset as u64 + entry.length as u64;
+        let current = max_end_by_file.entry(entry.file_num).or_insert(0);
+        if end > *current {
+            *current = end;
+        }
     }
 
     for &file_num in &file_nums {
         let path = rdb_dir.join(format!("{:02}.rdbdata", file_num));
         if path.exists() {
-            continue;
+            // File exists — check if it has content beyond the header
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > 4 {
+                    continue; // Already has content, don't recreate
+                }
+            }
         }
 
-        // Create file with RDB0 header only — let it grow as resources are written.
-        // Pre-allocating 42 × 1GB is slow on NTFS and causes a visible hang.
+        // Create file with RDB0 header and pre-allocate to full size.
+        // set_len creates a sparse file on NTFS — fast allocation without
+        // writing zeros. Without this, seeking past EOF to write a resource
+        // at offset 800MB causes NTFS to zero-fill the entire gap — extremely
+        // slow with 128 concurrent writers.
         let mut file = File::create(&path)
             .map_err(|e| format!("Failed to create {:02}.rdbdata: {}", file_num, e))?;
         file.write_all(b"RDB0")
             .map_err(|e| format!("Failed to write RDB0 header: {}", e))?;
+
+        let target_size = max_end_by_file.get(&file_num).copied().unwrap_or(4);
+        if target_size > 4 {
+            file.set_len(target_size)
+                .map_err(|e| format!("Failed to allocate {:02}.rdbdata: {}", file_num, e))?;
+        }
     }
 
     Ok(())
