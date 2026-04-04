@@ -41,6 +41,10 @@ The Secret World/
 our_downloader_secretworld/
 working_secretworld/
 
+# ── NSIS installer game files (from Funcom installer analysis) ──
+\{app\}/
+\{tmp\}/
+
 # ── Misc ──
 coverage/
 .cache/
