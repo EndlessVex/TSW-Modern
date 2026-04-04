@@ -1,14 +1,11 @@
 import PatchProgress, { type PatchStatus } from "./PatchProgress";
 import VerifyProgress from "./VerifyProgress";
-import LoginForm from "./LoginForm";
 import NewsFeed from "./NewsFeed";
 
-type DxVersion = "dx9" | "dx11";
 
 interface MainViewProps {
   installPath: string | null;
   validationResult: { valid: boolean; version: string | null; rdb_count: number; message: string } | null;
-  dxVersion: DxVersion;
   patchStatus: PatchStatus | null;
   patching: boolean;
   patchPhase: string | null;
@@ -32,8 +29,6 @@ interface MainViewProps {
   onVerifyComplete: (corruptedCount: number) => void;
   onRepair: () => void;
   onLaunch: () => void;
-  onLaunchStart: () => void;
-  onLaunchEnd: () => void;
   onError: (err: string | null) => void;
 }
 
@@ -50,7 +45,6 @@ function formatBytesSimple(bytes: number): string {
 export default function MainView({
   installPath,
   validationResult,
-  dxVersion,
   patchStatus,
   patching,
   patchPhase,
@@ -74,8 +68,6 @@ export default function MainView({
   onVerifyComplete,
   onRepair,
   onLaunch,
-  onLaunchStart,
-  onLaunchEnd,
   onError,
 }: MainViewProps) {
   const isValid = validationResult?.valid === true;
@@ -202,21 +194,6 @@ export default function MainView({
         </section>
       )}
 
-      {/* Login Section */}
-      {isValid && (
-        <LoginForm
-          installValid={isValid}
-          installPath={installPath}
-          dxVersion={dxVersion}
-          launching={launching}
-          patching={patching}
-          verifying={verifying}
-          repairing={repairing}
-          onLaunchStart={onLaunchStart}
-          onLaunchEnd={onLaunchEnd}
-        />
-      )}
-
       {/* Community News Section */}
       {isValid && (
         <section className="section">
@@ -271,7 +248,7 @@ export default function MainView({
           disabled={!isValid || launching || patching || verifying || repairing || needsUpdate}
           onClick={onLaunch}
         >
-          {launching ? "Launching…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : needsUpdate ? "Update Required" : "Launch Game"}
+          {launching ? "Starting…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : needsUpdate ? "Update Required" : "Start Game"}
         </button>
       </section>
 

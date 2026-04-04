@@ -2,12 +2,9 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { store } from "./store";
 import Header from "./Header";
 import MainView from "./MainView";
-import SettingsPanel from "./SettingsPanel";
 import type { PatchStatus, DownloadProgress } from "./PatchProgress";
 import "./App.css";
 
@@ -19,16 +16,11 @@ interface InstallValidation {
   message: string;
 }
 
-type DxVersion = "dx9" | "dx11";
 
 function App() {
-  // View switching
-  const [currentView, setCurrentView] = useState<"main" | "settings">("main");
-
-  // Shared state passed down to MainView
+  // Shared state
   const [installPath, setInstallPath] = useState<string | null>(null);
   const [validationResult, setValidationResult] = useState<InstallValidation | null>(null);
-  const [dxVersion, setDxVersion] = useState<DxVersion>("dx11");
   const [launching, setLaunching] = useState(false);
   const [patching, setPatching] = useState(false);
   const [patchStatus, setPatchStatus] = useState<PatchStatus | null>(null);
@@ -39,15 +31,12 @@ function App() {
   const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<number | null>(null);
   const [repairing, setRepairing] = useState(false);
-  const [bundleMode, setBundleMode] = useState<"full" | "minimum">("full");
   const [installerDownloading, setInstallerDownloading] = useState(false);
   const [installerProgress, setInstallerProgress] = useState<{ bytes_downloaded: number; total_bytes: number } | null>(null);
   const [installerPhase, setInstallerPhase] = useState<string | null>(null);
   const [freshInstallDir, setFreshInstallDir] = useState<string>(
     "C:\\Program Files (x86)\\Funcom\\The Secret World"
   );
-  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; date: string; update: import("@tauri-apps/plugin-updater").Update } | null>(null);
-  const [updating, setUpdating] = useState(false);
 
   // Listen for patch:progress events to track patching and repair state
   useEffect(() => {
@@ -62,6 +51,11 @@ function App() {
         setRepairing(false);
         if (phase === "complete") {
           setPatchStatus({ up_to_date: true, files_to_download: 0, total_bytes: 0 });
+          // Re-validate install path after download completes
+          // so UI transitions from "Get Started" to main view with Launch button
+          if (installPath) {
+            validatePath(installPath);
+          }
         }
       }
     });
@@ -162,11 +156,6 @@ function App() {
     async function loadSettings() {
       try {
         const savedPath = await store.get<string>("install_path");
-        const savedDx = await store.get<DxVersion>("dx_version");
-
-        if (savedDx === "dx9" || savedDx === "dx11") {
-          setDxVersion(savedDx);
-        }
 
         let pathToUse = savedPath;
 
@@ -192,15 +181,6 @@ function App() {
           }
         }
 
-        // Load bundle mode from Tauri backend
-        try {
-          const mode = await invoke<string>("get_bundle_mode");
-          if (mode === "full" || mode === "minimum") {
-            setBundleMode(mode);
-          }
-        } catch {
-          // Ignore — defaults to "full"
-        }
       } catch (err) {
         console.error("Failed to load settings:", err);
       } finally {
@@ -211,25 +191,6 @@ function App() {
     loadSettings();
   }, [validatePath, checkForUpdates]);
 
-  // Check for launcher updates after loading completes
-  useEffect(() => {
-    if (loading) return;
-    async function checkLauncherUpdate() {
-      try {
-        const update = await check();
-        if (update) {
-          setUpdateAvailable({
-            version: update.version,
-            date: update.date ?? "",
-            update,
-          });
-        }
-      } catch {
-        // Silently ignore — no releases published yet or dev environment
-      }
-    }
-    checkLauncherUpdate();
-  }, [loading]);
 
   // --- Action handlers passed to MainView ---
 
@@ -273,17 +234,6 @@ function App() {
     }
   }
 
-  async function handleUpdateLauncher() {
-    if (!updateAvailable || updating) return;
-    setUpdating(true);
-    try {
-      await updateAvailable.update.downloadAndInstall();
-      await relaunch();
-    } catch (err) {
-      setError(`Launcher update failed: ${err}`);
-      setUpdating(false);
-    }
-  }
 
   async function handleSelectDirectory() {
     try {
@@ -309,11 +259,6 @@ function App() {
     }
   }
 
-  async function handleDxChange(version: DxVersion) {
-    setDxVersion(version);
-    await store.set("dx_version", version);
-    await store.save();
-  }
 
   async function handleStartPatching() {
     if (!installPath || patching) return;
@@ -367,21 +312,13 @@ function App() {
     }
   }
 
-  async function handleBundleModeChange(mode: "full" | "minimum") {
-    setBundleMode(mode);
-    try {
-      await invoke("set_bundle_mode", { mode });
-    } catch (err) {
-      setError(`Failed to set bundle mode: ${err}`);
-    }
-  }
 
   async function handleLaunch() {
     if (!installPath || !validationResult?.valid || launching || patching || verifying || repairing) return;
     setLaunching(true);
     setError(null);
     try {
-      await invoke("launch_game", { installPath, dxVersion });
+      await invoke("launch_patcher", { installPath });
     } catch (err) {
       setError(`Launch failed: ${err}`);
     } finally {
@@ -400,71 +337,36 @@ function App() {
 
   return (
     <div className="app-layout">
-      <Header
-        currentView={currentView}
-        onToggleSettings={() =>
-          setCurrentView((v) => (v === "main" ? "settings" : "main"))
-        }
-      />
+      <Header />
       <div className="app-content">
-        {updateAvailable && (
-          <div className="update-banner">
-            <span>Launcher update v{updateAvailable.version} available</span>
-            <button
-              className="btn btn-update-launcher"
-              onClick={handleUpdateLauncher}
-              disabled={updating}
-            >
-              {updating ? "Updating…" : "Update Now"}
-            </button>
-          </div>
-        )}
-        {currentView === "main" ? (
-          <MainView
-            installPath={installPath}
-            validationResult={validationResult}
-            dxVersion={dxVersion}
-            patchStatus={patchStatus}
-            patching={patching}
-            patchPhase={patchPhase}
-            checkingUpdates={checkingUpdates}
-            launching={launching}
-            verifying={verifying}
-            repairing={repairing}
-            verifyResult={verifyResult}
-            error={error}
-            installerDownloading={installerDownloading}
-            installerProgress={installerProgress}
-            installerPhase={installerPhase}
-            freshInstallDir={freshInstallDir}
-            onSelectDirectory={handleSelectDirectory}
-            onDownloadInstaller={handleDownloadInstaller}
-            onChooseFreshInstallDir={handleChooseFreshInstallDir}
-            onStartPatching={handleStartPatching}
-            onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
-            onStartVerification={handleStartVerification}
-            onCancelVerification={handleCancelVerification}
-            onVerifyComplete={handleVerifyComplete}
-            onRepair={handleRepair}
-            onLaunch={handleLaunch}
-            onLaunchStart={() => setLaunching(true)}
-            onLaunchEnd={() => setLaunching(false)}
-            onError={setError}
-          />
-        ) : (
-          <SettingsPanel
-            installPath={installPath}
-            dxVersion={dxVersion}
-            bundleMode={bundleMode}
-            verifying={verifying}
-            repairing={repairing}
-            onBack={() => setCurrentView("main")}
-            onSelectDirectory={handleSelectDirectory}
-            onDxChange={handleDxChange}
-            onBundleModeChange={handleBundleModeChange}
-            onStartVerification={handleStartVerification}
-          />
-        )}
+        <MainView
+          installPath={installPath}
+          validationResult={validationResult}
+          patchStatus={patchStatus}
+          patching={patching}
+          patchPhase={patchPhase}
+          checkingUpdates={checkingUpdates}
+          launching={launching}
+          verifying={verifying}
+          repairing={repairing}
+          verifyResult={verifyResult}
+          error={error}
+          installerDownloading={installerDownloading}
+          installerProgress={installerProgress}
+          installerPhase={installerPhase}
+          freshInstallDir={freshInstallDir}
+          onSelectDirectory={handleSelectDirectory}
+          onDownloadInstaller={handleDownloadInstaller}
+          onChooseFreshInstallDir={handleChooseFreshInstallDir}
+          onStartPatching={handleStartPatching}
+          onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
+          onStartVerification={handleStartVerification}
+          onCancelVerification={handleCancelVerification}
+          onVerifyComplete={handleVerifyComplete}
+          onRepair={handleRepair}
+          onLaunch={handleLaunch}
+          onError={setError}
+        />
       </div>
     </div>
   );

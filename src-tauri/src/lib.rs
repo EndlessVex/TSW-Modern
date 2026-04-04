@@ -277,6 +277,24 @@ fn launch_game(install_path: String, dx_version: String, login_key: Option<Strin
     Ok(())
 }
 
+/// Launch the ClientPatcher.exe which provides the game's login UI and "Start Game" button.
+#[tauri::command]
+fn launch_patcher(install_path: String) -> Result<(), String> {
+    let base = std::path::Path::new(&install_path);
+    let patcher = base.join("ClientPatcher.exe");
+
+    if !patcher.is_file() {
+        return Err(format!("ClientPatcher.exe not found at {}", patcher.display()));
+    }
+
+    std::process::Command::new(&patcher)
+        .current_dir(base)
+        .spawn()
+        .map_err(|e| format!("Failed to launch ClientPatcher.exe: {}", e))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn check_for_updates_cmd(install_path: String) -> Result<PatchStatus, String> {
     let path = std::path::PathBuf::from(&install_path);
@@ -1642,6 +1660,7 @@ pub fn run() {
             validate_install_dir,
             auto_detect_install_dir,
             launch_game,
+            launch_patcher,
             authenticate,
             check_for_updates_cmd,
             get_patch_status_cmd,
