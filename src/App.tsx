@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { store } from "./store";
 import Header from "./Header";
 import MainView from "./MainView";
+import BottomBar, { type TabId } from "./BottomBar";
 import type { PatchStatus, DownloadProgress } from "./PatchProgress";
 import "./App.css";
 
@@ -19,6 +20,7 @@ interface InstallValidation {
 
 function App() {
   // Shared state
+  const [activeTab, setActiveTab] = useState<TabId>("info");
   const [installPath, setInstallPath] = useState<string | null>(null);
   const installPathRef = useRef<string | null>(null);
   const [validationResult, setValidationResult] = useState<InstallValidation | null>(null);
@@ -317,7 +319,7 @@ function App() {
   }
 
   return (
-    <div className="app-layout">
+    <div className="app-layout" data-tauri-drag-region>
       <Header />
       <div className="app-content">
         <MainView
@@ -348,6 +350,7 @@ function App() {
           onError={setError}
         />
       </div>
+      <BottomBar activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );
 }

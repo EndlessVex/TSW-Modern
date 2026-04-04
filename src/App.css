@@ -733,35 +733,31 @@ body {
 /* ─── App Layout & Header ───────────────────────────────────────────── */
 
 .app-layout {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
+  background-image: url('./assets/patcherBackground.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
-.app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 0.75rem;
-  height: 34px;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  user-select: none;
-}
-
-.app-header[data-tauri-drag-region] {
+.app-layout[data-tauri-drag-region] {
   -webkit-app-region: drag;
 }
 
-.app-title {
-  font-family: var(--font-heading);
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  pointer-events: none;
+.app-header {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0.35rem 0.5rem;
+  z-index: 10;
+  background: transparent;
+  -webkit-app-region: no-drag;
 }
 
 .titlebar-buttons {
@@ -807,6 +803,52 @@ body {
   max-width: 520px;
   margin: 0 auto;
   width: 100%;
+  -webkit-app-region: no-drag;
+}
+
+/* ─── Bottom Tab Bar ─────────────────────────────────────────────────── */
+
+.bottom-bar {
+  display: flex;
+  flex-shrink: 0;
+  height: 30px;
+  border-top: 1px solid #606060;
+  background: rgba(60, 60, 60, 0.85);
+  -webkit-app-region: no-drag;
+}
+
+.bottom-bar-tab {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-right: 1px solid #505050;
+  color: #c0c0c0;
+  font-family: var(--font-body);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  padding: 0;
+}
+
+.bottom-bar-tab:last-child {
+  border-right: none;
+}
+
+.bottom-bar-tab:hover {
+  background: rgba(80, 80, 80, 0.9);
+  color: #e0e0e0;
+}
+
+.bottom-bar-tab-active {
+  background: rgba(100, 100, 100, 0.9);
+  color: #ffffff;
+  border-bottom: 2px solid var(--accent);
 }
 
 /* ─── Launcher Update Banner ─────────────────────────────────────────── */

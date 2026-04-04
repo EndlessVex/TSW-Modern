@@ -4,10 +4,7 @@ export default function Header() {
   const appWindow = getCurrentWindow();
 
   return (
-    <header className="app-header" data-tauri-drag-region>
-      <span className="app-title" data-tauri-drag-region>
-        THE SECRET WORLD
-      </span>
+    <header className="app-header">
       <div className="titlebar-buttons">
         <button
           className="titlebar-btn"
