@@ -7,14 +7,13 @@
 //! list of 1496 files with paths, sizes, and MD5 hashes. TSW hasn't been updated
 //! since February 2017, so this manifest is frozen.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 /// Embedded game file manifest — compiled into the binary.
 const GAME_FILES_JSON: &str = include_str!("game_files.json");

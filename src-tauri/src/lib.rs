@@ -317,7 +317,6 @@ fn get_patch_status_cmd() -> Result<PatchStatus, String> {
 /// This replaces the Funcom installer + ClientPatcher entirely.
 #[tauri::command]
 async fn start_full_install(app: tauri::AppHandle, install_path: String) -> Result<(), String> {
-    use tauri::Emitter;
 
     // Prevent concurrent patching
     {
