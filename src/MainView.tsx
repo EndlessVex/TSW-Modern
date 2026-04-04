@@ -131,6 +131,10 @@ export default function MainView({
                 </div>
               )}
             </div>
+          ) : patching || patchPhase === "complete" || patchPhase === "error" ? (
+            <div className="install-progress-section">
+              <PatchProgress />
+            </div>
           ) : (
             <div className="fresh-install-controls">
               <div className="fresh-install-dir">
