@@ -498,7 +498,7 @@ pub fn compute_download_plan_from_hash_index(
 /// Rolling window speed calculator using time-bucketed byte counts.
 /// More stable than per-file samples — records bytes every time they're written,
 /// not just when files complete. Produces smooth speed readings even for tiny files.
-struct SpeedTracker {
+pub struct SpeedTracker {
     /// (timestamp, cumulative_bytes) snapshots taken periodically
     snapshots: Vec<(Instant, u64)>,
     /// Window duration for speed calculation
@@ -506,14 +506,14 @@ struct SpeedTracker {
 }
 
 impl SpeedTracker {
-    fn new(window: Duration) -> Self {
+    pub fn new(window: Duration) -> Self {
         Self {
             snapshots: Vec::new(),
             window,
         }
     }
 
-    fn record(&mut self, cumulative_bytes: u64) {
+    pub fn record(&mut self, cumulative_bytes: u64) {
         let now = Instant::now();
         // Only keep one snapshot per 200ms to avoid memory bloat
         if let Some(last) = self.snapshots.last() {
@@ -531,7 +531,7 @@ impl SpeedTracker {
         self.snapshots.retain(|(t, _)| *t >= cutoff);
     }
 
-    fn speed_bps(&self) -> u64 {
+    pub fn speed_bps(&self) -> u64 {
         if self.snapshots.len() < 2 {
             return 0;
         }
