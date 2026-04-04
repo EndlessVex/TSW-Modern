@@ -320,10 +320,12 @@ pub fn decompress_ioz1(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress IOz2-format data (LZMA-compressed CDN payloads).
 ///
-/// IOz2 format: 4-byte magic (`IOz2`) + u32_LE original_size + LZMA-compressed data.
-/// The LZMA stream starts with a 5-byte properties header followed by compressed data.
+/// IOz2 format: 4-byte magic (`IOz2`) + u32_LE original_size + LZMA stream.
+/// The LZMA stream has props(1) + dict_size(4) + compressed data, but is
+/// missing the 8-byte uncompressed size that standard LZMA alone format expects.
+/// We insert it from the IOz2 header before passing to lzma_rs.
 pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() < 8 {
+    if data.len() < 13 {
         return Err("IOz2 data too short".into());
     }
 
@@ -331,10 +333,17 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
         return Err(format!("Expected IOz2 magic, got {:?}", &data[0..4]));
     }
 
-    let original_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let original_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
 
-    let mut decompressed = Vec::with_capacity(original_size);
-    lzma_rs::lzma_decompress(&mut &data[8..], &mut decompressed)
+    // Build a standard LZMA alone stream:
+    // props(1) + dict_size(4) from the IOz2 data + uncompressed_size(8) we insert + compressed data
+    let mut lzma_stream = Vec::with_capacity(13 + data.len() - 13);
+    lzma_stream.extend_from_slice(&data[8..13]);    // props(1) + dict_size(4)
+    lzma_stream.extend_from_slice(&original_size.to_le_bytes()); // 8-byte uncompressed size
+    lzma_stream.extend_from_slice(&data[13..]);      // compressed data
+
+    let mut decompressed = Vec::with_capacity(original_size as usize);
+    lzma_rs::lzma_decompress(&mut lzma_stream.as_slice(), &mut decompressed)
         .map_err(|e| format!("IOz2 LZMA decompression failed: {e}"))?;
 
     Ok(decompressed)
