@@ -349,9 +349,29 @@ async fn start_full_install(app: tauri::AppHandle, install_path: String) -> Resu
     PATCH_PAUSED.store(false, Ordering::Relaxed);
     PATCH_CANCEL.store(false, Ordering::Relaxed);
 
+    // Prevent system sleep during download (Windows)
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn SetThreadExecutionState(esFlags: u32) -> u32;
+        }
+        // ES_CONTINUOUS | ES_SYSTEM_REQUIRED — prevent sleep
+        unsafe { SetThreadExecutionState(0x80000001); }
+    }
+
     let app_clone = app.clone();
     tokio::spawn(async move {
         let result = run_full_install_inner(&app_clone, &install_path).await;
+
+        // Re-allow sleep
+        #[cfg(target_os = "windows")]
+        {
+            extern "system" {
+                fn SetThreadExecutionState(esFlags: u32) -> u32;
+            }
+            // ES_CONTINUOUS alone — restore normal sleep behavior
+            unsafe { SetThreadExecutionState(0x80000000); }
+        }
 
         if let Ok(mut in_progress) = PATCHING_IN_PROGRESS.lock() {
             *in_progress = false;
@@ -434,6 +454,20 @@ async fn run_full_install_inner(
         },
     );
     client_files::write_static_files(&base)?;
+
+    // Check available disk space — need ~45GB minimum
+    #[cfg(target_os = "windows")]
+    {
+        let free_bytes = get_free_disk_space(&base);
+        let required_bytes = 45_000_000_000u64; // ~45 GB
+        if free_bytes > 0 && free_bytes < required_bytes {
+            return Err(format!(
+                "Not enough disk space. Need {:.1} GB free, have {:.1} GB.",
+                required_bytes as f64 / 1_073_741_824.0,
+                free_bytes as f64 / 1_073_741_824.0,
+            ));
+        }
+    }
 
     // Parse CDN config from the LocalConfig.xml we just wrote
     let patch_config =
@@ -760,40 +794,17 @@ async fn run_patching_inner(
     // Resources already in rdbdata (from a previous partial run) are detected by
     // checking if the resource header exists at the expected offset.
     // Step 4: Compute download plan — skip resources already written to rdbdata.
-    // Instead of checking each resource header (566K I/O ops), check file sizes.
-    // If an rdbdata file is at least as large as the max offset for its resources,
-    // sample a few headers to confirm it's populated (not just sparse zeros).
-    let mut file_sizes: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
-    for entry in &le_index.entries {
-        if entry.file_num == 255 { continue; }
-        if file_sizes.contains_key(&entry.file_num) { continue; }
-        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
-        if let Ok(meta) = std::fs::metadata(&rdb_path) {
-            file_sizes.insert(entry.file_num, meta.len());
-        }
-    }
-
-    // Check if rdbdata files are populated by sampling the first resource header
-    let mut populated_files: std::collections::HashSet<u8> = std::collections::HashSet::new();
-    for entry in &le_index.entries {
-        if entry.file_num == 255 || populated_files.contains(&entry.file_num) { continue; }
-        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
-        if let Ok(mut file) = std::fs::File::open(&rdb_path) {
-            use std::io::{Read, Seek, SeekFrom};
-            if entry.offset >= 16 {
-                if file.seek(SeekFrom::Start(entry.offset as u64 - 16)).is_ok() {
-                    let mut header = [0u8; 16];
-                    if file.read_exact(&mut header).is_ok() {
-                        let h_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-                        let h_id = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-                        if h_type == entry.rdb_type && h_id == entry.id {
-                            populated_files.insert(entry.file_num);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Use a completion log (rdb_completed.log) to track which rdbdata files
+    // have been fully written. This is more reliable than sampling headers
+    // because a file can have some resources written but not all.
+    let completion_log_path = rdb_dir.join("rdb_completed.log");
+    let completed_files: std::collections::HashSet<u8> = if let Ok(data) = std::fs::read_to_string(&completion_log_path) {
+        data.lines()
+            .filter_map(|l| l.trim().parse::<u8>().ok())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     let cdn_base = &cdn_base_url;
     let mut tasks = Vec::new();
@@ -803,8 +814,8 @@ async fn run_patching_inner(
             continue;
         }
 
-        // If the file is populated (first resource header matches), skip all its entries
-        if populated_files.contains(&entry.file_num) {
+        // If this file was fully completed in a previous run, skip it
+        if completed_files.contains(&entry.file_num) {
             continue;
         }
 
@@ -846,6 +857,9 @@ async fn run_patching_inner(
     );
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+    // Limit concurrent large resource downloads to prevent memory spikes.
+    // 189 resources are >10MB (up to 368MB). At 4 concurrent, worst case = ~1.5GB.
+    let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -860,7 +874,6 @@ async fn run_patching_inner(
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .user_agent("")
         .connect_timeout(dl_config.connect_timeout)
-        .read_timeout(dl_config.read_timeout)
         .build()
         .map_err(|e| format!("Failed to create download client: {}", e))?;
 
@@ -887,11 +900,19 @@ async fn run_patching_inner(
         let files_comp = files_completed.clone();
         let files_fail = files_failed.clone();
         let tracker = speed_tracker.clone();
+        let large_sem = large_semaphore.clone();
+        let is_large = _length > 1_000_000; // Resources > 1MB need large semaphore
         let ft = files_total;
         let tb = total_bytes;
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
+            // Acquire large semaphore for big resources to limit memory usage
+            let _large_permit = if is_large {
+                Some(large_sem.acquire_owned().await.unwrap())
+            } else {
+                None
+            };
             let max_retries = 3u32;
 
             for attempt in 0..=max_retries {
@@ -974,6 +995,21 @@ async fn run_patching_inner(
             final_failed, files_total
         ));
     }
+
+    // All resources written successfully — mark all file_nums as complete
+    let completion_log_path = rdb_dir.join("rdb_completed.log");
+    let mut all_file_nums: Vec<u8> = le_index.entries.iter()
+        .filter(|e| e.file_num != 255)
+        .map(|e| e.file_num)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    all_file_nums.sort();
+    let log_content = all_file_nums.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n") + "\n";
+    let _ = std::fs::write(&completion_log_path, &log_content);
 
     Ok(())
 }
@@ -1672,6 +1708,33 @@ fn get_display_modes() -> Vec<String> {
     }
 
     modes
+}
+
+/// Get free disk space for the drive containing the given path.
+/// Returns 0 if the check fails.
+#[cfg(target_os = "windows")]
+fn get_free_disk_space(path: &std::path::Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_bytes: u64 = 0;
+    let mut _total: u64 = 0;
+    let mut _total_free: u64 = 0;
+
+    let result = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_bytes, &mut _total, &mut _total_free)
+    };
+
+    if result != 0 { free_bytes } else { 0 }
 }
 
 pub fn run() {
