@@ -2,6 +2,7 @@ pub mod client_files;
 pub mod config;
 pub mod download;
 pub mod rdb;
+pub mod rdbdata;
 pub mod verify;
 
 use serde::{Deserialize, Serialize};
@@ -587,7 +588,11 @@ async fn start_patching(app: tauri::AppHandle, install_path: String) -> Result<(
     Ok(())
 }
 
-/// Inner patching logic — parses configs, computes plan, runs downloads.
+/// Inner patching logic — downloads RDB resources and writes to rdbdata containers.
+///
+/// Uses le.idx for placement data: each resource goes to a specific offset
+/// in a specific rdbdata file. Downloads from CDN, decompresses IOz1,
+/// writes directly to rdbdata — no staging files.
 async fn run_patching_inner(
     app: &tauri::AppHandle,
     install_path: &str,
@@ -595,142 +600,336 @@ async fn run_patching_inner(
     use tauri::Emitter;
 
     let base = std::path::PathBuf::from(install_path);
+    let rdb_dir = base.join("RDB");
+    std::fs::create_dir_all(&rdb_dir)
+        .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
 
     // Emit checking phase
     let _ = app.emit(
         "patch:progress",
         &download::DownloadProgress {
-            bytes_downloaded: 0,
-            total_bytes: 0,
-            files_completed: 0,
-            files_total: 0,
-            speed_bps: 0,
-            current_file: String::new(),
-            phase: "checking".into(),
-            failed_files: 0,
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Checking game state...".into(),
+            phase: "checking".into(), failed_files: 0,
         },
     );
 
-    // Parse configs
+    // Parse CDN config
     let patch_config =
         config::parse_local_config(&base.join("LocalConfig.xml")).map_err(|e| e.to_string())?;
-
-    // Upgrade to HTTPS for HTTP/2 multiplexing — drastically reduces per-request
-    // overhead for 650K small files. The CDN supports HTTP/2 over TLS.
     let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
-    let staging_dir = base.join("staging");
-    std::fs::create_dir_all(&staging_dir)
-        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
-
-    // Ensure RDB directory exists
-    let rdb_dir = base.join("RDB");
-    std::fs::create_dir_all(&rdb_dir)
-        .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
 
     let le_idx_path = rdb_dir.join("le.idx");
     let hash_idx_path = rdb_dir.join("RDBHashIndex.bin");
 
-    // Bootstrap: if RDBHashIndex.bin doesn't exist, download it from CDN
+    // Create a shared HTTP client for bootstrap downloads
+    let bootstrap_client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .user_agent("")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Step 1: Download le.idx from GitHub Releases if missing
+    if !le_idx_path.exists() {
+        let _ = app.emit(
+            "patch:progress",
+            &download::DownloadProgress {
+                bytes_downloaded: 0, total_bytes: 0,
+                files_completed: 0, files_total: 0,
+                speed_bps: 0, current_file: "Downloading resource index...".into(),
+                phase: "bootstrapping".into(), failed_files: 0,
+            },
+        );
+
+        let le_idx_url = "https://github.com/EndlessVex/TSW-Modern/releases/download/game-data/le.idx.gz";
+        let response = bootstrap_client.get(le_idx_url)
+            .send().await.map_err(|e| format!("Failed to download le.idx: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Failed to download le.idx: HTTP {}", response.status()));
+        }
+
+        let gz_bytes = response.bytes().await
+            .map_err(|e| format!("Failed to read le.idx download: {}", e))?;
+
+        // Decompress gzip
+        use std::io::{Read, Seek, SeekFrom};
+        let mut decoder = flate2::read::GzDecoder::new(&gz_bytes[..]);
+        let mut le_idx_data = Vec::new();
+        decoder.read_to_end(&mut le_idx_data)
+            .map_err(|e| format!("Failed to decompress le.idx: {}", e))?;
+
+        // Verify it's IBDR format
+        if le_idx_data.len() < 4 || &le_idx_data[..4] != b"IBDR" {
+            return Err("Downloaded le.idx has invalid format".into());
+        }
+
+        tokio::fs::write(&le_idx_path, &le_idx_data).await
+            .map_err(|e| format!("Failed to write le.idx: {}", e))?;
+
+        log::info!("Downloaded le.idx: {} bytes", le_idx_data.len());
+    }
+
+    // Step 2: Download RDBHashIndex.bin if missing
     if !hash_idx_path.exists() {
         let _ = app.emit(
             "patch:progress",
             &download::DownloadProgress {
                 bytes_downloaded: 0, total_bytes: 0,
                 files_completed: 0, files_total: 0,
-                speed_bps: 0, current_file: "Downloading patch index...".into(),
+                speed_bps: 0, current_file: "Downloading hash index...".into(),
                 phase: "bootstrapping".into(), failed_files: 0,
             },
         );
 
-        // Download PatchInfoClient.txt to get RDBHash
         let patch_info_url = format!("{}/PatchInfoClient.txt", patch_config.patch_base_url());
-        let dl_config = download::DownloadConfig::default();
-        let client = download::create_client(&dl_config).map_err(|e| e.to_string())?;
+        let patch_info_text = bootstrap_client.get(&patch_info_url)
+            .send().await.map_err(|e| format!("PatchInfoClient.txt: {}", e))?
+            .text().await.map_err(|e| format!("PatchInfoClient.txt read: {}", e))?;
 
-        let patch_info_text = client.get(&patch_info_url)
-            .send().await.map_err(|e| format!("Failed to download PatchInfoClient.txt: {}", e))?
-            .text().await.map_err(|e| format!("Failed to read PatchInfoClient.txt: {}", e))?;
-
-        // Parse RDBHash from PatchInfoClient.txt
         let rdb_hash = patch_info_text.lines()
             .find(|l| l.starts_with("RDBHash="))
             .and_then(|l| l.strip_prefix("RDBHash="))
             .ok_or("RDBHash not found in PatchInfoClient.txt")?
             .to_string();
 
-        // Download RDBHashIndex.bin from rdb/full/{RDBHash}
         let hash_idx_url = format!("{}/rdb/full/{}", cdn_base_url.trim_end_matches('/'), rdb_hash);
-        let response = client.get(&hash_idx_url)
-            .send().await.map_err(|e| format!("Failed to download RDBHashIndex.bin: {}", e))?;
+        let response = bootstrap_client.get(&hash_idx_url)
+            .send().await.map_err(|e| format!("RDBHashIndex.bin: {}", e))?;
 
         if !response.status().is_success() {
             return Err(format!("CDN returned {} for RDBHashIndex.bin", response.status()));
         }
 
         let hash_idx_bytes = response.bytes().await
-            .map_err(|e| format!("Failed to read RDBHashIndex.bin: {}", e))?;
+            .map_err(|e| format!("RDBHashIndex.bin read: {}", e))?;
 
-        // Check if it's IOz1 compressed and decompress if needed
         let final_bytes = if hash_idx_bytes.len() > 4 && &hash_idx_bytes[..4] == b"IOz1" {
-            verify::decompress_ioz1(&hash_idx_bytes)
-                .map_err(|e| format!("Failed to decompress RDBHashIndex.bin: {}", e))?
+            verify::decompress_ioz1(&hash_idx_bytes)?
         } else {
             hash_idx_bytes.to_vec()
         };
 
         tokio::fs::write(&hash_idx_path, &final_bytes).await
-            .map_err(|e| format!("Failed to write RDBHashIndex.bin: {}", e))?;
+            .map_err(|e| format!("Write RDBHashIndex.bin: {}", e))?;
     }
 
-    // Parse hash index (now guaranteed to exist)
-    let hash_index =
-        rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
+    // Step 3: Parse indices and create rdbdata files
+    let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
+    let hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
 
-    // Compute download plan — use le.idx if available, otherwise hash-index-only
-    let manifest = DownloadManifest::load(&staging_dir);
-    let tasks = if le_idx_path.exists() {
-        let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
-        compute_download_plan(&le_index, &hash_index, &cdn_base_url, &staging_dir, &manifest)
-    } else {
-        download::compute_download_plan_from_hash_index(&hash_index, &cdn_base_url, &staging_dir, &manifest)
-    };
+    // Create rdbdata container files
+    rdbdata::create_rdbdata_files(&base, &le_index)?;
+
+    // Build placement map for fast lookup
+    let placement_map = rdbdata::build_placement_map(&le_index);
+
+    // Step 4: Compute download plan — only resources not yet written to rdbdata
+    // Check which resources already exist by verifying a sample from each rdbdata file.
+    // For now, use the hash index to determine what needs downloading.
+    // Resources already in rdbdata (from a previous partial run) are detected by
+    // checking if the resource header exists at the expected offset.
+    let cdn_base = &cdn_base_url;
+    let mut tasks = Vec::new();
+
+    for entry in &le_index.entries {
+        if entry.file_num == 255 {
+            continue;
+        }
+
+        // Check if this resource already exists in rdbdata
+        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
+        let already_written = if let Ok(mut file) = std::fs::File::open(&rdb_path) {
+            use std::io::{Read, Seek, SeekFrom};
+            // Read the resource header at (offset - 16) to check if it's been written
+            if entry.offset >= 16 {
+                if file.seek(SeekFrom::Start(entry.offset as u64 - 16)).is_ok() {
+                    let mut header = [0u8; 16];
+                    if file.read_exact(&mut header).is_ok() {
+                        let h_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                        let h_id = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                        let h_size = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+                        h_type == entry.rdb_type && h_id == entry.id && h_size > 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if already_written {
+            continue;
+        }
+
+        let hash_hex = rdb::hex_encode(&entry.hash);
+        let url = rdb::cdn_url_from_hash(cdn_base, &entry.hash);
+        tasks.push((entry.rdb_type, entry.id, entry.file_num, entry.offset, entry.length, url, hash_hex));
+    }
+
+    let files_total = tasks.len() as u32;
+    let total_bytes: u64 = tasks.iter().map(|(_, _, _, _, len, _, _)| *len as u64).sum();
 
     if tasks.is_empty() {
-        // Already up to date
         let _ = app.emit(
             "patch:progress",
             &download::DownloadProgress {
-                bytes_downloaded: 0,
-                total_bytes: 0,
-                files_completed: 0,
-                files_total: 0,
-                speed_bps: 0,
-                current_file: String::new(),
-                phase: "complete".into(),
-                failed_files: 0,
+                bytes_downloaded: 0, total_bytes: 0,
+                files_completed: 0, files_total: 0,
+                speed_bps: 0, current_file: String::new(),
+                phase: "complete".into(), failed_files: 0,
             },
         );
         return Ok(());
     }
 
-    let dl_config = DownloadConfig {
-        cdn_base_url: cdn_base_url.clone(),
-        staging_dir: staging_dir.clone(),
-        max_concurrent: 128,
-        ..Default::default()
-    };
-    let client = create_client(&dl_config).map_err(|e| e.to_string())?;
-    let manifest_arc = std::sync::Arc::new(tokio::sync::Mutex::new(manifest));
+    log::info!("RDB download plan: {} resources, {:.1} MB", files_total, total_bytes as f64 / 1_048_576.0);
 
-    let result = run_downloads(app, &dl_config, &client, tasks, manifest_arc, &PATCH_PAUSED, &PATCH_CANCEL)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Step 5: Download resources and write directly to rdbdata
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes,
+            files_completed: 0, files_total,
+            speed_bps: 0, current_file: "Downloading game resources...".into(),
+            phase: "downloading".into(), failed_files: 0,
+        },
+    );
 
-    if result.files_failed > 0 {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+    let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let speed_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+        download::SpeedTracker::new(std::time::Duration::from_secs(15))
+    ));
+
+    let dl_config = download::DownloadConfig::default();
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(128)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .user_agent("")
+        .connect_timeout(dl_config.connect_timeout)
+        .read_timeout(dl_config.read_timeout)
+        .build()
+        .map_err(|e| format!("Failed to create download client: {}", e))?;
+
+    let install_base = base.clone();
+    let mut handles = Vec::with_capacity(tasks.len());
+
+    for (rdb_type, id, file_num, offset, length, url, hash_hex) in tasks {
+        if PATCH_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        while PATCH_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            if PATCH_CANCEL.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if PATCH_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let client = client.clone();
+        let app = app.clone();
+        let install_base = install_base.clone();
+        let bytes_dl = bytes_downloaded.clone();
+        let files_comp = files_completed.clone();
+        let files_fail = files_failed.clone();
+        let tracker = speed_tracker.clone();
+        let ft = files_total;
+        let tb = total_bytes;
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let max_retries = 3u32;
+
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+
+                // Download
+                let resp = match client.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => r,
+                    _ => continue,
+                };
+                let body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                // Decompress IOz1
+                let decompressed = if body.len() > 4 && &body[..4] == b"IOz1" {
+                    match verify::decompress_ioz1(&body) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    }
+                } else {
+                    body.to_vec()
+                };
+
+                // Write to rdbdata
+                if let Err(e) = rdbdata::write_resource_to_rdbdata(
+                    &install_base, file_num, rdb_type, id, offset, &decompressed,
+                ) {
+                    log::warn!("Write failed for {}:{}: {}", rdb_type, id, e);
+                    continue;
+                }
+
+                // Success
+                let new_bytes = bytes_dl.fetch_add(decompressed.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed) + decompressed.len() as u64;
+                let completed = files_comp.fetch_add(1,
+                    std::sync::atomic::Ordering::Relaxed) + 1;
+
+                {
+                    let mut t = tracker.lock().await;
+                    t.record(new_bytes);
+                }
+
+                if completed % 50 == 0 || completed == ft {
+                    let speed = { tracker.lock().await.speed_bps() };
+                    let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
+                    let _ = app.emit(
+                        "patch:progress",
+                        &download::DownloadProgress {
+                            bytes_downloaded: new_bytes,
+                            total_bytes: tb,
+                            files_completed: completed,
+                            files_total: ft,
+                            speed_bps: speed,
+                            current_file: hash_hex.clone(),
+                            phase: "downloading".into(),
+                            failed_files: failed,
+                        },
+                    );
+                }
+
+                return;
+            }
+
+            files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let final_failed = files_failed.load(std::sync::atomic::Ordering::Relaxed);
+    if final_failed > 0 {
         return Err(format!(
-            "{} files failed to download out of {} total",
-            result.files_failed,
-            result.files_completed + result.files_failed
+            "{} of {} resources failed to download",
+            final_failed, files_total
         ));
     }
 
