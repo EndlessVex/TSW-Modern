@@ -19,7 +19,6 @@ interface MainViewProps {
   installerProgress: { bytes_downloaded: number; total_bytes: number } | null;
   installerPhase: string | null;
   freshInstallDir: string;
-  onSelectDirectory: () => void;
   onDownloadInstaller: () => void;
   onChooseFreshInstallDir: () => void;
   onStartPatching: () => void;
@@ -58,7 +57,6 @@ export default function MainView({
   installerProgress,
   installerPhase,
   freshInstallDir,
-  onSelectDirectory,
   onDownloadInstaller,
   onChooseFreshInstallDir,
   onStartPatching,
@@ -138,12 +136,6 @@ export default function MainView({
               </div>
               <button className="btn btn-install" onClick={onDownloadInstaller}>
                 Download &amp; Install TSW
-              </button>
-              <div className="fresh-install-divider">
-                <span>or</span>
-              </div>
-              <button className="btn btn-secondary" onClick={onSelectDirectory}>
-                I already have the game installed
               </button>
             </div>
           )}
