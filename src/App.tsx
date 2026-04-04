@@ -71,18 +71,6 @@ function App() {
     };
   }, []);
 
-  // Listen for client_files:progress events (Phase 2 of full install)
-  useEffect(() => {
-    const unlisten = listen<{ files_completed: number; files_total: number; bytes_downloaded: number; total_bytes: number; phase: string; current_file: string }>("client_files:progress", (event) => {
-      const { phase } = event.payload;
-      setPatchPhase(phase === "downloading" ? "bootstrapping" : phase);
-    });
-
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
   const validatePath = useCallback(async (path: string) => {
     try {
       const result = await invoke<InstallValidation>("validate_install_dir", { path });

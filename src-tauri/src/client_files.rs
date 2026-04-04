@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 /// Embedded game file manifest — compiled into the binary.
@@ -24,17 +24,6 @@ pub struct GameFileEntry {
     pub path: String,
     pub size: u64,
     pub md5: String,
-}
-
-/// Progress event for client file downloads.
-#[derive(Debug, Clone, Serialize)]
-pub struct ClientFilesProgress {
-    pub files_completed: u32,
-    pub files_total: u32,
-    pub bytes_downloaded: u64,
-    pub total_bytes: u64,
-    pub phase: String,
-    pub current_file: String,
 }
 
 /// Load the embedded manifest, filtering to files not already present on disk.
@@ -128,17 +117,6 @@ pub async fn download_client_files(
     let files_total = plan.len() as u32;
 
     if files_total == 0 {
-        let _ = app.emit(
-            "client_files:progress",
-            &ClientFilesProgress {
-                files_completed: 0,
-                files_total: 0,
-                bytes_downloaded: 0,
-                total_bytes: 0,
-                phase: "complete".into(),
-                current_file: String::new(),
-            },
-        );
         return Ok(0);
     }
 
@@ -159,16 +137,18 @@ pub async fn download_client_files(
     let files_completed = Arc::new(AtomicU32::new(0));
     let files_failed = Arc::new(AtomicU32::new(0));
 
-    // Emit initial progress
+    // Emit initial progress via patch:progress (same event PatchProgress listens to)
     let _ = app.emit(
-        "client_files:progress",
-        &ClientFilesProgress {
-            files_completed: 0,
-            files_total,
+        "patch:progress",
+        &crate::download::DownloadProgress {
             bytes_downloaded: 0,
             total_bytes,
+            files_completed: 0,
+            files_total,
+            speed_bps: 0,
+            current_file: "Downloading game files...".into(),
             phase: "downloading".into(),
-            current_file: String::new(),
+            failed_files: 0,
         },
     );
 
@@ -216,80 +196,89 @@ pub async fn download_client_files(
             let url = client_file_url(&cdn, &entry.md5);
             let dest = install.join(&entry.path);
 
-            // Download
-            let resp = match client.get(&url).send().await {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    log::warn!("Client file {} → HTTP {}", entry.path, r.status());
-                    files_fail.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("Client file {} → {}", entry.path, e);
-                    files_fail.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+            // Retry loop with exponential backoff
+            let max_retries = 3u32;
+            let mut last_error = String::new();
 
-            let body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("Client file {} read → {}", entry.path, e);
-                    files_fail.fetch_add(1, Ordering::Relaxed);
-                    return;
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    tokio::time::sleep(delay).await;
                 }
-            };
 
-            // Decompress IOz2 if needed
-            let final_data = match decompress_ioz2(&body) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::warn!("Client file {} decompress → {}", entry.path, e);
-                    files_fail.fetch_add(1, Ordering::Relaxed);
-                    return;
+                // Download
+                let resp = match client.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        last_error = format!("HTTP {}", r.status());
+                        continue;
+                    }
+                    Err(e) => {
+                        last_error = format!("{}", e);
+                        continue;
+                    }
+                };
+
+                let body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last_error = format!("read: {}", e);
+                        continue;
+                    }
+                };
+
+                // Decompress IOz2 if needed
+                let final_data = match decompress_ioz2(&body) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        last_error = format!("decompress: {}", e);
+                        continue;
+                    }
+                };
+
+                // Verify MD5
+                let mut hasher = md5::Md5::new();
+                hasher.update(&final_data);
+                let actual_md5 = format!("{:x}", hasher.finalize());
+                if actual_md5 != entry.md5 {
+                    last_error = format!("MD5 mismatch: got {}", actual_md5);
+                    continue;
                 }
-            };
 
-            // Verify MD5
-            let mut hasher = md5::Md5::new();
-            hasher.update(&final_data);
-            let actual_md5 = format!("{:x}", hasher.finalize());
-            if actual_md5 != entry.md5 {
-                log::warn!(
-                    "Client file {} MD5 mismatch: expected {}, got {}",
-                    entry.path, entry.md5, actual_md5
-                );
-                files_fail.fetch_add(1, Ordering::Relaxed);
-                return;
+                // Write to disk
+                if let Err(e) = tokio::fs::write(&dest, &final_data).await {
+                    last_error = format!("write: {}", e);
+                    continue;
+                }
+
+                // Success — update progress
+                let new_bytes = bytes_dl.fetch_add(final_data.len() as u64, Ordering::Relaxed)
+                    + final_data.len() as u64;
+                let completed = files_comp.fetch_add(1, Ordering::Relaxed) + 1;
+
+                // Emit to patch:progress so the standard PatchProgress component works
+                if completed % 20 == 0 || completed == ft {
+                    let _ = app.emit(
+                        "patch:progress",
+                        &crate::download::DownloadProgress {
+                            bytes_downloaded: new_bytes,
+                            total_bytes: tb,
+                            files_completed: completed,
+                            files_total: ft,
+                            speed_bps: 0,
+                            current_file: entry.path.clone(),
+                            phase: "downloading".into(),
+                            failed_files: files_fail.load(Ordering::Relaxed),
+                        },
+                    );
+                }
+
+                return; // Success
             }
 
-            // Write to disk
-            if let Err(e) = tokio::fs::write(&dest, &final_data).await {
-                log::warn!("Client file {} write → {}", entry.path, e);
-                files_fail.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            // Update progress
-            let new_bytes = bytes_dl.fetch_add(final_data.len() as u64, Ordering::Relaxed)
-                + final_data.len() as u64;
-            let completed =
-                files_comp.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Emit progress every 20 files
-            if completed % 20 == 0 || completed == ft {
-                let _ = app.emit(
-                    "client_files:progress",
-                    &ClientFilesProgress {
-                        files_completed: completed,
-                        files_total: ft,
-                        bytes_downloaded: new_bytes,
-                        total_bytes: tb,
-                        phase: "downloading".into(),
-                        current_file: entry.path.clone(),
-                    },
-                );
-            }
+            // All retries exhausted
+            log::warn!("Client file {} failed after {} retries: {}", entry.path, max_retries, last_error);
+            files_fail.fetch_add(1, Ordering::Relaxed);
         }));
     }
 
@@ -300,23 +289,6 @@ pub async fn download_client_files(
 
     let final_completed = files_completed.load(Ordering::Relaxed);
     let final_failed = files_failed.load(Ordering::Relaxed);
-    let final_bytes = bytes_downloaded.load(Ordering::Relaxed);
-
-    let _ = app.emit(
-        "client_files:progress",
-        &ClientFilesProgress {
-            files_completed: final_completed,
-            files_total,
-            bytes_downloaded: final_bytes,
-            total_bytes,
-            phase: if final_failed > 0 { "error" } else { "complete" }.into(),
-            current_file: if final_failed > 0 {
-                format!("{} files failed", final_failed)
-            } else {
-                String::new()
-            },
-        },
-    );
 
     if final_failed > 0 {
         Err(format!(
