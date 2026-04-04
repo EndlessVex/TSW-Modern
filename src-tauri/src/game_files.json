@@ -120,11 +120,6 @@
     "md5": "37c5619b74f648376038781ac27f9937"
   },
   {
-    "path": "LocalConfig.xml",
-    "size": 669,
-    "md5": "3d43e555782ba9f8aa6f5fe4365d4ec2"
-  },
-  {
     "path": "msvcp100.dll",
     "size": 421200,
     "md5": "03e9314004f504a14a61c3d364b62f66"
@@ -168,11 +163,6 @@
     "path": "PhysXDevice.dll",
     "size": 71008,
     "md5": "34f2e08906fdbc5db36b47bf0c4a1a03"
-  },
-  {
-    "path": "Readme.txt",
-    "size": 4782,
-    "md5": "f905d541128168b9679ed1000326a1e1"
   },
   {
     "path": "shader.cache",
@@ -450,11 +440,6 @@
     "md5": "7881f00a18347f00b912078ef4c459a4"
   },
   {
-    "path": "Data/Gui/Default/LanguagePrefs.xml",
-    "size": 187,
-    "md5": "95a2afe879e9e91a0e9296d2b96b796d"
-  },
-  {
     "path": "Data/Gui/Default/LoginPrefs.xml",
     "size": 4526,
     "md5": "bb048349cdc439d2ce27f82a06f85543"
@@ -668,11 +653,6 @@
     "path": "Data/Gui/Default/Flash/Fifo.swf",
     "size": 32317,
     "md5": "7b8c39a3657a29490570f994f3a2ff25"
-  },
-  {
-    "path": "Data/Gui/Default/Flash/filenames.txt",
-    "size": 2702,
-    "md5": "da2324badf7fc0cf88ac4247653de4b6"
   },
   {
     "path": "Data/Gui/Default/Flash/fonts_standard.swf",
@@ -1193,11 +1173,6 @@
     "path": "Data/Gui/Default/Flash/XpBar.swf",
     "size": 72197,
     "md5": "20fd34de2ef53b63f067044355df9b83"
-  },
-  {
-    "path": "Data/Gui/Default/Flash/Banners/BannerConfig.xml",
-    "size": 359,
-    "md5": "3bff0c63a0831e716547e936aab9e574"
   },
   {
     "path": "Data/Gui/Default/Flash/CharacterCreation/RemoveOutfit.swf",
@@ -4470,19 +4445,9 @@
     "md5": "000aca2f44f4ea353b54ece375728468"
   },
   {
-    "path": "Data/Gui/Default/gfx/WorldmapGUI/minimap_missiongiver.tga",
-    "size": 1625,
-    "md5": "0ccbc42d3ed411e0ddb2482c634948ed"
-  },
-  {
     "path": "Data/Gui/Default/gfx/WorldmapGUI/minimap_missionitem.backup.tga",
     "size": 2348,
     "md5": "4fe2a40eb883001cfe69774327b903f2"
-  },
-  {
-    "path": "Data/Gui/Default/gfx/WorldmapGUI/minimap_missionitem.tga",
-    "size": 1589,
-    "md5": "b92e2a2eb3662a6ebea749104ae196a0"
   },
   {
     "path": "Data/Gui/Default/gfx/WorldmapGUI/minimap_npc.tga",
@@ -7508,11 +7473,6 @@
     "path": "mediacenter/BoxArt.png",
     "size": 14541,
     "md5": "feed269791c7c03b7705f086fdff29f2"
-  },
-  {
-    "path": "mediacenter/TheSecretWorld.lnk",
-    "size": 1190,
-    "md5": "7bd6d2cffdbbbd23c875d97e6c5db72d"
   },
   {
     "path": "mediacenter/TheSecretWorld.mcl",
