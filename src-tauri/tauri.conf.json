@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
-  "productName": "Secret World Launcher",
+  "productName": "Secret.World.Launcher",
   "version": "0.1.0",
   "identifier": "com.endlessvex.tsw-modern",
   "build": {
@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
