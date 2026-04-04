@@ -202,7 +202,7 @@ pub async fn download_client_files(
 
             for attempt in 0..=max_retries {
                 if attempt > 0 {
-                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    let delay = Duration::from_millis(500 * attempt as u64);
                     tokio::time::sleep(delay).await;
                 }
 

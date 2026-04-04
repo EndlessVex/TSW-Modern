@@ -671,8 +671,8 @@ pub async fn run_downloads(
             for attempt in 0..=max_retries {
                 if attempt > 0 {
                     // Exponential backoff: 1s, 2s, 4s + jitter up to 500ms
-                    let base_delay = Duration::from_secs(1 << (attempt - 1));
-                    let jitter = Duration::from_millis(rand::random::<u64>() % 500);
+                    let base_delay = Duration::from_millis(500 * attempt as u64);
+                    let jitter = Duration::from_millis(rand::random::<u64>() % 300);
                     tokio::time::sleep(base_delay + jitter).await;
                     log::info!(
                         "Retrying {} (attempt {}/{})",
