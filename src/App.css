@@ -742,41 +742,58 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.75rem 1.25rem;
+  padding: 0 0.75rem;
+  height: 34px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  user-select: none;
+}
+
+.app-header[data-tauri-drag-region] {
+  -webkit-app-region: drag;
 }
 
 .app-title {
   font-family: var(--font-heading);
-  font-size: 1.2rem;
+  font-size: 0.85rem;
   font-weight: 600;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.12em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.titlebar-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  padding: 0;
+}
+
+.titlebar-btn:hover {
+  background: var(--bg-hover);
   color: var(--text-primary);
 }
 
-.header-settings-btn {
-  background: none;
-  border: 1px solid transparent;
-  color: var(--text-secondary);
-  font-size: 1.25rem;
-  cursor: pointer;
-  padding: 0.3rem 0.5rem;
-  border-radius: 6px;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  line-height: 1;
-}
-
-.header-settings-btn:hover {
-  color: var(--accent);
-  border-color: var(--border-accent);
-}
-
-.header-settings-active {
-  color: var(--accent);
-  background: var(--accent-glow);
-  border-color: var(--accent);
+.titlebar-btn:last-child:hover {
+  background: rgba(248, 81, 73, 0.25);
+  color: var(--error);
 }
 
 .app-content {

@@ -54,3 +54,11 @@ bench_staging/
 !tsconfig.node.json
 !src-tauri/tauri.conf.json
 interceptor_output.txt
+
+# ── GSD baseline (auto-generated) ──
+.next/
+__pycache__/
+*.pyc
+.venv/
+venv/
+vendor/
