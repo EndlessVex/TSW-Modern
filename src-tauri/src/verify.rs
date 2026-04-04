@@ -318,6 +318,41 @@ pub fn decompress_ioz1(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(decompressed)
 }
 
+/// Decompress IOz2-format data (LZMA-compressed CDN payloads).
+///
+/// IOz2 format: 4-byte magic (`IOz2`) + u32_LE original_size + LZMA-compressed data.
+/// The LZMA stream starts with a 5-byte properties header followed by compressed data.
+pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 8 {
+        return Err("IOz2 data too short".into());
+    }
+
+    if &data[0..4] != b"IOz2" {
+        return Err(format!("Expected IOz2 magic, got {:?}", &data[0..4]));
+    }
+
+    let original_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+
+    let mut decompressed = Vec::with_capacity(original_size);
+    lzma_rs::lzma_decompress(&mut &data[8..], &mut decompressed)
+        .map_err(|e| format!("IOz2 LZMA decompression failed: {e}"))?;
+
+    Ok(decompressed)
+}
+
+/// Decompress CDN data — handles IOz1 (zlib), IOz2 (LZMA), or uncompressed.
+pub fn decompress_cdn(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() >= 4 {
+        if &data[0..4] == b"IOz1" {
+            return decompress_ioz1(data);
+        }
+        if &data[0..4] == b"IOz2" {
+            return decompress_ioz2(data);
+        }
+    }
+    Ok(data.to_vec())
+}
+
 /// Write decompressed bytes to an rdbdata file at a specific offset.
 ///
 /// Opens the rdbdata file, seeks to the given offset, and writes the data.
