@@ -759,6 +759,42 @@ async fn run_patching_inner(
     // For now, use the hash index to determine what needs downloading.
     // Resources already in rdbdata (from a previous partial run) are detected by
     // checking if the resource header exists at the expected offset.
+    // Step 4: Compute download plan — skip resources already written to rdbdata.
+    // Instead of checking each resource header (566K I/O ops), check file sizes.
+    // If an rdbdata file is at least as large as the max offset for its resources,
+    // sample a few headers to confirm it's populated (not just sparse zeros).
+    let mut file_sizes: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+    for entry in &le_index.entries {
+        if entry.file_num == 255 { continue; }
+        if file_sizes.contains_key(&entry.file_num) { continue; }
+        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
+        if let Ok(meta) = std::fs::metadata(&rdb_path) {
+            file_sizes.insert(entry.file_num, meta.len());
+        }
+    }
+
+    // Check if rdbdata files are populated by sampling the first resource header
+    let mut populated_files: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for entry in &le_index.entries {
+        if entry.file_num == 255 || populated_files.contains(&entry.file_num) { continue; }
+        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
+        if let Ok(mut file) = std::fs::File::open(&rdb_path) {
+            use std::io::{Read, Seek, SeekFrom};
+            if entry.offset >= 16 {
+                if file.seek(SeekFrom::Start(entry.offset as u64 - 16)).is_ok() {
+                    let mut header = [0u8; 16];
+                    if file.read_exact(&mut header).is_ok() {
+                        let h_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                        let h_id = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                        if h_type == entry.rdb_type && h_id == entry.id {
+                            populated_files.insert(entry.file_num);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let cdn_base = &cdn_base_url;
     let mut tasks = Vec::new();
 
@@ -767,33 +803,8 @@ async fn run_patching_inner(
             continue;
         }
 
-        // Check if this resource already exists in rdbdata
-        let rdb_path = base.join("RDB").join(format!("{:02}.rdbdata", entry.file_num));
-        let already_written = if let Ok(mut file) = std::fs::File::open(&rdb_path) {
-            use std::io::{Read, Seek, SeekFrom};
-            // Read the resource header at (offset - 16) to check if it's been written
-            if entry.offset >= 16 {
-                if file.seek(SeekFrom::Start(entry.offset as u64 - 16)).is_ok() {
-                    let mut header = [0u8; 16];
-                    if file.read_exact(&mut header).is_ok() {
-                        let h_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-                        let h_id = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-                        let h_size = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-                        h_type == entry.rdb_type && h_id == entry.id && h_size > 0
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if already_written {
+        // If the file is populated (first resource header matches), skip all its entries
+        if populated_files.contains(&entry.file_num) {
             continue;
         }
 
