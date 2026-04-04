@@ -1725,7 +1725,7 @@ fn get_display_modes() -> Vec<String> {
     modes
 }
 
-/// Get available system RAM in megabytes.
+/// Get available system RAM in megabytes (free, not total).
 fn get_available_ram_mb() -> u64 {
     #[cfg(target_os = "windows")]
     {
@@ -1751,12 +1751,13 @@ fn get_available_ram_mb() -> u64 {
         mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let result = unsafe { GlobalMemoryStatusEx(&mut mem) };
         if result != 0 {
-            return mem.ullTotalPhys / 1_048_576;
+            // Use available (free) RAM, not total
+            return mem.ullAvailPhys / 1_048_576;
         }
     }
 
-    // Fallback: assume 8GB
-    8192
+    // Fallback: assume 4GB available
+    4096
 }
 
 /// Get free disk space for the drive containing the given path.
