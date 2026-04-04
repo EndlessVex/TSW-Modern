@@ -496,8 +496,29 @@ async fn run_full_install_inner(
         return Err("Installation cancelled by user".into());
     }
 
-    // Phase 4: Download RDB resources — delegate to existing patching logic
-    run_patching_inner(app, install_path).await
+    // Phase 4: Download RDB resources to staging.
+    // NOTE: Resources are downloaded to staging/ directory. They need to be
+    // processed into RDB/XX.rdbdata files for the game to use them.
+    // This is handled by the game's patcher on first launch, or by our
+    // verify+repair flow after rdbdata files exist.
+    run_patching_inner(app, install_path).await?;
+
+    // After all phases complete, emit final complete
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0,
+            total_bytes: 0,
+            files_completed: 0,
+            files_total: 0,
+            speed_bps: 0,
+            current_file: String::new(),
+            phase: "complete".into(),
+            failed_files: 0,
+        },
+    );
+
+    Ok(())
 }
 
 #[tauri::command]
