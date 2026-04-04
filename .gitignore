@@ -38,6 +38,8 @@ Thumbs.db
 
 # ── Game install (local testing) ──
 The Secret World/
+our_downloader_secretworld/
+working_secretworld/
 
 # ── Misc ──
 coverage/
@@ -54,6 +56,10 @@ bench_staging/
 !tsconfig.node.json
 !src-tauri/tauri.conf.json
 interceptor_output.txt
+*.bak
+
+# ── Debug tools (not part of the app) ──
+src-tauri/tools/
 
 # ── GSD baseline (auto-generated) ──
 .next/

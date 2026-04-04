@@ -1,15 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { store } from "./store";
 import Header from "./Header";
 import MainView from "./MainView";
 import LoginForm from "./LoginForm";
-import NewsFeed from "./NewsFeed";
 import SettingsPanel from "./SettingsPanel";
 import BottomBar, { type TabId } from "./BottomBar";
 import type { PatchStatus, DownloadProgress } from "./PatchProgress";
+import PatchProgress from "./PatchProgress";
 import type { VerifyProgressData } from "./VerifyProgress";
 import "./App.css";
 
@@ -32,20 +33,20 @@ function App() {
   const [patching, setPatching] = useState(false);
   const [patchStatus, setPatchStatus] = useState<PatchStatus | null>(null);
   const [patchPhase, setPatchPhase] = useState<string | null>(null);
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [, setCheckingUpdates] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [verifying, setVerifying] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<number | null>(null);
+  const [, setVerifyResult] = useState<number | null>(null);
   const [repairing, setRepairing] = useState(false);
-  const [installerDownloading, setInstallerDownloading] = useState(false);
-  const [installerProgress, setInstallerProgress] = useState<{ bytes_downloaded: number; total_bytes: number } | null>(null);
-  const [installerPhase, setInstallerPhase] = useState<string | null>(null);
+  const [, setInstallerDownloading] = useState(false);
+  const [, setInstallerProgress] = useState<{ bytes_downloaded: number; total_bytes: number } | null>(null);
+  const [, setInstallerPhase] = useState<string | null>(null);
   const [freshInstallDir, setFreshInstallDir] = useState<string>(
     "C:\\Program Files (x86)\\Funcom\\The Secret World"
   );
   const [dxVersion, setDxVersion] = useState<"dx9" | "dx11">("dx11");
-  const [bundleMode, setBundleMode] = useState<"full" | "minimum">("full");
+  const [, setBundleMode] = useState<"full" | "minimum">("full");
 
   // Keep ref in sync for use in event listeners (avoids stale closure)
   useEffect(() => { installPathRef.current = installPath; }, [installPath]);
@@ -261,13 +262,7 @@ function App() {
     await store.save();
   }
 
-  async function handleBundleModeChange(mode: "full" | "minimum") {
-    setBundleMode(mode);
-    await store.set("bundle_mode", mode);
-    await store.save();
-  }
-
-  // --- Action handlers passed to MainView ---
+  // --- Action handlers ---
 
   async function handleDownloadInstaller() {
     if (patching) return;
@@ -326,57 +321,24 @@ function App() {
     }
   }
 
-  async function handleStartVerification() {
-    if (!installPath || verifying || repairing) return;
-    setVerifying(true);
-    setVerifyResult(null);
-    setError(null);
-    try {
-      await invoke("start_verification", { installPath });
-    } catch (err) {
-      setError(`Verification failed: ${err}`);
-      setVerifying(false);
-    }
-  }
-
-  async function handleCancelVerification() {
-    try {
-      await invoke("cancel_verification");
-    } catch (err) {
-      setError(`Cancel failed: ${err}`);
-    }
-  }
-
-  function handleVerifyComplete(corruptedCount: number) {
-    setVerifying(false);
-    setVerifyResult(corruptedCount);
-  }
-
-  async function handleRepair() {
-    if (!installPath || repairing) return;
-    setRepairing(true);
-    setError(null);
-    try {
-      await invoke("repair_corrupted", { installPath });
-    } catch (err) {
-      setError(`Repair failed: ${err}`);
-      setRepairing(false);
-    }
-  }
-
-
   async function handleLaunch() {
-    if (!installPath || !validationResult?.valid || launching || patching || verifying || repairing) return;
+    if (!installPath || launching || patching || verifying || repairing) return;
     setLaunching(true);
     setError(null);
     try {
       await invoke("launch_patcher", { installPath });
+      // Close our launcher after starting ClientPatcher
+      await getCurrentWindow().close();
     } catch (err) {
       setError(`Launch failed: ${err}`);
-    } finally {
-      setTimeout(() => setLaunching(false), 2000);
+      setLaunching(false);
     }
   }
+
+  // Is any long-running operation active?
+  const isValid = validationResult?.valid === true;
+  const isBusy = patching || verifying || repairing || launching;
+  const showProgressBar = patching && patchPhase !== "complete" && patchPhase !== "error";
 
   // Loading screen
   if (loading) {
@@ -390,6 +352,7 @@ function App() {
   return (
     <div className="app-layout" data-tauri-drag-region>
       <Header />
+
       <div className="content-panel">
         {error && (
           <div className="error-banner">
@@ -401,29 +364,7 @@ function App() {
         )}
 
         {activeTab === "info" && (
-          <MainView
-            installPath={installPath}
-            validationResult={validationResult}
-            patchStatus={patchStatus}
-            patching={patching}
-            patchPhase={patchPhase}
-            checkingUpdates={checkingUpdates}
-            verifying={verifying}
-            repairing={repairing}
-            verifyResult={verifyResult}
-            installerDownloading={installerDownloading}
-            installerProgress={installerProgress}
-            installerPhase={installerPhase}
-            freshInstallDir={freshInstallDir}
-            onDownloadInstaller={handleDownloadInstaller}
-            onChooseFreshInstallDir={handleChooseFreshInstallDir}
-            onStartPatching={handleStartPatching}
-            onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
-            onStartVerification={handleStartVerification}
-            onCancelVerification={handleCancelVerification}
-            onVerifyComplete={handleVerifyComplete}
-            onRepair={handleRepair}
-          />
+          <MainView />
         )}
 
         {activeTab === "account" && (
@@ -440,39 +381,64 @@ function App() {
           />
         )}
 
-        {activeTab === "notes" && (
-          <NewsFeed />
-        )}
-
         {activeTab === "options" && (
           <SettingsPanel
             installPath={installPath}
             dxVersion={dxVersion}
-            bundleMode={bundleMode}
-            verifying={verifying}
-            repairing={repairing}
             onSelectDirectory={handleSelectDirectory}
             onDxChange={handleDxChange}
-            onBundleModeChange={handleBundleModeChange}
-            onStartVerification={handleStartVerification}
           />
         )}
 
-        {/* START GAME button at bottom of content panel */}
-        <section className="section launch-section">
+        {/* Install path picker — shown at bottom of content panel when no valid install */}
+        {!isValid && !patching && !showProgressBar && (
+          <div className="install-path-picker">
+            <span className="install-path-label">Install to:</span>
+            <span className="install-path-value">{freshInstallDir}</span>
+            <button className="btn btn-secondary btn-small" onClick={handleChooseFreshInstallDir}>
+              Change
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Status bar — context-aware button between content and tabs.
+          No valid install → DOWNLOAD (starts full install).
+          Valid + needs update → UPDATE (starts patching).
+          Valid + up to date → START GAME ▶ (launches game).
+          During patching → progress bar replaces button. */}
+      <div className="status-bar">
+        {showProgressBar ? (
+          <PatchProgress layout="bar" />
+        ) : (
           <button
             className="btn btn-launch"
-            disabled={
-              validationResult?.valid !== true ||
-              launching || patching || verifying || repairing ||
-              (patchStatus !== null && !patchStatus.up_to_date)
+            disabled={isBusy}
+            onClick={
+              patchPhase === "complete"
+                ? handleLaunch
+                : !isValid
+                  ? handleDownloadInstaller
+                  : (patchStatus !== null && !patchStatus.up_to_date)
+                    ? handleStartPatching
+                    : handleLaunch
             }
-            onClick={handleLaunch}
           >
-            {launching ? "Starting…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : (patchStatus !== null && !patchStatus.up_to_date) ? "Update Required" : "START GAME"}
+            <span className="launch-label">
+              {launching ? "Starting…" : verifying ? "Verifying…" : repairing ? "Repairing…"
+                : patchPhase === "complete" ? "START GAME"
+                : patchPhase === "error" ? "RETRY"
+                : !isValid ? "DOWNLOAD"
+                : (patchStatus !== null && !patchStatus.up_to_date) ? "UPDATE"
+                : "START GAME"}
+            </span>
+            {!isBusy && (patchPhase === "complete" || (isValid && (patchStatus === null || patchStatus.up_to_date))) && (
+              <span className="launch-arrow">▶</span>
+            )}
           </button>
-        </section>
+        )}
       </div>
+
       <BottomBar activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );

@@ -44,7 +44,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk4QzFDN0JBQjY4MjkwMDYKUldTWXdjZTZ0b0tRQmdjUmdrV3FPWUNiUGRTdmxaMitJK3pqSU9NZnNPTGxHVTZQMDV2V3RySVAK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJENzg4N0E4RkM1MkE2NDMKUldSRHBsTDhxSWQ0dld1VDZRLzU3UjZnMVBIOEs2Y2hobk1JYXVubXROVm1SaWViM053eVUzN1oK",
       "endpoints": [
         "https://github.com/EndlessVex/TSW-Modern/releases/latest/download/latest.json"
       ]

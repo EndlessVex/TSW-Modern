@@ -8,13 +8,8 @@ type TabId = "general" | "graphics" | "audio";
 interface SettingsPanelProps {
   installPath: string | null;
   dxVersion: DxVersion;
-  bundleMode: "full" | "minimum";
-  verifying: boolean;
-  repairing: boolean;
   onSelectDirectory: () => void;
   onDxChange: (version: DxVersion) => void;
-  onBundleModeChange: (mode: "full" | "minimum") => void;
-  onStartVerification: () => void;
 }
 
 const FALLBACK_RESOLUTIONS = [
@@ -29,13 +24,8 @@ const DISPLAY_MODES = ["Fullscreen", "Windowed", "Borderless"];
 export default function SettingsPanel({
   installPath,
   dxVersion,
-  bundleMode,
-  verifying,
-  repairing,
   onSelectDirectory,
   onDxChange,
-  onBundleModeChange,
-  onStartVerification,
 }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<TabId>("general");
 
@@ -213,50 +203,6 @@ export default function SettingsPanel({
               </select>
             </div>
 
-            <div className="settings-divider" />
-
-            {/* Bundle mode */}
-            <div className="settings-field">
-              <label className="settings-label">Download Mode</label>
-              <div className="dx-selector">
-                <label className={`dx-option${bundleMode === "full" ? " dx-active" : ""}`}>
-                  <input
-                    type="radio"
-                    name="bundle-settings"
-                    value="full"
-                    checked={bundleMode === "full"}
-                    onChange={() => onBundleModeChange("full")}
-                    disabled={verifying || repairing}
-                  />
-                  Full Client
-                </label>
-                <label className={`dx-option${bundleMode === "minimum" ? " dx-active" : ""}`}>
-                  <input
-                    type="radio"
-                    name="bundle-settings"
-                    value="minimum"
-                    checked={bundleMode === "minimum"}
-                    onChange={() => onBundleModeChange("minimum")}
-                    disabled={verifying || repairing}
-                  />
-                  Minimum Client
-                </label>
-              </div>
-            </div>
-
-            <div className="settings-divider" />
-
-            {/* Verify game files */}
-            <div className="settings-field">
-              <label className="settings-label">Maintenance</label>
-              <button
-                className="btn btn-verify"
-                onClick={onStartVerification}
-                disabled={verifying || repairing}
-              >
-                {verifying ? "Verifying…" : "Verify Game Files"}
-              </button>
-            </div>
           </div>
         )}
 

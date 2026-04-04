@@ -1,3 +1,4 @@
+pub mod bxml;
 pub mod client_files;
 pub mod config;
 pub mod download;
@@ -555,6 +556,15 @@ async fn run_full_install_inner(
     // This is handled by the game's patcher on first launch, or by our
     // verify+repair flow after rdbdata files exist.
     run_patching_inner(app, install_path).await?;
+
+    // Write pre-compiled bxml view cache files so the game doesn't need to
+    // generate them on first launch. Avoids a crash when connecting with
+    // an existing character on a fresh install.
+    let install_base = std::path::PathBuf::from(install_path);
+    match bxml::write_bxml_cache(&install_base) {
+        Ok(n) => { if n > 0 { log::info!("Wrote {} bxml cache files", n); } }
+        Err(e) => { log::warn!("Failed to write bxml cache: {}", e); }
+    }
 
     // Register in Windows Add/Remove Programs + create Start Menu shortcut.
     // Uses --register CLI subcommand. No elevation needed:
@@ -1813,6 +1823,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             validate_install_dir,
             auto_detect_install_dir,
