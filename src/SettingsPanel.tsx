@@ -11,7 +11,6 @@ interface SettingsPanelProps {
   bundleMode: "full" | "minimum";
   verifying: boolean;
   repairing: boolean;
-  onBack: () => void;
   onSelectDirectory: () => void;
   onDxChange: (version: DxVersion) => void;
   onBundleModeChange: (mode: "full" | "minimum") => void;
@@ -33,7 +32,6 @@ export default function SettingsPanel({
   bundleMode,
   verifying,
   repairing,
-  onBack,
   onSelectDirectory,
   onDxChange,
   onBundleModeChange,
@@ -373,10 +371,6 @@ export default function SettingsPanel({
         )}
       </div>
 
-      {/* Back button */}
-      <button className="btn btn-secondary settings-back" onClick={onBack}>
-        ← Back to Launcher
-      </button>
     </div>
   );
 }

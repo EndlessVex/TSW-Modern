@@ -10,11 +10,9 @@ interface MainViewProps {
   patching: boolean;
   patchPhase: string | null;
   checkingUpdates: boolean;
-  launching: boolean;
   verifying: boolean;
   repairing: boolean;
   verifyResult: number | null;
-  error: string | null;
   installerDownloading: boolean;
   installerProgress: { bytes_downloaded: number; total_bytes: number } | null;
   installerPhase: string | null;
@@ -27,8 +25,6 @@ interface MainViewProps {
   onCancelVerification: () => void;
   onVerifyComplete: (corruptedCount: number) => void;
   onRepair: () => void;
-  onLaunch: () => void;
-  onError: (err: string | null) => void;
 }
 
 /** Simple byte formatter for the status line */
@@ -48,11 +44,9 @@ export default function MainView({
   patching,
   patchPhase,
   checkingUpdates,
-  launching,
   verifying,
   repairing,
   verifyResult,
-  error,
   installerDownloading,
   installerProgress,
   installerPhase,
@@ -65,8 +59,6 @@ export default function MainView({
   onCancelVerification,
   onVerifyComplete,
   onRepair,
-  onLaunch,
-  onError,
 }: MainViewProps) {
   const isValid = validationResult?.valid === true;
   const needsUpdate = patchStatus !== null && !patchStatus.up_to_date;
@@ -231,27 +223,6 @@ export default function MainView({
             <div className="verify-phase">Repairing corrupted files…</div>
           )}
         </section>
-      )}
-
-      {/* Launch Button */}
-      <section className="section">
-        <button
-          className="btn btn-launch"
-          disabled={!isValid || launching || patching || verifying || repairing || needsUpdate}
-          onClick={onLaunch}
-        >
-          {launching ? "Starting…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : needsUpdate ? "Update Required" : "Start Game"}
-        </button>
-      </section>
-
-      {/* Error Display */}
-      {error && (
-        <div className="error-banner">
-          <span>{error}</span>
-          <button className="error-dismiss" onClick={() => onError(null)}>
-            ✕
-          </button>
-        </div>
       )}
     </>
   );

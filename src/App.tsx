@@ -5,6 +5,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { store } from "./store";
 import Header from "./Header";
 import MainView from "./MainView";
+import LoginForm from "./LoginForm";
+import NewsFeed from "./NewsFeed";
+import SettingsPanel from "./SettingsPanel";
 import BottomBar, { type TabId } from "./BottomBar";
 import type { PatchStatus, DownloadProgress } from "./PatchProgress";
 import "./App.css";
@@ -40,6 +43,8 @@ function App() {
   const [freshInstallDir, setFreshInstallDir] = useState<string>(
     "C:\\Program Files (x86)\\Funcom\\The Secret World"
   );
+  const [dxVersion, setDxVersion] = useState<"dx9" | "dx11">("dx11");
+  const [bundleMode, setBundleMode] = useState<"full" | "minimum">("full");
 
   // Keep ref in sync for use in event listeners (avoids stale closure)
   useEffect(() => { installPathRef.current = installPath; }, [installPath]);
@@ -162,6 +167,11 @@ function App() {
     async function loadSettings() {
       try {
         const savedPath = await store.get<string>("install_path");
+        const savedDx = await store.get<string>("dx_version");
+        const savedBundle = await store.get<string>("bundle_mode");
+
+        if (savedDx === "dx9" || savedDx === "dx11") setDxVersion(savedDx);
+        if (savedBundle === "full" || savedBundle === "minimum") setBundleMode(savedBundle);
 
         let pathToUse = savedPath;
 
@@ -197,6 +207,42 @@ function App() {
     loadSettings();
   }, [validatePath, checkForUpdates]);
 
+
+  // --- Settings change handlers ---
+
+  async function handleSelectDirectory() {
+    try {
+      const selected = await open({
+        directory: true,
+        title: "Select The Secret World install directory",
+        defaultPath: installPath ?? undefined,
+      });
+      if (selected) {
+        const path = selected as string;
+        setInstallPath(path);
+        await store.set("install_path", path);
+        await store.save();
+        const result = await validatePath(path);
+        if (result?.valid) {
+          await checkForUpdates(path);
+        }
+      }
+    } catch {
+      // User cancelled
+    }
+  }
+
+  async function handleDxChange(version: "dx9" | "dx11") {
+    setDxVersion(version);
+    await store.set("dx_version", version);
+    await store.save();
+  }
+
+  async function handleBundleModeChange(mode: "full" | "minimum") {
+    setBundleMode(mode);
+    await store.set("bundle_mode", mode);
+    await store.save();
+  }
 
   // --- Action handlers passed to MainView ---
 
@@ -321,34 +367,88 @@ function App() {
   return (
     <div className="app-layout" data-tauri-drag-region>
       <Header />
-      <div className="app-content">
-        <MainView
-          installPath={installPath}
-          validationResult={validationResult}
-          patchStatus={patchStatus}
-          patching={patching}
-          patchPhase={patchPhase}
-          checkingUpdates={checkingUpdates}
-          launching={launching}
-          verifying={verifying}
-          repairing={repairing}
-          verifyResult={verifyResult}
-          error={error}
-          installerDownloading={installerDownloading}
-          installerProgress={installerProgress}
-          installerPhase={installerPhase}
-          freshInstallDir={freshInstallDir}
-          onDownloadInstaller={handleDownloadInstaller}
-          onChooseFreshInstallDir={handleChooseFreshInstallDir}
-          onStartPatching={handleStartPatching}
-          onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
-          onStartVerification={handleStartVerification}
-          onCancelVerification={handleCancelVerification}
-          onVerifyComplete={handleVerifyComplete}
-          onRepair={handleRepair}
-          onLaunch={handleLaunch}
-          onError={setError}
-        />
+      <div className="content-panel">
+        {error && (
+          <div className="error-banner">
+            <span>{error}</span>
+            <button className="error-dismiss" onClick={() => setError(null)}>
+              ✕
+            </button>
+          </div>
+        )}
+
+        {activeTab === "info" && (
+          <MainView
+            installPath={installPath}
+            validationResult={validationResult}
+            patchStatus={patchStatus}
+            patching={patching}
+            patchPhase={patchPhase}
+            checkingUpdates={checkingUpdates}
+            verifying={verifying}
+            repairing={repairing}
+            verifyResult={verifyResult}
+            installerDownloading={installerDownloading}
+            installerProgress={installerProgress}
+            installerPhase={installerPhase}
+            freshInstallDir={freshInstallDir}
+            onDownloadInstaller={handleDownloadInstaller}
+            onChooseFreshInstallDir={handleChooseFreshInstallDir}
+            onStartPatching={handleStartPatching}
+            onCheckForUpdates={() => installPath && checkForUpdates(installPath)}
+            onStartVerification={handleStartVerification}
+            onCancelVerification={handleCancelVerification}
+            onVerifyComplete={handleVerifyComplete}
+            onRepair={handleRepair}
+          />
+        )}
+
+        {activeTab === "account" && (
+          <LoginForm
+            installValid={validationResult?.valid === true}
+            installPath={installPath}
+            dxVersion={dxVersion}
+            launching={launching}
+            patching={patching}
+            verifying={verifying}
+            repairing={repairing}
+            onLaunchStart={() => setLaunching(true)}
+            onLaunchEnd={() => setLaunching(false)}
+          />
+        )}
+
+        {activeTab === "notes" && (
+          <NewsFeed />
+        )}
+
+        {activeTab === "options" && (
+          <SettingsPanel
+            installPath={installPath}
+            dxVersion={dxVersion}
+            bundleMode={bundleMode}
+            verifying={verifying}
+            repairing={repairing}
+            onSelectDirectory={handleSelectDirectory}
+            onDxChange={handleDxChange}
+            onBundleModeChange={handleBundleModeChange}
+            onStartVerification={handleStartVerification}
+          />
+        )}
+
+        {/* START GAME button at bottom of content panel */}
+        <section className="section launch-section">
+          <button
+            className="btn btn-launch"
+            disabled={
+              validationResult?.valid !== true ||
+              launching || patching || verifying || repairing ||
+              (patchStatus !== null && !patchStatus.up_to_date)
+            }
+            onClick={handleLaunch}
+          >
+            {launching ? "Starting…" : patching ? "Patching…" : verifying ? "Verifying…" : repairing ? "Repairing…" : (patchStatus !== null && !patchStatus.up_to_date) ? "Update Required" : "START GAME"}
+          </button>
+        </section>
       </div>
       <BottomBar activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
