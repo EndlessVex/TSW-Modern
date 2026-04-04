@@ -26,19 +26,11 @@ pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<()
 
     // Find all unique file_nums that have actual resources
     let mut file_nums: std::collections::HashSet<u8> = std::collections::HashSet::new();
-    let mut max_offsets: HashMap<u8, u64> = HashMap::new();
-
     for entry in &le_index.entries {
         if entry.file_num == 255 {
             continue;
         }
         file_nums.insert(entry.file_num);
-        // Track the maximum offset+length to know minimum file size
-        let end = entry.offset as u64 + entry.length as u64;
-        let current = max_offsets.entry(entry.file_num).or_insert(0);
-        if end > *current {
-            *current = end;
-        }
     }
 
     for &file_num in &file_nums {
@@ -47,18 +39,12 @@ pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<()
             continue;
         }
 
-        // Create file with RDB0 header
+        // Create file with RDB0 header only — let it grow as resources are written.
+        // Pre-allocating 42 × 1GB is slow on NTFS and causes a visible hang.
         let mut file = File::create(&path)
             .map_err(|e| format!("Failed to create {:02}.rdbdata: {}", file_num, e))?;
         file.write_all(b"RDB0")
             .map_err(|e| format!("Failed to write RDB0 header: {}", e))?;
-
-        // Pre-allocate to the required size for performance
-        let min_size = max_offsets.get(&file_num).copied().unwrap_or(4);
-        file.set_len(min_size)
-            .map_err(|e| format!("Failed to pre-allocate {:02}.rdbdata: {}", file_num, e))?;
-
-        log::info!("Created {:02}.rdbdata ({:.1} MB)", file_num, min_size as f64 / 1_048_576.0);
     }
 
     Ok(())

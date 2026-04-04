@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -20,6 +20,7 @@ interface InstallValidation {
 function App() {
   // Shared state
   const [installPath, setInstallPath] = useState<string | null>(null);
+  const installPathRef = useRef<string | null>(null);
   const [validationResult, setValidationResult] = useState<InstallValidation | null>(null);
   const [launching, setLaunching] = useState(false);
   const [patching, setPatching] = useState(false);
@@ -38,6 +39,9 @@ function App() {
     "C:\\Program Files (x86)\\Funcom\\The Secret World"
   );
 
+  // Keep ref in sync for use in event listeners (avoids stale closure)
+  useEffect(() => { installPathRef.current = installPath; }, [installPath]);
+
   // Listen for patch:progress events to track patching and repair state
   useEffect(() => {
     const unlisten = listen<DownloadProgress>("patch:progress", (event) => {
@@ -52,9 +56,9 @@ function App() {
         if (phase === "complete") {
           setPatchStatus({ up_to_date: true, files_to_download: 0, total_bytes: 0 });
           // Re-validate install path after download completes
-          // so UI transitions from "Get Started" to main view with Launch button
-          if (installPath) {
-            validatePath(installPath);
+          const currentPath = installPathRef.current;
+          if (currentPath) {
+            validatePath(currentPath);
           }
         }
       }
@@ -235,29 +239,6 @@ function App() {
   }
 
 
-  async function handleSelectDirectory() {
-    try {
-      const selected = await open({
-        directory: true,
-        title: "Select TSW Install Directory",
-      });
-
-      if (selected) {
-        setInstallPath(selected);
-        setError(null);
-        setPatchStatus(null);
-        setPatchPhase(null);
-        const result = await validatePath(selected);
-        await store.set("install_path", selected);
-        await store.save();
-        if (result?.valid) {
-          await checkForUpdates(selected);
-        }
-      }
-    } catch (err) {
-      setError(`Failed to open directory picker: ${err}`);
-    }
-  }
 
 
   async function handleStartPatching() {
@@ -355,7 +336,6 @@ function App() {
           installerProgress={installerProgress}
           installerPhase={installerPhase}
           freshInstallDir={freshInstallDir}
-          onSelectDirectory={handleSelectDirectory}
           onDownloadInstaller={handleDownloadInstaller}
           onChooseFreshInstallDir={handleChooseFreshInstallDir}
           onStartPatching={handleStartPatching}
