@@ -15,8 +15,8 @@ use std::sync::Mutex;
 use std::os::windows::process::CommandExt;
 
 use download::{
-    check_for_updates as check_updates_inner, create_client, compute_download_plan,
-    run_downloads, DownloadConfig, DownloadManifest, PatchStatus,
+    check_for_updates as check_updates_inner, create_client,
+    DownloadConfig, PatchStatus,
 };
 use verify::{CorruptedEntry, VerifyResult};
 
@@ -655,7 +655,7 @@ async fn run_patching_inner(
             .map_err(|e| format!("Failed to read le.idx download: {}", e))?;
 
         // Decompress gzip
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::Read;
         let mut decoder = flate2::read::GzDecoder::new(&gz_bytes[..]);
         let mut le_idx_data = Vec::new();
         decoder.read_to_end(&mut le_idx_data)
@@ -718,13 +718,13 @@ async fn run_patching_inner(
 
     // Step 3: Parse indices and create rdbdata files
     let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
-    let hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
+    let _hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
 
     // Create rdbdata container files
     rdbdata::create_rdbdata_files(&base, &le_index)?;
 
     // Build placement map for fast lookup
-    let placement_map = rdbdata::build_placement_map(&le_index);
+    let _placement_map = rdbdata::build_placement_map(&le_index);
 
     // Step 4: Compute download plan — only resources not yet written to rdbdata
     // Check which resources already exist by verifying a sample from each rdbdata file.
@@ -825,7 +825,7 @@ async fn run_patching_inner(
     let install_base = base.clone();
     let mut handles = Vec::with_capacity(tasks.len());
 
-    for (rdb_type, id, file_num, offset, length, url, hash_hex) in tasks {
+    for (rdb_type, id, file_num, offset, _length, url, hash_hex) in tasks {
         if PATCH_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
