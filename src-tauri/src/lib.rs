@@ -739,6 +739,16 @@ async fn run_patching_inner(
     let _hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
 
     // Create rdbdata container files
+    // Create rdbdata container files (pre-allocated sparse files)
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Creating game data files...".into(),
+            phase: "bootstrapping".into(), failed_files: 0,
+        },
+    );
     rdbdata::create_rdbdata_files(&base, &le_index)?;
 
     // Build placement map for fast lookup
@@ -791,6 +801,9 @@ async fn run_patching_inner(
         let url = rdb::cdn_url_from_hash(cdn_base, &entry.hash);
         tasks.push((entry.rdb_type, entry.id, entry.file_num, entry.offset, entry.length, url, hash_hex));
     }
+
+    // Sort by (file_num, offset) for sequential disk writes — reduces NTFS random I/O
+    tasks.sort_by_key(|(_, _, file_num, offset, _, _, _)| (*file_num, *offset));
 
     let files_total = tasks.len() as u32;
     let total_bytes: u64 = tasks.iter().map(|(_, _, _, _, len, _, _)| *len as u64).sum();
