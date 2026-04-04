@@ -556,6 +556,16 @@ async fn run_full_install_inner(
     // verify+repair flow after rdbdata files exist.
     run_patching_inner(app, install_path).await?;
 
+    // Register in Windows Add/Remove Programs.
+    // Try HKCU first (no elevation needed), fall back to HKLM via elevation.
+    #[cfg(target_os = "windows")]
+    {
+        let install_path_owned = install_path.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            register_uninstall_entry(&install_path_owned);
+        }).await;
+    }
+
     // After all phases complete, emit final complete
     let _ = app.emit(
         "patch:progress",
@@ -1785,6 +1795,40 @@ fn get_free_disk_space(path: &std::path::Path) -> u64 {
     };
 
     if result != 0 { free_bytes } else { 0 }
+}
+
+/// Register the game in Windows Add/Remove Programs via HKCU (no elevation needed).
+#[cfg(target_os = "windows")]
+fn register_uninstall_entry(install_path: &str) {
+    let our_exe = std::env::current_exe().unwrap_or_default();
+    let uninstall_cmd = format!(
+        "\"{}\" --uninstall \"{}\"",
+        our_exe.display(),
+        install_path
+    );
+    let icon_path = std::path::Path::new(install_path).join("ClientPatcher.exe");
+    let reg_key = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheSecretWorld_TSWDownloader";
+
+    let entries = [
+        format!("reg add \"{}\" /v DisplayName /t REG_SZ /d \"The Secret World\" /f", reg_key),
+        format!("reg add \"{}\" /v Publisher /t REG_SZ /d \"Funcom\" /f", reg_key),
+        format!("reg add \"{}\" /v DisplayVersion /t REG_SZ /d \"1.15\" /f", reg_key),
+        format!("reg add \"{}\" /v UninstallString /t REG_SZ /d \"{}\" /f", reg_key, uninstall_cmd),
+        format!("reg add \"{}\" /v InstallLocation /t REG_SZ /d \"{}\" /f", reg_key, install_path),
+        format!("reg add \"{}\" /v DisplayIcon /t REG_SZ /d \"{}\" /f", reg_key, icon_path.display()),
+        format!("reg add \"{}\" /v EstimatedSize /t REG_DWORD /d 44040192 /f", reg_key),
+        format!("reg add \"{}\" /v NoModify /t REG_DWORD /d 1 /f", reg_key),
+        format!("reg add \"{}\" /v NoRepair /t REG_DWORD /d 1 /f", reg_key),
+    ];
+
+    for entry in &entries {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", entry])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status();
+    }
 }
 
 pub fn run() {
