@@ -26,6 +26,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib"] }
 lzma-rs = "0.3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-opener = "2.5.3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

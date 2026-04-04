@@ -7,26 +7,25 @@ export default function Header() {
     <header className="app-header">
       <div className="titlebar-buttons">
         <button
-          className="titlebar-btn"
+          className="titlebar-btn titlebar-minimize"
           onClick={() => appWindow.minimize()}
           aria-label="Minimize"
           title="Minimize"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1" />
-            <line x1="4" y1="7" x2="10" y2="7" stroke="currentColor" strokeWidth="1.2" />
+          <svg width="18" height="18" viewBox="0 0 44 44">
+            <circle cx="22" cy="22" r="21" fill="#727375" />
+            <rect x="8" y="19" width="28" height="5" rx="1" fill="#fefefe" />
           </svg>
         </button>
         <button
-          className="titlebar-btn"
+          className="titlebar-btn titlebar-close"
           onClick={() => appWindow.close()}
           aria-label="Close"
           title="Close"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <circle cx="7" cy="7" r="6.5" stroke="currentColor" strokeWidth="1" />
-            <line x1="4.5" y1="4.5" x2="9.5" y2="9.5" stroke="currentColor" strokeWidth="1.2" />
-            <line x1="9.5" y1="4.5" x2="4.5" y2="9.5" stroke="currentColor" strokeWidth="1.2" />
+          <svg width="18" height="18" viewBox="0 0 44 44">
+            <circle cx="22" cy="22" r="21" fill="#727375" />
+            <path d="M13 13 L31 31 M31 13 L13 31" stroke="#fefefe" strokeWidth="4" strokeLinecap="round" />
           </svg>
         </button>
       </div>

@@ -61,9 +61,14 @@ pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<()
         file.write_all(b"RDB0")
             .map_err(|e| format!("Failed to write RDB0 header: {}", e))?;
 
+        // Pre-allocate to exactly 1 GB (1,073,741,824 bytes) to match the
+        // original ClientPatcher. The game may expect fixed-size containers
+        // with zero-padded regions beyond the last resource.
+        const RDBDATA_SIZE: u64 = 1_073_741_824;
         let target_size = max_end_by_file.get(&file_num).copied().unwrap_or(4);
-        if target_size > 4 {
-            file.set_len(target_size)
+        let alloc_size = if target_size > 4 { RDBDATA_SIZE.max(target_size) } else { 4 };
+        if alloc_size > 4 {
+            file.set_len(alloc_size)
                 .map_err(|e| format!("Failed to allocate {:02}.rdbdata: {}", file_num, e))?;
         }
     }

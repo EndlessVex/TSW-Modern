@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 interface NewsPost {
   title: string;
@@ -80,8 +81,10 @@ export default function NewsFeed() {
           key={i}
           className="news-card"
           href={`https://www.reddit.com${post.permalink}`}
-          target="_blank"
-          rel="noopener noreferrer"
+          onClick={(e) => {
+            e.preventDefault();
+            openUrl(`https://www.reddit.com${post.permalink}`).catch(() => {});
+          }}
         >
           <span className="news-title">{post.title}</span>
           <span className="news-meta">

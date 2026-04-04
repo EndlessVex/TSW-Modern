@@ -7,10 +7,13 @@
     "core:default",
     "core:window:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
     "dialog:allow-open",
     "store:default",
     "core:event:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "opener:default"
   ]
 }
