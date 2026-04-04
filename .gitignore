@@ -49,6 +49,7 @@ test_full_download/
 bench_staging/
 *.json
 !package.json
+!package-lock.json
 !tsconfig.json
 !tsconfig.node.json
 !src-tauri/tauri.conf.json
