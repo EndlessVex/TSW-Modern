@@ -511,7 +511,11 @@ async fn run_full_install_inner(
         .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
 
     let hash_idx_path = rdb_dir.join("RDBHashIndex.bin");
-    if !hash_idx_path.exists() {
+    // Re-download if missing OR if the file is a stale version 4 index (~22 MB).
+    // Version 7 is ~44 MB; anything under 30 MB is the old truncated version.
+    let hash_idx_needs_download = !hash_idx_path.exists() || 
+        hash_idx_path.metadata().map(|m| m.len() < 30_000_000).unwrap_or(true);
+    if hash_idx_needs_download {
         let patch_info_url = format!("{}/PatchInfoClient.txt", patch_config.patch_base_url());
         let dl_config = download::DownloadConfig::default();
         let client = download::create_client(&dl_config).map_err(|e| e.to_string())?;
@@ -761,7 +765,11 @@ async fn run_patching_inner(
     }
 
     // Step 2: Download RDBHashIndex.bin if missing
-    if !hash_idx_path.exists() {
+    // Re-download if missing OR if the file is a stale version 4 index (~22 MB).
+    // Version 7 is ~44 MB; anything under 30 MB is the old truncated version.
+    let hash_idx_needs_redownload = !hash_idx_path.exists() ||
+        hash_idx_path.metadata().map(|m| m.len() < 30_000_000).unwrap_or(true);
+    if hash_idx_needs_redownload {
         let _ = app.emit(
             "patch:progress",
             &download::DownloadProgress {
