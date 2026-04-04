@@ -54,9 +54,9 @@ fn main() {
             ];
 
             for val in &values {
-                let _ = std::process::Command::new("reg")
-                    .args(["add", reg_key])
-                    .raw_arg(val)
+                let cmd = format!("reg add \"{}\" {}", reg_key, val);
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", &cmd])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
