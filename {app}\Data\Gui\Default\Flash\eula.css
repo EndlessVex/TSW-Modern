@@ -1,0 +1,39 @@
+.small {
+	font-size: 10;
+	color: #555555;
+}
+
+.header {
+	font-size: 18;
+	font-weight: bold;
+	color: #777777;
+}
+
+.large {
+	font-size: 16;
+	color: #666666;
+}
+
+.normal {
+	font-size: 14;
+	color: #666666;
+}
+
+.link {
+	color: #3366CC;
+}
+
+.indent1 {
+	margin-left: 25;
+	color: #666666;
+}
+
+.indent2 {
+	margin-left: 50;
+	color: #666666;
+}
+
+.indent3 {
+	margin-left: 75;
+	color: #666666;
+}

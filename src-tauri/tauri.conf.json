@@ -17,10 +17,11 @@
       {
         "label": "main",
         "title": "Secret World Launcher",
-        "width": 900,
-        "height": 600,
-        "resizable": true,
-        "fullscreen": false
+        "width": 760,
+        "height": 550,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false
       }
     ]
   },
