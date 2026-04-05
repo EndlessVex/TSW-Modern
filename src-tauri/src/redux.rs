@@ -376,8 +376,8 @@ fn decompress_mixd(
     // "ATI1" tag
     output.extend_from_slice(b"ATI1");
 
-    // BC4 gloss all mips (full 8-byte blocks)
-    for mip in &bc4_mips {
+    // BC4 gloss all mips (full 8-byte blocks, SMALLEST mip first)
+    for mip in bc4_mips.iter().rev() {
         output.extend_from_slice(mip);
     }
 
