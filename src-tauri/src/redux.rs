@@ -167,8 +167,10 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     let dds_width = u32::from_le_bytes(dds_data[16..20].try_into().unwrap()) as usize;
 
     let mip0_data = &dds_data[DDS_HEADER_SIZE..];
-    let is_dxt5 = fmt_tag == b"DXT5";
-    let block_size: usize = if is_dxt5 { 16 } else { 8 };
+    // Determine codec from IOg1 format tag + DDS FourCC
+    let dds_fourcc = &dds_data[84..88];
+    let codec = TextureCodec::from_tags(fmt_tag, dds_fourcc)?;
+    let block_size = codec.block_size();
 
     // Verify mip0 size matches
     if mip_sizes.is_empty() {
@@ -199,7 +201,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         let new_h = (current_h / 2).max(4);
 
         let mip_data = generate_mip(
-            &current_data, current_w, current_h, new_w, new_h, is_dxt5, block_size,
+            &current_data, current_w, current_h, new_w, new_h, codec,
         );
 
         if mip_data.len() != mip_sizes[mip_idx] {
@@ -240,9 +242,9 @@ fn generate_mip(
     prev_h: usize,
     new_w: usize,
     new_h: usize,
-    is_dxt5: bool,
-    block_size: usize,
+    codec: TextureCodec,
 ) -> Vec<u8> {
+    let block_size = codec.block_size();
     let prev_bx = (prev_w / 4).max(1);
     let prev_by = (prev_h / 4).max(1);
     let new_bx = (new_w / 4).max(1);
@@ -252,12 +254,10 @@ fn generate_mip(
 
     for by in 0..new_by {
         for bx in 0..new_bx {
-            // Each new block corresponds to a 2×2 group of source blocks
             let src_bx = bx * 2;
             let src_by = by * 2;
 
-            // Decode 2×2 source blocks → 8×8 RGBA pixels
-            let mut pixels = [[0u8; 4]; 64]; // 8×8 RGBA
+            let mut pixels = [[0u8; 4]; 64];
 
             for dy in 0..2 {
                 for dx in 0..2 {
@@ -271,13 +271,12 @@ fn generate_mip(
                     }
 
                     let block = &prev[block_off..block_off + block_size];
-                    let block_pixels = if is_dxt5 {
-                        decode_dxt5_block(block)
-                    } else {
-                        decode_dxt1_block(block)
+                    let block_pixels = match codec {
+                        TextureCodec::Dxt1 => decode_dxt1_block(block),
+                        TextureCodec::Dxt5 => decode_dxt5_block(block),
+                        TextureCodec::Ati2 => decode_ati2_block(block),
                     };
 
-                    // Place 4×4 decoded pixels into 8×8 grid
                     for py in 0..4 {
                         for px in 0..4 {
                             let gy = dy * 4 + py;
@@ -288,7 +287,6 @@ fn generate_mip(
                 }
             }
 
-            // Box-filter 8×8 → 4×4
             let mut filtered = [[0u8; 4]; 16];
             for py in 0..4 {
                 for px in 0..4 {
@@ -314,11 +312,10 @@ fn generate_mip(
                 }
             }
 
-            // Re-encode to DXT
-            if is_dxt5 {
-                result.extend_from_slice(&encode_dxt5_block(&filtered));
-            } else {
-                result.extend_from_slice(&encode_dxt1_block(&filtered));
+            match codec {
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&filtered)),
+                TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&filtered)),
+                TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&filtered)),
             }
         }
     }
