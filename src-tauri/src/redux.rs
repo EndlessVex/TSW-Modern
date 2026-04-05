@@ -170,7 +170,6 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     // Determine codec from IOg1 format tag + DDS FourCC
     let dds_fourcc = &dds_data[84..88];
     let codec = TextureCodec::from_tags(fmt_tag, dds_fourcc)?;
-    let block_size = codec.block_size();
 
     // Verify mip0 size matches
     if mip_sizes.is_empty() {
