@@ -296,7 +296,7 @@ fn decompress_mixd(
         output.extend_from_slice(fctx_hdr);
 
         let zero_indices = [0u8; 6];
-        for mip in &ati2_mips {
+        for mip in ati2_mips.iter().rev() {
             let num_blocks = mip.len() / 16;
             for block_idx in 0..num_blocks {
                 let off = block_idx * 16;
@@ -367,9 +367,9 @@ fn decompress_mixd(
     let mut output = Vec::with_capacity(decomp_size);
     output.extend_from_slice(fctx_hdr);
 
-    // Interleaved section: 6 zero prefix + 16 ATI2 per block, all mips
+    // Interleaved section: 6 zero prefix + 16 ATI2 per block, all mips (SMALLEST mip first)
     let zero_prefix = [0u8; 6];
-    for mip in &ati2_mips {
+    for mip in ati2_mips.iter().rev() {
         let num_blocks = mip.len() / 16;
         for block_idx in 0..num_blocks {
             let off = block_idx * 16;
