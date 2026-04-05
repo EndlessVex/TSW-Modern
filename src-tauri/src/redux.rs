@@ -66,6 +66,70 @@ impl TextureCodec {
     }
 }
 
+struct ParsedStream {
+    fmt_tag: [u8; 4],
+    mip_sizes: Vec<usize>,
+    dds_data: Vec<u8>,
+    width: usize,
+    height: usize,
+    next_stream_offset: usize,
+}
+
+fn parse_stream(data: &[u8], pos: usize) -> Result<ParsedStream, String> {
+    // Read: comp_total(u32) + fmt_tag(4) + mip_count(u32) + mip_sizes + HXDR + stream_desc + LZMA -> DDS
+    if data.len() < pos + 12 {
+        return Err(format!("IOg1 data truncated at stream metadata (offset {})", pos));
+    }
+    let comp_total = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+    let mut fmt_tag = [0u8; 4];
+    fmt_tag.copy_from_slice(&data[pos+4..pos+8]);
+    let mip_count = u32::from_le_bytes(data[pos+8..pos+12].try_into().unwrap()) as usize;
+
+    let mip_table_start = pos + 12;
+    if data.len() < mip_table_start + mip_count * 4 {
+        return Err("IOg1 data truncated at mip size table".into());
+    }
+    let mut mip_sizes = Vec::with_capacity(mip_count);
+    for i in 0..mip_count {
+        let off = mip_table_start + i * 4;
+        mip_sizes.push(u32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize);
+    }
+
+    let hxdr_off = mip_table_start + mip_count * 4;
+    if data.len() < hxdr_off + 8 {
+        return Err("IOg1 data truncated at HXDR".into());
+    }
+    let hxdr_size = u32::from_le_bytes(data[hxdr_off..hxdr_off+4].try_into().unwrap()) as usize;
+    if &data[hxdr_off+4..hxdr_off+8] != HXDR_MAGIC {
+        return Err(format!("Expected HXDR magic at offset {}", hxdr_off+4));
+    }
+
+    let sd_off = hxdr_off + hxdr_size;
+    let lzma_off = sd_off + STREAM_DESC_SIZE;
+    let stream_end = hxdr_off + comp_total;
+
+    if data.len() < lzma_off + 13 {
+        return Err("IOg1 data truncated before LZMA".into());
+    }
+
+    let lzma_data = &data[lzma_off..data.len().min(stream_end)];
+    let mut dds_data = Vec::new();
+    lzma_rs::lzma_decompress(&mut &lzma_data[..], &mut dds_data)
+        .map_err(|e| format!("LZMA decompression failed: {e}"))?;
+
+    if dds_data.len() < DDS_HEADER_SIZE + 4 || &dds_data[0..4] != DDS_MAGIC {
+        return Err("Invalid DDS after LZMA decompression".into());
+    }
+
+    let height = u32::from_le_bytes(dds_data[12..16].try_into().unwrap()) as usize;
+    let width = u32::from_le_bytes(dds_data[16..20].try_into().unwrap()) as usize;
+
+    Ok(ParsedStream {
+        fmt_tag, mip_sizes, dds_data, width, height,
+        next_stream_offset: hxdr_off + comp_total,
+    })
+}
+
 /// Returns `true` if `data` starts with the IOg1 magic.
 pub fn is_iog1(data: &[u8]) -> bool {
     data.len() >= 4 && &data[0..4] == IOG1_MAGIC
@@ -98,80 +162,25 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
 
     // ── 2. Extract FCTX header (copied verbatim to output) ─────────
     let fctx_hdr = &data[20..20 + fctx_hdr_size];
-    let mut pos = 20 + fctx_hdr_size;
+    let pos = 20 + fctx_hdr_size;
 
-    // ── 3. Parse mip metadata ───────────────────────────────────────
-    if data.len() < pos + 12 {
-        return Err("IOg1 data truncated at mip metadata".into());
+    // ── 3. Parse first stream ───────────────────────────────────────
+    let stream1 = parse_stream(data, pos)?;
+    let fmt_tag = stream1.fmt_tag;
+    let mip_count = stream1.mip_sizes.len();
+
+    // ── 4. Branch on MIXD vs single-stream ──────────────────────────
+    if &fmt_tag == b"MIXD" {
+        return decompress_mixd(data, fctx_hdr, decomp_size, stream1);
     }
 
-    // comp_total at pos+0 (not needed)
-    let fmt_tag = &data[pos + 4..pos + 8];
-    let mip_count = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap()) as usize;
-    pos += 12;
+    // ── Single-stream path (DXT1/DXT5) ──────────────────────────────
+    let dds_fourcc = &stream1.dds_data[84..88];
+    let codec = TextureCodec::from_tags(&fmt_tag, dds_fourcc)?;
 
-    if data.len() < pos + mip_count * 4 {
-        return Err("IOg1 data truncated at mip size table".into());
-    }
+    let mip0_data = &stream1.dds_data[DDS_HEADER_SIZE..];
+    let mip_sizes = &stream1.mip_sizes;
 
-    let mut mip_sizes = Vec::with_capacity(mip_count);
-    for i in 0..mip_count {
-        let off = pos + i * 4;
-        let sz = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-        mip_sizes.push(sz);
-    }
-    pos += mip_count * 4;
-
-    // ── 4. Skip HXDR header ─────────────────────────────────────────
-    if data.len() < pos + 8 {
-        return Err("IOg1 data truncated at HXDR header".into());
-    }
-
-    let hxdr_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    if &data[pos + 4..pos + 8] != HXDR_MAGIC {
-        return Err(format!(
-            "Expected HXDR magic at offset {}, got {:?}",
-            pos + 4,
-            &data[pos + 4..pos + 8]
-        ));
-    }
-    pos += hxdr_size;
-
-    // ── 5. Skip stream descriptors, find LZMA stream ────────────────
-    if data.len() < pos + STREAM_DESC_SIZE + 13 {
-        return Err("IOg1 data truncated before LZMA stream".into());
-    }
-    pos += STREAM_DESC_SIZE;
-
-    // ── 6. LZMA decompress → DDS ────────────────────────────────────
-    let lzma_data = &data[pos..];
-    let mut dds_data = Vec::new();
-    lzma_rs::lzma_decompress(&mut &lzma_data[..], &mut dds_data)
-        .map_err(|e| format!("IOg1 LZMA decompression failed: {e}"))?;
-
-    if dds_data.len() < DDS_HEADER_SIZE + 4 {
-        return Err(format!(
-            "LZMA output too small for DDS: {} bytes",
-            dds_data.len()
-        ));
-    }
-    if &dds_data[0..4] != DDS_MAGIC {
-        return Err(format!(
-            "Expected DDS magic after LZMA, got {:?}",
-            &dds_data[0..4]
-        ));
-    }
-
-    // Parse DDS dimensions for mip generation
-    let dds_height = u32::from_le_bytes(dds_data[12..16].try_into().unwrap()) as usize;
-    let dds_width = u32::from_le_bytes(dds_data[16..20].try_into().unwrap()) as usize;
-
-    let mip0_data = &dds_data[DDS_HEADER_SIZE..];
-    // Determine codec from IOg1 format tag + DDS FourCC
-    let dds_fourcc = &dds_data[84..88];
-    let codec = TextureCodec::from_tags(fmt_tag, dds_fourcc)?;
-
-    // Verify mip0 size matches
     if mip_sizes.is_empty() {
         return Err("No mip levels defined".into());
     }
@@ -183,7 +192,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    // ── 7. Build output: FCTX header + all mips ─────────────────────
+    // ── 5. Build output: FCTX header + all mips ─────────────────────
     let mut output = Vec::with_capacity(decomp_size);
     output.extend_from_slice(fctx_hdr);
 
@@ -192,8 +201,8 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
 
     // Mips 1..N: generate by box-filtering
     let mut current_data = mip0_data[..mip_sizes[0]].to_vec();
-    let mut current_w = dds_width;
-    let mut current_h = dds_height;
+    let mut current_w = stream1.width;
+    let mut current_h = stream1.height;
 
     for mip_idx in 1..mip_count {
         let new_w = (current_w / 2).max(4);
@@ -223,6 +232,136 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
             "Output size mismatch: {} bytes, expected {}",
             output.len(),
             decomp_size
+        ));
+    }
+
+    Ok(output)
+}
+
+fn decompress_mixd(
+    data: &[u8],
+    fctx_hdr: &[u8],
+    decomp_size: usize,
+    stream1: ParsedStream,
+) -> Result<Vec<u8>, String> {
+    let width = stream1.width;
+    let height = stream1.height;
+    let mip_count = stream1.mip_sizes.len();
+
+    // Parse stream 2 (ATI1 gloss)
+    let stream2 = parse_stream(data, stream1.next_stream_offset)?;
+    if &stream2.fmt_tag != b"ATI1" {
+        return Err(format!("Expected ATI1 for MIXD stream 2, got {:?}", stream2.fmt_tag));
+    }
+
+    // -- Generate ATI2 mip chain (for extracting BC4-red lower mips) --
+    let ati2_mip0 = &stream1.dds_data[DDS_HEADER_SIZE..];
+    if ati2_mip0.len() < stream1.mip_sizes[0] {
+        return Err("ATI2 DDS payload too small".into());
+    }
+    let ati2_mip0_data = &ati2_mip0[..stream1.mip_sizes[0]];
+
+    let mut ati2_mips: Vec<Vec<u8>> = vec![ati2_mip0_data.to_vec()];
+    let mut cw = width;
+    let mut ch = height;
+    for mip_idx in 1..mip_count {
+        let nw = (cw / 2).max(4);
+        let nh = (ch / 2).max(4);
+        let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2);
+        ati2_mips.push(mip);
+        cw = nw;
+        ch = nh;
+    }
+
+    // -- Generate BC4 gloss mip chain --
+    let bc4_mip0 = &stream2.dds_data[DDS_HEADER_SIZE..];
+    if stream2.mip_sizes.is_empty() || bc4_mip0.len() < stream2.mip_sizes[0] {
+        return Err("ATI1 DDS payload too small".into());
+    }
+    let bc4_mip0_data = &bc4_mip0[..stream2.mip_sizes[0]];
+
+    let mut bc4_mips: Vec<Vec<u8>> = vec![bc4_mip0_data.to_vec()];
+    let mut cw = width;
+    let mut ch = height;
+    for mip_idx in 1..mip_count {
+        let nw = (cw / 2).max(4);
+        let nh = (ch / 2).max(4);
+        let mip = generate_mip_bc4(&bc4_mips[mip_idx - 1], cw, ch, nw, nh);
+        bc4_mips.push(mip);
+        cw = nw;
+        ch = nh;
+    }
+
+    // -- Compute section sizes --
+    let mut mip_block_counts = Vec::with_capacity(mip_count);
+    let mut cw = width;
+    let mut ch = height;
+    for _ in 0..mip_count {
+        let bw = (cw / 4).max(1);
+        let bh = (ch / 4).max(1);
+        mip_block_counts.push(bw * bh);
+        cw = (cw / 2).max(4);
+        ch = (ch / 2).max(4);
+    }
+    let total_blocks: usize = mip_block_counts.iter().sum();
+
+    let dxt1_all = total_blocks * 8;
+    let ati2_mip0_size = mip_block_counts[0] * 16;
+    let bc4_all = total_blocks * 8;
+    let gap_size = decomp_size - fctx_hdr.len() - dxt1_all - ati2_mip0_size - 4 - bc4_all;
+
+    // -- Assemble output --
+    let mut output = Vec::with_capacity(decomp_size);
+
+    // FCTX header
+    output.extend_from_slice(fctx_hdr);
+
+    // Section 1: DXT1 all mips (neutral gray)
+    let gray_565 = encode_rgb565(128, 128, 128);
+    let mut gray_block = [0u8; 8];
+    gray_block[0..2].copy_from_slice(&gray_565.to_le_bytes());
+    gray_block[2..4].copy_from_slice(&gray_565.to_le_bytes());
+    for &count in &mip_block_counts {
+        for _ in 0..count {
+            output.extend_from_slice(&gray_block);
+        }
+    }
+
+    // Section 2: BC4-red lower mips + zero padding (gap)
+    // Extract first BC4 block (red channel, bytes 0-7) from each ATI2 lower mip block
+    let mut gap_data = Vec::with_capacity(gap_size);
+    for mip_idx in 1..mip_count {
+        let ati2_mip = &ati2_mips[mip_idx];
+        let num_blocks = mip_block_counts[mip_idx];
+        for block_idx in 0..num_blocks {
+            let off = block_idx * 16;
+            if off + 8 <= ati2_mip.len() {
+                gap_data.extend_from_slice(&ati2_mip[off..off + 8]);
+            } else {
+                gap_data.extend_from_slice(&[0u8; 8]);
+            }
+        }
+    }
+    // Pad to exact gap_size
+    gap_data.resize(gap_size, 0);
+    output.extend_from_slice(&gap_data);
+
+    // Section 3: ATI2 mip0 only
+    output.extend_from_slice(ati2_mip0_data);
+
+    // Section 4: "ATI1" tag
+    output.extend_from_slice(b"ATI1");
+
+    // Section 5: BC4 gloss all mips
+    for mip in &bc4_mips {
+        output.extend_from_slice(mip);
+    }
+
+    // Verify output size
+    if output.len() != decomp_size {
+        return Err(format!(
+            "MIXD output size mismatch: {} bytes, expected {} (diff={})",
+            output.len(), decomp_size, output.len() as i64 - decomp_size as i64
         ));
     }
 
@@ -319,6 +458,51 @@ fn generate_mip(
         }
     }
 
+    result
+}
+
+/// Generate a downsampled BC4 mip level from BC4 block data.
+fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new_h: usize) -> Vec<u8> {
+    let prev_bx = (prev_w / 4).max(1);
+    let prev_by = (prev_h / 4).max(1);
+    let new_bx = (new_w / 4).max(1);
+    let new_by = (new_h / 4).max(1);
+    let mut result = Vec::with_capacity(new_bx * new_by * 8);
+
+    for by in 0..new_by {
+        for bx in 0..new_bx {
+            let src_bx = bx * 2;
+            let src_by = by * 2;
+            let mut values = [0u8; 64];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sbx = (src_bx + dx).min(prev_bx - 1);
+                    let sby = (src_by + dy).min(prev_by - 1);
+                    let block_off = (sby * prev_bx + sbx) * 8;
+                    if block_off + 8 > prev.len() { continue; }
+                    let block_vals = decode_bc4_block(&prev[block_off..block_off + 8]);
+                    for py in 0..4 {
+                        for px in 0..4 {
+                            values[(dy * 4 + py) * 8 + (dx * 4 + px)] = block_vals[py * 4 + px];
+                        }
+                    }
+                }
+            }
+            let mut filtered = [0u8; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    let mut sum = 0u32;
+                    for fy in 0..2 {
+                        for fx in 0..2 {
+                            sum += values[(py * 2 + fy) * 8 + (px * 2 + fx)] as u32;
+                        }
+                    }
+                    filtered[py * 4 + px] = (sum / 4) as u8;
+                }
+            }
+            result.extend_from_slice(&encode_bc4_block(&filtered));
+        }
+    }
     result
 }
 
@@ -872,6 +1056,20 @@ mod tests {
             );
             assert_eq!(decoded[i][2], 0, "ATI2 B should be 0");
             assert_eq!(decoded[i][3], 255, "ATI2 A should be 255");
+        }
+    }
+
+    #[test]
+    fn test_generate_mip_bc4() {
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&encode_bc4_block(&[200u8; 16]));
+        }
+        let mip = generate_mip_bc4(&data, 8, 8, 4, 4);
+        assert_eq!(mip.len(), 8);
+        let decoded = decode_bc4_block(&mip);
+        for &v in &decoded {
+            assert!((v as i16 - 200).abs() <= 2, "BC4 mip value: {}", v);
         }
     }
 
