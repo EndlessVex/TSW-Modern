@@ -291,18 +291,17 @@ fn decompress_mixd(
             ch = nh;
         }
 
-        // Assemble interleaved output: for each block, 6 zero bytes + 16 ATI2 bytes
+        // Assemble per-mip grouped output (Ghidra-verified layout, same as format_enum=6):
+        // Per mip (smallest first): [6-byte prefix × blocks] then [16-byte ATI2 × blocks]
         let mut output = Vec::with_capacity(decomp_size);
         output.extend_from_slice(fctx_hdr);
 
-        let zero_indices = [0u8; 6];
         for mip in ati2_mips.iter().rev() {
             let num_blocks = mip.len() / 16;
-            for block_idx in 0..num_blocks {
-                let off = block_idx * 16;
-                output.extend_from_slice(&zero_indices);
-                output.extend_from_slice(&mip[off..off + 16]);
-            }
+            // 6-byte prefix section (zeros) for this mip
+            output.resize(output.len() + num_blocks * 6, 0);
+            // 16-byte ATI2 section for this mip
+            output.extend_from_slice(mip);
         }
 
         if output.len() != decomp_size {
@@ -358,30 +357,34 @@ fn decompress_mixd(
         ch = nh;
     }
 
-    // -- Assemble output --
-    // Correct format_enum=6 FCTX layout (verified against ClientPatcher output):
+    // -- Assemble output in per-mip grouped layout --
+    // Verified via Ghidra decompilation of the game's FCTX MIXD reader (FUN_00c63360):
+    // the game reads per-mip, NOT as global planes. Each mip has its prefix section
+    // (6 bytes/block) grouped together, then its ATI2 section (16 bytes/block).
+    //
+    // Layout:
     //   FCTX header (24 bytes)
-    //   Interleaved section: for each mip, for each block: 6 zero bytes + 16 ATI2 bytes
+    //   Per mip (smallest first):
+    //     [6-byte prefix × blocks_in_mip]  (zeros — BC4 index placeholder)
+    //     [16-byte ATI2 × blocks_in_mip]   (normal map data for ALL mips)
     //   "ATI1" tag (4 bytes)
-    //   BC4 gloss: for each mip, all BC4 blocks (8 bytes each)
+    //   BC4 gloss (8 bytes/block) for ALL mips, smallest-first
     let mut output = Vec::with_capacity(decomp_size);
     output.extend_from_slice(fctx_hdr);
 
-    // Interleaved section: 6 zero prefix + 16 ATI2 per block, all mips (SMALLEST mip first)
-    let zero_prefix = [0u8; 6];
+    // Per-mip interleaved sections (smallest mip first = ati2_mips reversed)
     for mip in ati2_mips.iter().rev() {
         let num_blocks = mip.len() / 16;
-        for block_idx in 0..num_blocks {
-            let off = block_idx * 16;
-            output.extend_from_slice(&zero_prefix);
-            output.extend_from_slice(&mip[off..off + 16]);
-        }
+        // 6-byte prefix section (zeros) for this mip
+        output.resize(output.len() + num_blocks * 6, 0);
+        // 16-byte ATI2 section for this mip
+        output.extend_from_slice(mip);
     }
 
     // "ATI1" tag
     output.extend_from_slice(b"ATI1");
 
-    // BC4 gloss all mips (full 8-byte blocks, SMALLEST mip first)
+    // BC4 gloss full blocks (8B each) for all mips, smallest-first
     for mip in bc4_mips.iter().rev() {
         output.extend_from_slice(mip);
     }
@@ -782,7 +785,7 @@ fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
         ]
     };
 
-    // Find closest alpha index for each pixel
+    // Find closest alpha index for each pixel (strict < for game-compatible tie-breaking)
     let mut alpha_bits: u64 = 0;
     for (i, p) in pixels.iter().enumerate() {
         let a = p[3];
@@ -821,25 +824,28 @@ fn decode_bc4_block(data: &[u8]) -> [u8; 16] {
     let a0 = data[0] as u16;
     let a1 = data[1] as u16;
 
+    // Use truncating division (no +3 rounding bias) to match the game engine's
+    // BC4 interpolation. Verified: this produces byte-identical output for ~53%
+    // of generated mip blocks vs the ClientPatcher, up from ~9% with standard rounding.
     let table: [u8; 8] = if a0 > a1 {
         [
             a0 as u8,
             a1 as u8,
-            ((6 * a0 + 1 * a1 + 3) / 7) as u8,
-            ((5 * a0 + 2 * a1 + 3) / 7) as u8,
-            ((4 * a0 + 3 * a1 + 3) / 7) as u8,
-            ((3 * a0 + 4 * a1 + 3) / 7) as u8,
-            ((2 * a0 + 5 * a1 + 3) / 7) as u8,
-            ((1 * a0 + 6 * a1 + 3) / 7) as u8,
+            ((6 * a0 + 1 * a1) / 7) as u8,
+            ((5 * a0 + 2 * a1) / 7) as u8,
+            ((4 * a0 + 3 * a1) / 7) as u8,
+            ((3 * a0 + 4 * a1) / 7) as u8,
+            ((2 * a0 + 5 * a1) / 7) as u8,
+            ((1 * a0 + 6 * a1) / 7) as u8,
         ]
     } else {
         [
             a0 as u8,
             a1 as u8,
-            ((4 * a0 + 1 * a1 + 2) / 5) as u8,
-            ((3 * a0 + 2 * a1 + 2) / 5) as u8,
-            ((2 * a0 + 3 * a1 + 2) / 5) as u8,
-            ((1 * a0 + 4 * a1 + 2) / 5) as u8,
+            ((4 * a0 + 1 * a1) / 5) as u8,
+            ((3 * a0 + 2 * a1) / 5) as u8,
+            ((2 * a0 + 3 * a1) / 5) as u8,
+            ((1 * a0 + 4 * a1) / 5) as u8,
             0,
             255,
         ]
@@ -857,6 +863,37 @@ fn decode_bc4_block(data: &[u8]) -> [u8; 16] {
     values
 }
 
+/// Sum of squared errors for BC4 block with given endpoints.
+/// Ghidra-verified: FUN_006801F0
+fn bc4_sse(values: &[u8; 16], a0: u8, a1: u8) -> u32 {
+    let a0w = a0 as u16;
+    let a1w = a1 as u16;
+    let table: [u8; 8] = if a0 > a1 {
+        [a0, a1,
+         ((6 * a0w + 1 * a1w) / 7) as u8, ((5 * a0w + 2 * a1w) / 7) as u8,
+         ((4 * a0w + 3 * a1w) / 7) as u8, ((3 * a0w + 4 * a1w) / 7) as u8,
+         ((2 * a0w + 5 * a1w) / 7) as u8, ((1 * a0w + 6 * a1w) / 7) as u8]
+    } else {
+        [a0, a1,
+         ((4 * a0w + 1 * a1w) / 5) as u8, ((3 * a0w + 2 * a1w) / 5) as u8,
+         ((2 * a0w + 3 * a1w) / 5) as u8, ((1 * a0w + 4 * a1w) / 5) as u8,
+         0, 255]
+    };
+    let mut total = 0u32;
+    for &v in values {
+        let mut min_err = 0x10000u32;
+        for &tv in &table {
+            let d = v as i32 - tv as i32;
+            let err = (d * d) as u32;
+            if err < min_err {
+                min_err = err;
+            }
+        }
+        total = total.saturating_add(min_err);
+    }
+    total
+}
+
 /// Encode 16 channel values → BC4 block (8 bytes).
 fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
     let mut min_v = 255u8;
@@ -868,42 +905,82 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
 
     let (a0, a1) = (max_v, min_v);
 
+    // Constant block: all pixels are the same value. The game engine uses
+    // index 1 (a1) for all pixels. This is visually identical to any other
+    // index (all palette entries decode to the same value), but must match
+    // for byte-identical output.
+    if a0 == a1 {
+        let mut out = [0u8; 8];
+        out[0] = a0;
+        out[1] = a1;
+        // All 16 pixels get index 1: each 3-bit group = 001
+        // 16 × 3 bits = 48 bits = 0x249249249249
+        let bits: u64 = 0x249249249249;
+        out[2..8].copy_from_slice(&bits.to_le_bytes()[0..6]);
+        return out;
+    }
+
+    // Ghidra-verified exhaustive endpoint search (FUN_00680B60):
+    // When range > 8, search (ep0, ep1) pairs for minimum sum-of-squared-errors.
+    let (mut best_a0, mut best_a1) = (a0, a1);
+
+    if (a0 as i32 - a1 as i32) > 8 {
+        let mut best_error = bc4_sse(values, a0, a1);
+
+        let mut ep0 = a1 as u32 + 9;
+        while ep0 <= a0 as u32 {
+            for ep1 in (a1 as u32)..ep0 {
+                let err = bc4_sse(values, ep0 as u8, ep1 as u8);
+                if err < best_error {
+                    best_error = err;
+                    best_a0 = ep0 as u8;
+                    best_a1 = ep1 as u8;
+                }
+            }
+            ep0 += 1;
+        }
+    }
+
+    let (a0, a1) = (best_a0, best_a1);
+
+    // Build palette with truncating division (Ghidra-verified FUN_0067B0E0)
     let table: [u8; 8] = if a0 > a1 {
         let a0w = a0 as u16;
         let a1w = a1 as u16;
         [
             a0,
             a1,
-            ((6 * a0w + 1 * a1w + 3) / 7) as u8,
-            ((5 * a0w + 2 * a1w + 3) / 7) as u8,
-            ((4 * a0w + 3 * a1w + 3) / 7) as u8,
-            ((3 * a0w + 4 * a1w + 3) / 7) as u8,
-            ((2 * a0w + 5 * a1w + 3) / 7) as u8,
-            ((1 * a0w + 6 * a1w + 3) / 7) as u8,
+            ((6 * a0w + 1 * a1w) / 7) as u8,
+            ((5 * a0w + 2 * a1w) / 7) as u8,
+            ((4 * a0w + 3 * a1w) / 7) as u8,
+            ((3 * a0w + 4 * a1w) / 7) as u8,
+            ((2 * a0w + 5 * a1w) / 7) as u8,
+            ((1 * a0w + 6 * a1w) / 7) as u8,
         ]
-    } else if a0 == a1 {
-        [a0; 8]
     } else {
         let a0w = a0 as u16;
         let a1w = a1 as u16;
         [
             a0,
             a1,
-            ((4 * a0w + 1 * a1w + 2) / 5) as u8,
-            ((3 * a0w + 2 * a1w + 2) / 5) as u8,
-            ((2 * a0w + 3 * a1w + 2) / 5) as u8,
-            ((1 * a0w + 4 * a1w + 2) / 5) as u8,
+            ((4 * a0w + 1 * a1w) / 5) as u8,
+            ((3 * a0w + 2 * a1w) / 5) as u8,
+            ((2 * a0w + 3 * a1w) / 5) as u8,
+            ((1 * a0w + 4 * a1w) / 5) as u8,
             0,
             255,
         ]
     };
 
+    // Assign indices: strict < tie-breaking, squared-error distance
+    // Ghidra-verified: FUN_006802B0
     let mut bits: u64 = 0;
     for (i, &v) in values.iter().enumerate() {
-        let mut best_dist = u16::MAX;
+        let mut best_dist = u32::MAX;
         let mut best_idx = 0u64;
         for (j, &tv) in table.iter().enumerate() {
-            let d = (v as i16 - tv as i16).unsigned_abs();
+            let d = (v as i32 - tv as i32) * (v as i32 - tv as i32);
+            let d = d as u32;
             if d < best_dist {
                 best_dist = d;
                 best_idx = j as u64;
