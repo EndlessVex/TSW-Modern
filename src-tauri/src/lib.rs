@@ -4,6 +4,7 @@ pub mod config;
 pub mod download;
 pub mod rdb;
 pub mod rdbdata;
+pub mod redux;
 pub mod verify;
 
 use serde::{Deserialize, Serialize};
@@ -821,7 +822,13 @@ async fn run_patching_inner(
 
     // Step 3: Parse indices and create rdbdata files
     let le_index = rdb::parse_le_index(&le_idx_path).map_err(|e| e.to_string())?;
-    let _hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
+    let hash_index = rdb::parse_hash_index(&hash_idx_path).map_err(|e| e.to_string())?;
+
+    // Build set of valid resource hashes from the CDN hash index.
+    // Resources not in this set are deleted/obsolete and should be skipped.
+    let valid_hashes: std::collections::HashSet<[u8; 16]> = hash_index.entries.values()
+        .map(|e| e.hash)
+        .collect();
 
     // Create rdbdata container files
     // Create rdbdata container files (pre-allocated sparse files)
@@ -862,6 +869,13 @@ async fn run_patching_inner(
 
     for entry in &le_index.entries {
         if entry.file_num == 255 {
+            continue;
+        }
+
+        // Skip resources not in the CDN hash index (deleted/obsolete).
+        // This prevents downloading ~232 extra resources that the official
+        // install marks as file_num=255, saving ~85MB and one rdbdata file.
+        if !valid_hashes.contains(&entry.hash) {
             continue;
         }
 
@@ -996,14 +1010,13 @@ async fn run_patching_inner(
                     Err(_) => continue,
                 };
 
-                // Decompress IOz1
-                let decompressed = if body.len() > 4 && &body[..4] == b"IOz1" {
-                    match verify::decompress_ioz1(&body) {
-                        Ok(d) => d,
-                        Err(_) => continue,
+                // Decompress CDN payload (IOz1/IOz2/IOg1 or uncompressed)
+                let decompressed = match verify::decompress_cdn(&body) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("Decompress failed for {}:{}: {}", rdb_type, id, e);
+                        continue;
                     }
-                } else {
-                    body.to_vec()
                 };
 
                 // Write to rdbdata
@@ -1327,7 +1340,7 @@ async fn run_repair_inner(
             }
         };
 
-        let decompressed = match verify::decompress_ioz1(&raw_data) {
+        let decompressed = match verify::decompress_cdn(&raw_data) {
             Ok(d) => d,
             Err(e) => {
                 log::error!(
