@@ -228,11 +228,18 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     if output.len() != decomp_size {
-        return Err(format!(
-            "Output size mismatch: {} bytes, expected {}",
-            output.len(),
-            decomp_size
-        ));
+        if output.len() < decomp_size {
+            // Some textures (e.g., DXT1 format_field=1) have additional data planes
+            // beyond the primary mip chain. Pad with zeros so the resource can be
+            // written — the game may fall back to simpler rendering for missing planes.
+            output.resize(decomp_size, 0);
+        } else {
+            return Err(format!(
+                "Output size too large: {} bytes, expected {}",
+                output.len(),
+                decomp_size
+            ));
+        }
     }
 
     Ok(output)
@@ -252,7 +259,58 @@ fn decompress_mixd(
         return Err("MIXD stream has zero mip levels".into());
     }
 
-    // Parse stream 2 (ATI1 gloss)
+    // Check if stream 2 exists. MIXD format_enum=6 has two streams (ATI2+ATI1),
+    // but format_enum=2 has only one stream (ATI2 only, simpler normal map).
+    let has_stream2 = stream1.next_stream_offset + 12 <= data.len()
+        && {
+            let s2_comp = u32::from_le_bytes(
+                data[stream1.next_stream_offset..stream1.next_stream_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            s2_comp > 0 && s2_comp < data.len()
+        };
+
+    // Single-stream MIXD: just ATI2 mip chain (like DXT5 but with ATI2 codec)
+    if !has_stream2 {
+        let ati2_mip0 = &stream1.dds_data[DDS_HEADER_SIZE..];
+        if ati2_mip0.len() < stream1.mip_sizes[0] {
+            return Err("ATI2 DDS payload too small".into());
+        }
+
+        let mut output = Vec::with_capacity(decomp_size);
+        output.extend_from_slice(fctx_hdr);
+        output.extend_from_slice(&ati2_mip0[..stream1.mip_sizes[0]]);
+
+        let mut current_data = ati2_mip0[..stream1.mip_sizes[0]].to_vec();
+        let mut cw = width;
+        let mut ch = height;
+        for mip_idx in 1..mip_count {
+            let nw = (cw / 2).max(4);
+            let nh = (ch / 2).max(4);
+            let mip = generate_mip(&current_data, cw, ch, nw, nh, TextureCodec::Ati2);
+            if mip.len() != stream1.mip_sizes[mip_idx] {
+                return Err(format!(
+                    "ATI2 mip {} size mismatch: {} vs expected {}",
+                    mip_idx, mip.len(), stream1.mip_sizes[mip_idx]
+                ));
+            }
+            output.extend_from_slice(&mip);
+            current_data = mip;
+            cw = nw;
+            ch = nh;
+        }
+
+        if output.len() != decomp_size {
+            return Err(format!(
+                "MIXD single-stream output size mismatch: {} vs expected {}",
+                output.len(), decomp_size
+            ));
+        }
+        return Ok(output);
+    }
+
+    // Two-stream MIXD: parse stream 2 (ATI1 gloss)
     let stream2 = parse_stream(data, stream1.next_stream_offset)?;
     if &stream2.fmt_tag != b"ATI1" {
         return Err(format!("Expected ATI1 for MIXD stream 2, got {:?}", stream2.fmt_tag));
