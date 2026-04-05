@@ -349,7 +349,7 @@ pub fn write_static_files(install_dir: &Path) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&lang_dir);
     let lang_path = lang_dir.join("LanguagePrefs.xml");
     if !lang_path.exists() {
-        let lang = r#"<Prefs><Value name="SelectedLanguage" value="en" /><Value name="SelectedAudioLanguage" value="en" /></Prefs>"#;
+        let lang = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<Root>\n  <Value name=\"Language\" value=\"&quot;en&quot;\"/>\n  <Value name=\"AudioLanguage\" value=\"&quot;en&quot;\"/>\n</Root>\n";
         std::fs::write(&lang_path, lang)
             .map_err(|e| format!("Failed to write LanguagePrefs.xml: {}", e))?;
     }

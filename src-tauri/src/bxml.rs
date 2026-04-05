@@ -8,6 +8,8 @@ use std::path::Path;
 
 /// Each entry: (relative path from install dir, file bytes)
 const BXML_FILES: &[(&str, &[u8])] = &[
+    // Bundle group definitions (controls texture bundle loading)
+    ("Data/Gui/Default/BundleGroups.bxml", include_bytes!("bxml_cache/Data/Gui/Default/BundleGroups.bxml")),
     // Top-level config caches
     ("Data/Gui/Default/FontConfig.bxml", include_bytes!("bxml_cache/Data/Gui/Default/FontConfig.bxml")),
     ("Data/Gui/Default/Fonts.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Fonts.bxml")),
@@ -27,31 +29,21 @@ const BXML_FILES: &[(&str, &[u8])] = &[
     ("Data/Gui/Default/Views/DrowningBar.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/DrowningBar.bxml")),
     ("Data/Gui/Default/Views/HUD/HUDView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/HUD/HUDView.bxml")),
     ("Data/Gui/Default/Views/HUDMapView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/HUDMapView.bxml")),
-    ("Data/Gui/Default/Views/InfoView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/InfoView.bxml")),
     ("Data/Gui/Default/Views/MainMenu/MainMenuView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MainMenu/MainMenuView.bxml")),
     ("Data/Gui/Default/Views/MainMenu/Options.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MainMenu/Options.bxml")),
     ("Data/Gui/Default/Views/MainMenu/OptionsView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MainMenu/OptionsView.bxml")),
     ("Data/Gui/Default/Views/MainMenu/Window.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MainMenu/Window.bxml")),
-    ("Data/Gui/Default/Views/MapGUI/MapHoverInfoView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MapGUI/MapHoverInfoView.bxml")),
     ("Data/Gui/Default/Views/MapGUI/RegionMapRenderer.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MapGUI/RegionMapRenderer.bxml")),
-    ("Data/Gui/Default/Views/MapGUI/RegionMapView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MapGUI/RegionMapView.bxml")),
-    ("Data/Gui/Default/Views/MapGUI/RegionMapWndSkin.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MapGUI/RegionMapWndSkin.bxml")),
     ("Data/Gui/Default/Views/MapGUI/WorldMapRegionPositions.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MapGUI/WorldMapRegionPositions.bxml")),
     ("Data/Gui/Default/Views/MemoryManagerDebug/FragmentationView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MemoryManagerDebug/FragmentationView.bxml")),
     ("Data/Gui/Default/Views/MemoryManagerDebug/PoolView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/MemoryManagerDebug/PoolView.bxml")),
-    ("Data/Gui/Default/Views/NPCChatView/BlackBorderView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/NPCChatView/BlackBorderView.bxml")),
-    ("Data/Gui/Default/Views/NPCChatView/NPCChatView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/NPCChatView/NPCChatView.bxml")),
     ("Data/Gui/Default/Views/PortraitGUI/OverheadConfig.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/PortraitGUI/OverheadConfig.bxml")),
     ("Data/Gui/Default/Views/SplashScreenView.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/SplashScreenView.bxml")),
     ("Data/Gui/Default/Views/TokenGUI/TokenIcons.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Views/TokenGUI/TokenIcons.bxml")),
     // Waypoints (playfield data — crash if missing when entering these zones)
-    ("Data/Gui/Default/Waypoints/PF1000.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF1000.bxml")),
     ("Data/Gui/Default/Waypoints/PF1100.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF1100.bxml")),
-    ("Data/Gui/Default/Waypoints/PF3030.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF3030.bxml")),
-    ("Data/Gui/Default/Waypoints/PF3040.bxml", include_bytes!("bxml_cache/Data/Gui/Default/Waypoints/PF3040.bxml")),
     // Window skins
     ("Data/Gui/Default/WindowSkins/Borderless.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/Borderless.bxml")),
-    ("Data/Gui/Default/WindowSkins/DialogWindow.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/DialogWindow.bxml")),
     ("Data/Gui/Default/WindowSkins/Tabbed.bxml", include_bytes!("bxml_cache/Data/Gui/Default/WindowSkins/Tabbed.bxml")),
 ];
 
