@@ -192,15 +192,9 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    // ── 5. Build output: FCTX header + all mips ─────────────────────
-    let mut output = Vec::with_capacity(decomp_size);
-    output.extend_from_slice(fctx_hdr);
-
-    // Mip 0: copy directly from DDS
-    output.extend_from_slice(&mip0_data[..mip_sizes[0]]);
-
-    // Mips 1..N: generate by box-filtering
-    let mut current_data = mip0_data[..mip_sizes[0]].to_vec();
+    // ── 5. Generate all mips, then write SMALLEST-FIRST ────────────
+    // The FCTX format stores mips smallest-first (1x1 at start, full mip0 at end).
+    let mut all_mips: Vec<Vec<u8>> = vec![mip0_data[..mip_sizes[0]].to_vec()];
     let mut current_w = stream1.width;
     let mut current_h = stream1.height;
 
@@ -209,7 +203,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         let new_h = (current_h / 2).max(4);
 
         let mip_data = generate_mip(
-            &current_data, current_w, current_h, new_w, new_h, codec,
+            &all_mips[mip_idx - 1], current_w, current_h, new_w, new_h, codec,
         );
 
         if mip_data.len() != mip_sizes[mip_idx] {
@@ -221,10 +215,16 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
             ));
         }
 
-        output.extend_from_slice(&mip_data);
-        current_data = mip_data;
+        all_mips.push(mip_data);
         current_w = new_w;
         current_h = new_h;
+    }
+
+    // Write mips smallest-first (reverse order: mip[N-1] first, mip0 last)
+    let mut output = Vec::with_capacity(decomp_size);
+    output.extend_from_slice(fctx_hdr);
+    for mip in all_mips.iter().rev() {
+        output.extend_from_slice(mip);
     }
 
     if output.len() < decomp_size {
