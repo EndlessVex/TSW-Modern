@@ -228,18 +228,11 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     if output.len() != decomp_size {
-        if output.len() < decomp_size {
-            // Some textures (e.g., DXT1 format_field=1) have additional data planes
-            // beyond the primary mip chain. Pad with zeros so the resource can be
-            // written — the game may fall back to simpler rendering for missing planes.
-            output.resize(decomp_size, 0);
-        } else {
-            return Err(format!(
-                "Output size too large: {} bytes, expected {}",
-                output.len(),
-                decomp_size
-            ));
-        }
+        return Err(format!(
+            "Output size mismatch: {} bytes, expected {}",
+            output.len(),
+            decomp_size
+        ));
     }
 
     Ok(output)
