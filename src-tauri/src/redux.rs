@@ -227,7 +227,12 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         current_h = new_h;
     }
 
-    if output.len() != decomp_size {
+    if output.len() < decomp_size {
+        // Rare: DXT1/DXT5 resource with empty extra planes beyond the mip chain
+        // (e.g., resource 205281: DXT1 diffuse bundled with zeroed normal/gloss).
+        // The IOg1 only contains the color stream; zero-fill extra planes.
+        output.resize(decomp_size, 0);
+    } else if output.len() != decomp_size {
         return Err(format!(
             "Output size mismatch: {} bytes, expected {}",
             output.len(),
