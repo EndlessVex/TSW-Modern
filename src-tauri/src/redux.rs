@@ -353,74 +353,30 @@ fn decompress_mixd(
         ch = nh;
     }
 
-    // -- Compute section sizes --
-    let mut mip_block_counts = Vec::with_capacity(mip_count);
-    let mut cw = width;
-    let mut ch = height;
-    for _ in 0..mip_count {
-        let bw = (cw / 4).max(1);
-        let bh = (ch / 4).max(1);
-        mip_block_counts.push(bw * bh);
-        cw = (cw / 2).max(4);
-        ch = (ch / 2).max(4);
-    }
-    let total_blocks: usize = mip_block_counts.iter().sum();
-
-    let dxt1_all = total_blocks * 8;
-    let ati2_mip0_size = mip_block_counts[0] * 16;
-    let bc4_all = total_blocks * 8;
-    let known_size = fctx_hdr.len() + dxt1_all + ati2_mip0_size + 4 + bc4_all;
-    if decomp_size < known_size {
-        return Err(format!(
-            "MIXD decomp_size {} too small for sections (need at least {})",
-            decomp_size, known_size
-        ));
-    }
-    let gap_size = decomp_size - known_size;
-
     // -- Assemble output --
+    // Correct format_enum=6 FCTX layout (verified against ClientPatcher output):
+    //   FCTX header (24 bytes)
+    //   Interleaved section: for each mip, for each block: 6 zero bytes + 16 ATI2 bytes
+    //   "ATI1" tag (4 bytes)
+    //   BC4 gloss: for each mip, all BC4 blocks (8 bytes each)
     let mut output = Vec::with_capacity(decomp_size);
-
-    // FCTX header
     output.extend_from_slice(fctx_hdr);
 
-    // Section 1: DXT1 all mips (neutral gray)
-    let gray_565 = encode_rgb565(128, 128, 128);
-    let mut gray_block = [0u8; 8];
-    gray_block[0..2].copy_from_slice(&gray_565.to_le_bytes());
-    gray_block[2..4].copy_from_slice(&gray_565.to_le_bytes());
-    for &count in &mip_block_counts {
-        for _ in 0..count {
-            output.extend_from_slice(&gray_block);
-        }
-    }
-
-    // Section 2: BC4-red lower mips + zero padding (gap)
-    // Extract first BC4 block (red channel, bytes 0-7) from each ATI2 lower mip block
-    let mut gap_data = Vec::with_capacity(gap_size);
-    for mip_idx in 1..mip_count {
-        let ati2_mip = &ati2_mips[mip_idx];
-        let num_blocks = mip_block_counts[mip_idx];
+    // Interleaved section: 6 zero prefix + 16 ATI2 per block, all mips
+    let zero_prefix = [0u8; 6];
+    for mip in &ati2_mips {
+        let num_blocks = mip.len() / 16;
         for block_idx in 0..num_blocks {
             let off = block_idx * 16;
-            if off + 8 <= ati2_mip.len() {
-                gap_data.extend_from_slice(&ati2_mip[off..off + 8]);
-            } else {
-                gap_data.extend_from_slice(&[0u8; 8]);
-            }
+            output.extend_from_slice(&zero_prefix);
+            output.extend_from_slice(&mip[off..off + 16]);
         }
     }
-    // Pad to exact gap_size
-    gap_data.resize(gap_size, 0);
-    output.extend_from_slice(&gap_data);
 
-    // Section 3: ATI2 mip0 only
-    output.extend_from_slice(ati2_mip0_data);
-
-    // Section 4: "ATI1" tag
+    // "ATI1" tag
     output.extend_from_slice(b"ATI1");
 
-    // Section 5: BC4 gloss all mips
+    // BC4 gloss all mips (full 8-byte blocks)
     for mip in &bc4_mips {
         output.extend_from_slice(mip);
     }
