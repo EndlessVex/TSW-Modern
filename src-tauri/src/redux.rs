@@ -271,34 +271,40 @@ fn decompress_mixd(
             s2_comp > 0 && s2_comp < data.len()
         };
 
-    // Single-stream MIXD: just ATI2 mip chain (like DXT5 but with ATI2 codec)
+    // Single-stream MIXD (format_enum=2): interleaved 22 bytes/block.
+    // Layout per block: 6 bytes (BC4 indices for 3rd channel) + 16 bytes (ATI2).
+    // The 3rd channel has implicit endpoints; indices zero-filled (not in IOg1).
     if !has_stream2 {
         let ati2_mip0 = &stream1.dds_data[DDS_HEADER_SIZE..];
         if ati2_mip0.len() < stream1.mip_sizes[0] {
             return Err("ATI2 DDS payload too small".into());
         }
 
-        let mut output = Vec::with_capacity(decomp_size);
-        output.extend_from_slice(fctx_hdr);
-        output.extend_from_slice(&ati2_mip0[..stream1.mip_sizes[0]]);
-
-        let mut current_data = ati2_mip0[..stream1.mip_sizes[0]].to_vec();
+        // Generate full ATI2 mip chain
+        let mut ati2_mips: Vec<Vec<u8>> = vec![ati2_mip0[..stream1.mip_sizes[0]].to_vec()];
         let mut cw = width;
         let mut ch = height;
         for mip_idx in 1..mip_count {
             let nw = (cw / 2).max(4);
             let nh = (ch / 2).max(4);
-            let mip = generate_mip(&current_data, cw, ch, nw, nh, TextureCodec::Ati2);
-            if mip.len() != stream1.mip_sizes[mip_idx] {
-                return Err(format!(
-                    "ATI2 mip {} size mismatch: {} vs expected {}",
-                    mip_idx, mip.len(), stream1.mip_sizes[mip_idx]
-                ));
-            }
-            output.extend_from_slice(&mip);
-            current_data = mip;
+            let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2);
+            ati2_mips.push(mip);
             cw = nw;
             ch = nh;
+        }
+
+        // Assemble interleaved output: for each block, 6 zero bytes + 16 ATI2 bytes
+        let mut output = Vec::with_capacity(decomp_size);
+        output.extend_from_slice(fctx_hdr);
+
+        let zero_indices = [0u8; 6];
+        for mip in &ati2_mips {
+            let num_blocks = mip.len() / 16;
+            for block_idx in 0..num_blocks {
+                let off = block_idx * 16;
+                output.extend_from_slice(&zero_indices);
+                output.extend_from_slice(&mip[off..off + 16]);
+            }
         }
 
         if output.len() != decomp_size {
@@ -1267,4 +1273,5 @@ mod tests {
         assert_eq!(&result[0..4], b"FCTX", "Output should start with FCTX");
         assert_eq!(result.len(), 699088, "Output size should match decomp_size");
     }
+
 }
