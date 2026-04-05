@@ -248,6 +248,10 @@ fn decompress_mixd(
     let height = stream1.height;
     let mip_count = stream1.mip_sizes.len();
 
+    if mip_count == 0 {
+        return Err("MIXD stream has zero mip levels".into());
+    }
+
     // Parse stream 2 (ATI1 gloss)
     let stream2 = parse_stream(data, stream1.next_stream_offset)?;
     if &stream2.fmt_tag != b"ATI1" {
@@ -308,7 +312,14 @@ fn decompress_mixd(
     let dxt1_all = total_blocks * 8;
     let ati2_mip0_size = mip_block_counts[0] * 16;
     let bc4_all = total_blocks * 8;
-    let gap_size = decomp_size - fctx_hdr.len() - dxt1_all - ati2_mip0_size - 4 - bc4_all;
+    let known_size = fctx_hdr.len() + dxt1_all + ati2_mip0_size + 4 + bc4_all;
+    if decomp_size < known_size {
+        return Err(format!(
+            "MIXD decomp_size {} too small for sections (need at least {})",
+            decomp_size, known_size
+        ));
+    }
+    let gap_size = decomp_size - known_size;
 
     // -- Assemble output --
     let mut output = Vec::with_capacity(decomp_size);
