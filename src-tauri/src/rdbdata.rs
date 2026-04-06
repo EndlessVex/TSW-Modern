@@ -190,60 +190,6 @@ pub fn build_placement_map(le_index: &LeIndex) -> HashMap<(u32, u32), &LeIndexEn
     map
 }
 
-/// Write a single decompressed resource into its rdbdata container file.
-///
-/// Writes the 16-byte resource header at (offset - 16) and the data at offset.
-/// The offset comes from le.idx and points to the data start (after header).
-pub fn write_resource_to_rdbdata(
-    install_dir: &Path,
-    file_num: u8,
-    rdb_type: u32,
-    id: u32,
-    offset: u32,
-    data: &[u8],
-) -> Result<(), String> {
-    let path = install_dir.join("RDB").join(format!("{:02}.rdbdata", file_num));
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .map_err(|e| format!("Failed to open {:02}.rdbdata: {}", file_num, e))?;
-
-    let size = data.len() as u32;
-    // Space = size rounded up to next 4-byte boundary (observed padding pattern)
-    let space = (size + 3) & !3;
-
-    // Write resource header at offset - 16
-    let header_offset = offset.checked_sub(16)
-        .ok_or_else(|| format!("Invalid offset {} for resource {}:{}", offset, rdb_type, id))?;
-
-    file.seek(SeekFrom::Start(header_offset as u64))
-        .map_err(|e| format!("Failed to seek in {:02}.rdbdata: {}", file_num, e))?;
-
-    // Header: type(4) + id(4) + size(4) + space(4)
-    let mut header = [0u8; 16];
-    header[0..4].copy_from_slice(&rdb_type.to_le_bytes());
-    header[4..8].copy_from_slice(&id.to_le_bytes());
-    header[8..12].copy_from_slice(&size.to_le_bytes());
-    header[12..16].copy_from_slice(&space.to_le_bytes());
-
-    file.write_all(&header)
-        .map_err(|e| format!("Failed to write header in {:02}.rdbdata: {}", file_num, e))?;
-
-    // Write resource data
-    file.write_all(data)
-        .map_err(|e| format!("Failed to write data in {:02}.rdbdata: {}", file_num, e))?;
-
-    // Write padding zeros if space > size (always 0-3 bytes)
-    if space > size {
-        let pad_len = (space - size) as usize;
-        file.write_all(&[0u8; 4][..pad_len])
-            .map_err(|e| format!("Failed to write padding in {:02}.rdbdata: {}", file_num, e))?;
-    }
-
-    Ok(())
-}
-
 /// Cached file handles for rdbdata writes. Keeps files open across
 /// multiple resource writes to avoid ~22K open/close syscalls.
 pub struct RdbdataWriter {
@@ -269,13 +215,15 @@ impl RdbdataWriter {
         data: &[u8],
     ) -> Result<(), String> {
         let mut handles = self.handles.lock().map_err(|e| e.to_string())?;
-        let file = handles.entry(file_num).or_insert_with(|| {
+        if !handles.contains_key(&file_num) {
             let path = self.install_dir.join("RDB").join(format!("{:02}.rdbdata", file_num));
-            OpenOptions::new()
+            let f = OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .unwrap_or_else(|e| panic!("Failed to open {:02}.rdbdata: {}", file_num, e))
-        });
+                .map_err(|e| format!("Failed to open {:02}.rdbdata: {}", file_num, e))?;
+            handles.insert(file_num, f);
+        }
+        let file = handles.get_mut(&file_num).unwrap(); // safe: just inserted
 
         let size = data.len() as u32;
         let space = (size + 3) & !3;
