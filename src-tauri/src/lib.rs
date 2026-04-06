@@ -940,6 +940,13 @@ async fn run_patching_inner(
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
     let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));
+    // CPU-bound decompression semaphore: limit concurrent IOg1 texture encoding
+    // to available CPU cores. The BC4 exhaustive endpoint search is O(range²) per
+    // block and can process billions of operations per texture. Running 128 of
+    // these simultaneously maxes CPU and starves the async runtime.
+    let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    ));
     let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -981,85 +988,104 @@ async fn run_patching_inner(
         let files_fail = files_failed.clone();
         let tracker = speed_tracker.clone();
         let large_sem = large_semaphore.clone();
+        let cpu_sem = cpu_semaphore.clone();
         let is_large = _length > 1_000_000; // Resources > 1MB need large semaphore
         let ft = files_total;
         let tb = total_bytes;
 
         handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            // Acquire large semaphore for big resources to limit memory usage
-            let _large_permit = if is_large {
-                Some(large_sem.acquire_owned().await.unwrap())
-            } else {
-                None
-            };
             let max_retries = 3u32;
+            let mut downloaded_body = None;
 
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
-                }
-
-                // Download
-                let resp = match client.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => r,
-                    _ => continue,
-                };
-                let body = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(_) => continue,
+            // Phase 1: Download (network-bound, keep permit for backpressure)
+            {
+                let _permit = permit;
+                let _large_permit = if is_large {
+                    Some(large_sem.acquire_owned().await.unwrap())
+                } else {
+                    None
                 };
 
-                // Decompress CDN payload (IOz1/IOz2/IOg1 or uncompressed)
-                let decompressed = match verify::decompress_cdn(&body) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::warn!("Decompress failed for {}:{}: {}", rdb_type, id, e);
-                        continue;
+                for attempt in 0..=max_retries {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
-                };
 
-                // Write to rdbdata
-                if let Err(e) = rdbdata::write_resource_to_rdbdata(
-                    &install_base, file_num, rdb_type, id, offset, &decompressed,
-                ) {
-                    log::warn!("Write failed for {}:{}: {}", rdb_type, id, e);
-                    continue;
+                    let resp = match client.get(&url).send().await {
+                        Ok(r) if r.status().is_success() => r,
+                        _ => continue,
+                    };
+                    let body = match resp.bytes().await {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+
+                    downloaded_body = Some(body);
+                    break;
                 }
+            } // download permit + large permit released here
 
-                // Success
-                let new_bytes = bytes_dl.fetch_add(decompressed.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed) + decompressed.len() as u64;
-                let completed = files_comp.fetch_add(1,
-                    std::sync::atomic::Ordering::Relaxed) + 1;
-
-                {
-                    let mut t = tracker.lock().await;
-                    t.record(new_bytes);
+            // Phase 2: Decompress + Write (CPU-bound, limited to num_cpus)
+            let body = match downloaded_body {
+                Some(b) => b,
+                None => {
+                    files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
+            };
 
-                if completed % 50 == 0 || completed == ft {
-                    let speed = { tracker.lock().await.speed_bps() };
-                    let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
-                    let _ = app.emit(
-                        "patch:progress",
-                        &download::DownloadProgress {
-                            bytes_downloaded: new_bytes,
-                            total_bytes: tb,
-                            files_completed: completed,
-                            files_total: ft,
-                            speed_bps: speed,
-                            current_file: hash_hex.clone(),
-                            phase: "downloading".into(),
-                            failed_files: failed,
-                        },
-                    );
+            let _cpu_permit = cpu_sem.acquire_owned().await.unwrap();
+
+            let install_base_inner = install_base.clone();
+            let decompress_result = tokio::task::spawn_blocking(move || {
+                let decompressed = verify::decompress_cdn(&body)?;
+                rdbdata::write_resource_to_rdbdata(
+                    &install_base_inner, file_num, rdb_type, id, offset, &decompressed,
+                )?;
+                Ok::<usize, String>(decompressed.len())
+            }).await;
+
+            drop(_cpu_permit);
+
+            match decompress_result {
+                Ok(Ok(size)) => {
+                    let new_bytes = bytes_dl.fetch_add(size as u64,
+                        std::sync::atomic::Ordering::Relaxed) + size as u64;
+                    let completed = files_comp.fetch_add(1,
+                        std::sync::atomic::Ordering::Relaxed) + 1;
+
+                    {
+                        let mut t = tracker.lock().await;
+                        t.record(new_bytes);
+                    }
+
+                    if completed % 50 == 0 || completed == ft {
+                        let speed = { tracker.lock().await.speed_bps() };
+                        let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
+                        let _ = app.emit(
+                            "patch:progress",
+                            &download::DownloadProgress {
+                                bytes_downloaded: new_bytes,
+                                total_bytes: tb,
+                                files_completed: completed,
+                                files_total: ft,
+                                speed_bps: speed,
+                                current_file: hash_hex.clone(),
+                                phase: "downloading".into(),
+                                failed_files: failed,
+                            },
+                        );
+                    }
                 }
-
-                return;
+                Ok(Err(e)) => {
+                    log::warn!("Process failed for {}:{}: {}", rdb_type, id, e);
+                    files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    log::warn!("Task panicked for {}:{}: {}", rdb_type, id, e);
+                    files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
-
-            files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }));
     }
 

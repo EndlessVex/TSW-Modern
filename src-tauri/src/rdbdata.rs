@@ -131,10 +131,10 @@ pub fn write_resource_to_rdbdata(
     file.write_all(data)
         .map_err(|e| format!("Failed to write data in {:02}.rdbdata: {}", file_num, e))?;
 
-    // Write padding zeros if space > size
+    // Write padding zeros if space > size (always 0-3 bytes)
     if space > size {
-        let padding = vec![0u8; (space - size) as usize];
-        file.write_all(&padding)
+        let pad_len = (space - size) as usize;
+        file.write_all(&[0u8; 4][..pad_len])
             .map_err(|e| format!("Failed to write padding in {:02}.rdbdata: {}", file_num, e))?;
     }
 
