@@ -16,6 +16,22 @@ use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+// ─── Process priority (Windows) ─────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+#[cfg(target_os = "windows")]
+const NORMAL_PRIORITY_CLASS: u32 = 0x00000020;
+
+#[cfg(target_os = "windows")]
+fn set_process_priority(priority: u32) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetPriorityClass(hProcess: isize, dwPriorityClass: u32) -> i32;
+        fn GetCurrentProcess() -> isize;
+    }
+    unsafe { SetPriorityClass(GetCurrentProcess(), priority); }
+}
+
 use download::{
     check_for_updates as check_updates_inner, create_client,
     DownloadConfig, PatchStatus,
@@ -697,6 +713,14 @@ async fn run_patching_inner(
     log::info!("=== run_patching_inner START === install_path={}", install_path);
     use tauri::Emitter;
 
+    // Lower process priority during patching so we don't starve the OS, UI,
+    // or other applications. This is what Steam/Battle.net do during downloads.
+    // The OS scheduler will give us idle CPU time without hard-capping throughput.
+    #[cfg(target_os = "windows")]
+    {
+        set_process_priority(BELOW_NORMAL_PRIORITY_CLASS);
+    }
+
     let base = std::path::PathBuf::from(install_path);
     let rdb_dir = base.join("RDB");
     std::fs::create_dir_all(&rdb_dir)
@@ -945,11 +969,11 @@ async fn run_patching_inner(
     } else {
         4   // <4GB: minimal
     };
-    // Use half the CPU cores for decompression (minimum 1), leaving headroom
-    // for OS, UI, and download networking. With opt-level=2, each decompression
-    // task runs fast enough that fewer concurrent slots still keep the CPU busy.
+    // Use a third of the CPU cores for decompression (minimum 1), leaving
+    // headroom for OS, UI, and download networking. Combined with below-normal
+    // process priority, this keeps CPU usage under ~75% even on weak laptops.
     let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let decompress_concurrent = (cpu_cores / 2).max(1);
+    let decompress_concurrent = (cpu_cores / 3).max(1);
     let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
     // Limit downloads to 2x the decompress slots. With opt-level=2, decompression
@@ -1137,6 +1161,12 @@ async fn run_patching_inner(
         .collect::<Vec<_>>()
         .join("\n") + "\n";
     let _ = std::fs::write(&completion_log_path, &log_content);
+
+    // Restore normal process priority now that patching is done.
+    #[cfg(target_os = "windows")]
+    {
+        set_process_priority(NORMAL_PRIORITY_CLASS);
+    }
 
     Ok(())
 }
