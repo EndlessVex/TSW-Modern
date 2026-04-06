@@ -964,8 +964,16 @@ async fn run_patching_inner(
     let decompress_concurrent = (cpu_cores / 3).max(1);
     let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
-    // Download slots: 2x CPU slots — keeps a buffer of downloaded files ready.
-    let main_concurrent = (decompress_concurrent * 2).min(32);
+    // Download slots: most resources are tiny (<10KB) and process instantly,
+    // so high download concurrency keeps the network saturated. The large
+    // semaphore separately limits big files that eat memory.
+    let main_concurrent = if available_ram_mb > 8000 {
+        64
+    } else if available_ram_mb > 4000 {
+        32
+    } else {
+        16
+    };
 
     // Large resource slots: limits how many big files (>1MB, up to 368MB) sit
     // in memory at once. Capped by RAM to avoid pressure on low-end systems.
