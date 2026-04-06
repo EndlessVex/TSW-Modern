@@ -1076,13 +1076,17 @@ async fn run_patching_inner(
                     let completed = files_comp.fetch_add(1,
                         std::sync::atomic::Ordering::Relaxed) + 1;
 
-                    {
+                    let speed = {
                         let mut t = tracker.lock().await;
                         t.record(new_bytes);
-                    }
+                        if completed % 50 == 0 || completed == ft {
+                            Some(t.speed_bps())
+                        } else {
+                            None
+                        }
+                    };
 
-                    if completed % 50 == 0 || completed == ft {
-                        let speed = { tracker.lock().await.speed_bps() };
+                    if let Some(speed) = speed {
                         let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
                         let _ = app.emit(
                             "patch:progress",
