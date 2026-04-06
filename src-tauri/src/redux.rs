@@ -566,47 +566,68 @@ fn generate_mip(
 }
 
 /// Generate a downsampled BC4 mip level from BC4 block data.
+///
+/// Same float pipeline as generate_mip but for single-channel BC4.
 fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new_h: usize) -> Vec<u8> {
     let prev_bx = (prev_w / 4).max(1);
     let prev_by = (prev_h / 4).max(1);
     let new_bx = (new_w / 4).max(1);
     let new_by = (new_h / 4).max(1);
-    let mut result = Vec::with_capacity(new_bx * new_by * 8);
 
-    for by in 0..new_by {
-        for bx in 0..new_bx {
-            let src_bx = bx * 2;
-            let src_by = by * 2;
-            let mut values = [0u8; 64];
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let sbx = (src_bx + dx).min(prev_bx - 1);
-                    let sby = (src_by + dy).min(prev_by - 1);
-                    let block_off = (sby * prev_bx + sbx) * 8;
-                    if block_off + 8 > prev.len() { continue; }
-                    let block_vals = decode_bc4_block(&prev[block_off..block_off + 8]);
-                    for py in 0..4 {
-                        for px in 0..4 {
-                            values[(dy * 4 + py) * 8 + (dx * 4 + px)] = block_vals[py * 4 + px];
-                        }
-                    }
-                }
-            }
-            let mut filtered = [0u8; 16];
+    // Step 1: Decode entire source mip to single-channel pixel buffer
+    let mut src_pixels = vec![0u8; prev_w * prev_h];
+    for by in 0..prev_by {
+        for bx in 0..prev_bx {
+            let block_off = (by * prev_bx + bx) * 8;
+            if block_off + 8 > prev.len() { continue; }
+            let block_vals = decode_bc4_block(&prev[block_off..block_off + 8]);
             for py in 0..4 {
                 for px in 0..4 {
-                    let mut sum = 0u32;
-                    for fy in 0..2 {
-                        for fx in 0..2 {
-                            sum += values[(py * 2 + fy) * 8 + (px * 2 + fx)] as u32;
-                        }
+                    let x = bx * 4 + px;
+                    let y = by * 4 + py;
+                    if x < prev_w && y < prev_h {
+                        src_pixels[y * prev_w + x] = block_vals[py * 4 + px];
                     }
-                    filtered[py * 4 + px] = (sum / 4) as u8;
                 }
             }
-            result.extend_from_slice(&encode_bc4_block(&filtered));
         }
     }
+
+    // Step 2: Box-filter in float space with rounding
+    let mut dst_pixels = vec![0u8; new_w * new_h];
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let sx = x * 2;
+            let sy = y * 2;
+            let x0 = sx.min(prev_w - 1);
+            let y0 = sy.min(prev_h - 1);
+            let x1 = (sx + 1).min(prev_w - 1);
+            let y1 = (sy + 1).min(prev_h - 1);
+
+            let sum = src_pixels[y0 * prev_w + x0] as f32
+                + src_pixels[y0 * prev_w + x1] as f32
+                + src_pixels[y1 * prev_w + x0] as f32
+                + src_pixels[y1 * prev_w + x1] as f32;
+            dst_pixels[y * new_w + x] = (sum / 4.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    // Step 3: Re-encode block by block
+    let mut result = Vec::with_capacity(new_bx * new_by * 8);
+    for by in 0..new_by {
+        for bx in 0..new_bx {
+            let mut block_vals = [0u8; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = (bx * 4 + px).min(new_w - 1);
+                    let y = (by * 4 + py).min(new_h - 1);
+                    block_vals[py * 4 + px] = dst_pixels[y * new_w + x];
+                }
+            }
+            result.extend_from_slice(&encode_bc4_block(&block_vals));
+        }
+    }
+
     result
 }
 
