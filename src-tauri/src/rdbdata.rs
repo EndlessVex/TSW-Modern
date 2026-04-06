@@ -19,7 +19,11 @@ use crate::rdb::{LeIndex, LeIndexEntry};
 
 /// Pre-create all required rdbdata files with RDB0 headers.
 /// Only creates files that don't already exist.
-pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<(), String> {
+pub fn create_rdbdata_files(
+    install_dir: &Path,
+    le_index: &LeIndex,
+    valid_hashes: Option<&std::collections::HashSet<[u8; 16]>>,
+) -> Result<(), String> {
     let rdb_dir = install_dir.join("RDB");
     std::fs::create_dir_all(&rdb_dir)
         .map_err(|e| format!("Failed to create RDB dir: {}", e))?;
@@ -31,6 +35,12 @@ pub fn create_rdbdata_files(install_dir: &Path, le_index: &LeIndex) -> Result<()
     for entry in &le_index.entries {
         if entry.file_num == 255 {
             continue;
+        }
+        // Skip resources not in valid set (if filter provided)
+        if let Some(valid) = valid_hashes {
+            if !valid.contains(&entry.hash) {
+                continue;
+            }
         }
         file_nums.insert(entry.file_num);
         let end = entry.offset as u64 + entry.length as u64;

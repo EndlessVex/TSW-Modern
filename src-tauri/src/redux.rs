@@ -1031,18 +1031,26 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
     let (mut best_a0, mut best_a1) = (a0, a1);
 
     if (a0 as i32 - a1 as i32) > 8 {
-        let mut best_error = bc4_sse(values, a0, a1);
+        let range = a0 as i32 - a1 as i32;
+        let mut best_error = bc4_sse(values, a0, a1) as i32;
 
-        let mut ep0 = a1 as u32 + 9;
-        while ep0 <= a0 as u32 {
-            for ep1 in (a1 as u32)..ep0 {
-                let err = bc4_sse(values, ep0 as u8, ep1 as u8);
-                if err < best_error {
-                    best_error = err;
-                    best_a0 = ep0 as u8;
-                    best_a1 = ep1 as u8;
+        let mut ep0 = a1 as i32 + 9;
+        let mut ep1_max = a1 as i32;
+        let mut range_remaining = range - 9; // decreases as ep0 increases
+        while ep0 <= a0 as i32 {
+            ep1_max += 1;
+            for ep1 in (a1 as i32)..ep1_max {
+                // Ghidra pruning: skip pairs that can't beat current best
+                if (range_remaining + ep1) <= best_error {
+                    let err = bc4_sse(values, ep0 as u8, ep1 as u8) as i32;
+                    if err < best_error {
+                        best_error = err;
+                        best_a0 = ep0 as u8;
+                        best_a1 = ep1 as u8;
+                    }
                 }
             }
+            range_remaining -= 1;
             ep0 += 1;
         }
     }

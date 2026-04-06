@@ -841,7 +841,7 @@ async fn run_patching_inner(
             phase: "bootstrapping".into(), failed_files: 0,
         },
     );
-    rdbdata::create_rdbdata_files(&base, &le_index)?;
+    rdbdata::create_rdbdata_files(&base, &le_index, Some(&valid_hashes))?;
 
     // Build placement map for fast lookup
     let _placement_map = rdbdata::build_placement_map(&le_index);
