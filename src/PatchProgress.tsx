@@ -10,7 +10,7 @@ export interface DownloadProgress {
   files_total: number;
   speed_bps: number;
   current_file: string;
-  phase: "checking" | "downloading" | "complete" | "error" | "repairing" | "bootstrapping";
+  phase: "checking" | "downloading" | "patching" | "complete" | "error" | "repairing" | "bootstrapping";
   failed_files: number;
 }
 
@@ -71,7 +71,7 @@ export default function PatchProgress({ layout = "panel" }: PatchProgressProps) 
 
   // Elapsed time counter
   useEffect(() => {
-    if (!progress || progress.phase !== "downloading") return;
+    if (!progress || (progress.phase !== "downloading" && progress.phase !== "patching")) return;
     if (paused) return;
     const interval = setInterval(() => setElapsedSec(s => s + 1), 1000);
     return () => clearInterval(interval);
@@ -79,7 +79,7 @@ export default function PatchProgress({ layout = "panel" }: PatchProgressProps) 
 
   // Keyboard controls: ESC to pause/cancel, Space to resume
   useEffect(() => {
-    if (!progress || (progress.phase !== "downloading" && progress.phase !== "checking" && progress.phase !== "bootstrapping")) return;
+    if (!progress || (progress.phase !== "downloading" && progress.phase !== "patching" && progress.phase !== "checking" && progress.phase !== "bootstrapping")) return;
 
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") {
@@ -110,16 +110,19 @@ export default function PatchProgress({ layout = "panel" }: PatchProgressProps) 
 
   const { phase, bytes_downloaded, total_bytes, files_completed, files_total } = progress;
 
-  const pct = total_bytes > 0
-    ? Math.min(100, Math.max(0, (bytes_downloaded / total_bytes) * 100))
-    : 0;
+  // During download: progress = bytes downloaded / total bytes
+  // During patching tail: progress = files completed / files total
+  const pct = phase === "patching"
+    ? (files_total > 0 ? Math.min(100, Math.max(0, (files_completed / files_total) * 100)) : 100)
+    : (total_bytes > 0 ? Math.min(100, Math.max(0, (bytes_downloaded / total_bytes) * 100)) : 0);
 
   // ─── Bar layout: status bar zone between content and tabs ───
   if (layout === "bar") {
     const phaseLabel =
       phase === "checking" ? "Checking for updates..." :
       phase === "bootstrapping" ? "Downloading patch index..." :
-      phase === "downloading" ? `Patching local files` :
+      phase === "downloading" ? "Downloading game files" :
+      phase === "patching" ? "Processing remaining files..." :
       phase === "complete" ? "Patching complete" :
       phase === "error" ? "Patching failed" :
       phase === "repairing" ? "Repairing files..." : "";
@@ -139,20 +142,27 @@ export default function PatchProgress({ layout = "panel" }: PatchProgressProps) 
                 {formatTime(elapsedSec)}
               </>
             )}
+            {phase === "patching" && (
+              <>
+                {files_completed}/{files_total} files
+                {" - "}
+                {formatTime(elapsedSec)}
+              </>
+            )}
             {phase === "complete" && "Download complete"}
             {phase === "error" && (progress.current_file || "Download failed")}
           </span>
           <span className="status-bar-phase">
             {phaseLabel}
-            {phase === "downloading" && !paused && (
-              <span className="status-bar-hint">  To pause download press ESC anytime.</span>
+            {(phase === "downloading" || phase === "patching") && !paused && (
+              <span className="status-bar-hint">  Press ESC to pause.</span>
             )}
-            {phase === "downloading" && paused && (
-              <span className="status-bar-hint">  Paused — press Space to resume, ESC to cancel.</span>
+            {(phase === "downloading" || phase === "patching") && paused && (
+              <span className="status-bar-hint">  Paused — Space to resume, ESC to cancel.</span>
             )}
           </span>
         </div>
-        {(phase === "downloading" || phase === "complete" || phase === "error") && (
+        {(phase === "downloading" || phase === "patching" || phase === "complete" || phase === "error") && (
           <div className="status-bar-track">
             <div
               className={`status-bar-fill ${phase === "complete" ? "status-bar-fill-complete" : ""} ${phase === "error" ? "status-bar-fill-error" : ""} ${paused ? "status-bar-fill-paused" : ""}`}
