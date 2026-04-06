@@ -910,6 +910,13 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World")
     }
 
+    /// Skip test if TSW isn't installed locally (e.g. CI)
+    macro_rules! require_tsw {
+        () => {
+            if !tsw_dir().exists() { return; }
+        };
+    }
+
     // ── DownloadConfig defaults ──────────────────────────────────────
 
     #[test]
@@ -1386,6 +1393,7 @@ mod tests {
 
     #[test]
     fn download_check_for_updates_real_install() {
+        require_tsw!();
         let status = check_for_updates(&tsw_dir()).expect("check_for_updates");
         // TSW is a frozen game — local root hash matches the frozen hash
         assert!(

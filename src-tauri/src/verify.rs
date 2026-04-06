@@ -465,10 +465,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn tsw_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../The Secret World")
-            .canonicalize()
-            .expect("TSW install directory must exist")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World")
+    }
+
+    /// Skip test if TSW isn't installed locally (e.g. CI)
+    macro_rules! require_tsw {
+        () => {
+            if !tsw_dir().exists() { return; }
+        };
     }
 
     fn le_idx_path() -> PathBuf {
@@ -479,6 +483,7 @@ mod tests {
 
     #[test]
     fn test_verify_single_entry() {
+        require_tsw!();
         // Verify the very first entry in le.idx: type=1000001, id=3, file_num=0
         let idx = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");
         let entry = &idx.entries[0];
@@ -508,6 +513,7 @@ mod tests {
 
     #[test]
     fn test_verify_multiple_entries() {
+        require_tsw!();
         // Verify 8 entries across different rdbdata files
         let idx = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");
 
@@ -546,6 +552,7 @@ mod tests {
 
     #[test]
     fn test_verify_skips_file_num_255() {
+        require_tsw!();
         let idx = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");
 
         // Build index with only file_num=255 entries
@@ -573,6 +580,7 @@ mod tests {
 
     #[test]
     fn test_verify_cancellation() {
+        require_tsw!();
         let idx = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");
 
         // Take 100 entries that are not file_num=255
@@ -602,6 +610,7 @@ mod tests {
 
     #[test]
     fn test_verify_progress_callback() {
+        require_tsw!();
         let idx = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");
 
         let entries: Vec<_> = idx
@@ -771,6 +780,7 @@ mod tests {
 
     #[test]
     fn test_build_minimum_entry_set() {
+        require_tsw!();
         let min_set = build_minimum_entry_set(&tsw_dir()).expect("build minimum set");
         // Should contain entries from default-resources (477k) + core bundles
         // Total should be substantial but less than all 1.2M entries
@@ -788,6 +798,7 @@ mod tests {
 
     #[test]
     fn test_is_entry_in_minimum_set() {
+        require_tsw!();
         let min_set = build_minimum_entry_set(&tsw_dir()).expect("build minimum set");
         // Check a known entry that should be in default-resources
         // (type=1000001, id=3 is the first entry in le.idx)
@@ -808,6 +819,7 @@ mod tests {
 
     #[test]
     fn test_minimum_set_subset_of_full() {
+        require_tsw!();
         // Verify all entries in minimum set are valid (type, id) pairs from le.idx
         let min_set = build_minimum_entry_set(&tsw_dir()).expect("build minimum set");
         let le_index = rdb::parse_le_index(&le_idx_path()).expect("parse le.idx");

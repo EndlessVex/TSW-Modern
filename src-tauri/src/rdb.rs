@@ -455,7 +455,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn tsw_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World")
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World");
+        if !p.exists() { eprintln!("Skipping: TSW not installed locally"); }
+        p
+    }
+
+    /// Skip test if TSW isn't installed locally (e.g. CI)
+    macro_rules! require_tsw {
+        () => {
+            if !tsw_dir().exists() { return; }
+        };
     }
 
     fn le_idx_path() -> PathBuf {
@@ -470,6 +479,7 @@ mod tests {
 
     #[test]
     fn le_idx_header() {
+        require_tsw!();
         let idx = parse_le_index(&le_idx_path()).expect("parse le.idx");
         assert_eq!(idx.entries.len(), 709_723);
         assert_eq!(
@@ -480,6 +490,7 @@ mod tests {
 
     #[test]
     fn le_idx_first_entry() {
+        require_tsw!();
         let idx = parse_le_index(&le_idx_path()).expect("parse le.idx");
         let e = &idx.entries[0];
         assert_eq!(e.rdb_type, 1_000_001);
@@ -490,6 +501,7 @@ mod tests {
 
     #[test]
     fn le_idx_last_entry() {
+        require_tsw!();
         let idx = parse_le_index(&le_idx_path()).expect("parse le.idx");
         let e = idx.entries.last().expect("should have entries");
         assert_eq!(e.rdb_type, 1_070_020);
@@ -501,12 +513,14 @@ mod tests {
 
     #[test]
     fn hash_index_header() {
+        require_tsw!();
         let hi = parse_hash_index(&hash_index_path()).expect("parse hash index");
         assert_eq!(hi.entries.len(), 709_723);
     }
 
     #[test]
     fn hash_index_first_entry() {
+        require_tsw!();
         let hi = parse_hash_index(&hash_index_path()).expect("parse hash index");
         let entry = hi.entries.get(&(1_000_001, 3)).expect("entry (1000001, 3)");
         assert_eq!(entry.file_size, 89);
@@ -518,6 +532,7 @@ mod tests {
 
     #[test]
     fn hash_index_type_count() {
+        require_tsw!();
         // Verify we got entries from all 169 type groups by counting distinct types.
         let hi = parse_hash_index(&hash_index_path()).expect("parse hash index");
         let distinct_types: std::collections::HashSet<u32> =
@@ -671,6 +686,7 @@ mod tests {
 
     #[test]
     fn le_idx_file_num_255_flagged() {
+        require_tsw!();
         // Verify entries with file_num=255 exist — these are server-only resources
         // that should be skipped during download decisions.
         let idx = parse_le_index(&le_idx_path()).expect("parse le.idx");
@@ -688,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_parse_bundles_real_le_idx() {
+        require_tsw!();
         let bundles = parse_bundles(&le_idx_path()).expect("parse bundles");
         assert_eq!(
             bundles.len(),
@@ -703,6 +720,7 @@ mod tests {
 
     #[test]
     fn test_bundle_entry_counts() {
+        require_tsw!();
         let bundles = parse_bundles(&le_idx_path()).expect("parse bundles");
         let total: usize = bundles.iter().map(|b| b.entries.len()).sum();
         // Research says ~1,202,680 total refs
@@ -715,6 +733,7 @@ mod tests {
 
     #[test]
     fn test_bundle_entry_types_valid() {
+        require_tsw!();
         // Verify that parsed entry types/ids are in reasonable ranges
         let bundles = parse_bundles(&le_idx_path()).expect("parse bundles");
         for bundle in &bundles {

@@ -1968,20 +1968,23 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Real TSW install directory, relative to src-tauri/
-    fn tsw_path() -> String {
+    /// Real TSW install directory, relative to src-tauri/.
+    /// Returns None if the game isn't installed locally (e.g. CI).
+    fn tsw_path() -> Option<String> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../The Secret World");
-        // Canonicalize to resolve the ..
         path.canonicalize()
-            .expect("TSW install directory must exist at '../The Secret World/' relative to src-tauri/")
-            .to_string_lossy()
-            .to_string()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
     }
 
     #[test]
     fn valid_tsw_directory() {
-        let result = validate_install_dir_inner(&tsw_path());
+        let path = match tsw_path() {
+            Some(p) => p,
+            None => return, // skip in CI
+        };
+        let result = validate_install_dir_inner(&path);
         assert!(result.valid, "Expected valid=true, got: {:?}", result);
         assert!(
             result.version.is_some(),

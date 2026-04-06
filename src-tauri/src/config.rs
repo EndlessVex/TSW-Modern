@@ -149,12 +149,24 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn tsw_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World")
+    }
+
+    /// Skip test if TSW isn't installed locally (e.g. CI)
+    macro_rules! require_tsw {
+        () => {
+            if !tsw_dir().exists() { return; }
+        };
+    }
+
     fn local_config_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../The Secret World/LocalConfig.xml")
+        tsw_dir().join("LocalConfig.xml")
     }
 
     #[test]
     fn config_parses_real_file() {
+        require_tsw!();
         let cfg = parse_local_config(&local_config_path()).expect("parse LocalConfig.xml");
         assert_eq!(cfg.http_patch_addr, "http://update.secretworld.com/tswupm");
         assert_eq!(cfg.http_patch_folder, "TSWLiveSteam");
@@ -164,6 +176,7 @@ mod tests {
 
     #[test]
     fn config_patch_base_url() {
+        require_tsw!();
         let cfg = parse_local_config(&local_config_path()).expect("parse");
         assert_eq!(
             cfg.patch_base_url(),
