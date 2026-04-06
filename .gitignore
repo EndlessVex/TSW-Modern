@@ -14,7 +14,7 @@ target/
 # ── Tauri ──
 src-tauri/gen/schemas/
 
-# ── Local reference material ──
+# ── Local reference material (screenshots, binaries, format docs) ──
 references/
 
 # ── GSD (agent workspace) ──
@@ -36,30 +36,49 @@ Thumbs.db
 # ── Logs ──
 *.log
 
-# ── Game install (local testing) ──
+# ── Game installs (local testing — each ~35-44GB) ──
 The Secret World/
 our_downloader_secretworld/
 working_secretworld/
+ours-recent/
+ours-loggedin/
+normal-downloaded/
+normal-first-launch/
+normal-full-patch/
+normal-full-loggedin/
+installer-finished/
+failed-attempt/
+weird-size/
 
-# ── NSIS installer game files (from Funcom installer analysis) ──
+# ── NSIS installer extracted files (from Funcom installer analysis) ──
 *{app}*
 *{tmp}*
 
-# ── Misc ──
-coverage/
-.cache/
-tmp/
+# ── Game binaries / Ghidra projects (reverse engineering) ──
+TheSecretWorldInstaller.exe
+*.gpr
+*.rep/
 
-# Test/research artifacts
-test_full_download/
-bench_staging/
+# ── Research scripts (one-off analysis, not part of the app) ──
+*.py
+forensic_results.txt
+interceptor_output.txt
+
+# ── Generated data files ──
+le.idx.gz
 *.json
 !package.json
 !package-lock.json
 !tsconfig.json
 !tsconfig.node.json
 !src-tauri/tauri.conf.json
-interceptor_output.txt
+
+# ── Misc ──
+coverage/
+.cache/
+tmp/
+test_full_download/
+bench_staging/
 *.bak
 
 # ── Debug tools (not part of the app) ──
