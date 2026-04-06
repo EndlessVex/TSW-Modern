@@ -994,71 +994,21 @@ fn decode_dxt5_block(data: &[u8]) -> [[u8; 4]; 16] {
 
 /// Encode 16 RGBA pixels → DXT5 block (16 bytes).
 fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
-    // ── Alpha ──
-    let mut min_a = 255u8;
-    let mut max_a = 0u8;
-    for p in pixels {
-        min_a = min_a.min(p[3]);
-        max_a = max_a.max(p[3]);
-    }
-
-    let (a0, a1) = (max_a, min_a);
-
-    let alpha_table: [u8; 8] = if a0 > a1 {
-        let a0w = a0 as u16;
-        let a1w = a1 as u16;
-        [
-            a0,
-            a1,
-            ((6 * a0w + 1 * a1w) / 7) as u8,
-            ((5 * a0w + 2 * a1w) / 7) as u8,
-            ((4 * a0w + 3 * a1w) / 7) as u8,
-            ((3 * a0w + 4 * a1w) / 7) as u8,
-            ((2 * a0w + 5 * a1w) / 7) as u8,
-            ((1 * a0w + 6 * a1w) / 7) as u8,
-        ]
-    } else if a0 == a1 {
-        [a0; 8]
-    } else {
-        let a0w = a0 as u16;
-        let a1w = a1 as u16;
-        [
-            a0,
-            a1,
-            ((4 * a0w + 1 * a1w) / 5) as u8,
-            ((3 * a0w + 2 * a1w) / 5) as u8,
-            ((2 * a0w + 3 * a1w) / 5) as u8,
-            ((1 * a0w + 4 * a1w) / 5) as u8,
-            0,
-            255,
-        ]
-    };
-
-    // Find closest alpha index for each pixel (strict < for game-compatible tie-breaking)
-    let mut alpha_bits: u64 = 0;
+    // Extract alpha values and encode as BC4 block (same structure).
+    // Uses encode_bc4_block for exhaustive endpoint search + squared error
+    // index assignment, matching the ClientPatcher (Ghidra: FUN_00680B60).
+    let mut alpha_values = [0u8; 16];
     for (i, p) in pixels.iter().enumerate() {
-        let a = p[3];
-        let mut best_dist = u16::MAX;
-        let mut best_idx = 0u64;
-        for (j, &ta) in alpha_table.iter().enumerate() {
-            let d = (a as i16 - ta as i16).unsigned_abs();
-            if d < best_dist {
-                best_dist = d;
-                best_idx = j as u64;
-            }
-        }
-        alpha_bits |= best_idx << (i * 3);
+        alpha_values[i] = p[3];
     }
+    let alpha_block = encode_bc4_block(&alpha_values);
 
-    let alpha_bytes = alpha_bits.to_le_bytes();
-
-    // ── Color (DXT1) ──
+    // Color portion (DXT1)
     let color_block = encode_dxt1_block(pixels);
 
+    // DXT5 = alpha(8) + color(8)
     let mut out = [0u8; 16];
-    out[0] = a0;
-    out[1] = a1;
-    out[2..8].copy_from_slice(&alpha_bytes[0..6]);
+    out[0..8].copy_from_slice(&alpha_block);
     out[8..16].copy_from_slice(&color_block);
     out
 }
@@ -1712,6 +1662,24 @@ mod tests {
         let pixels = decode_dxt5_block(&block);
         // Truncating: (6*200 + 1*50) / 7 = 1250/7 = 178
         assert_eq!(pixels[0][3], 178, "DXT5 alpha should use truncating division, got {}", pixels[0][3]);
+    }
+
+    #[test]
+    fn test_dxt5_alpha_uses_bc4_encoder() {
+        // DXT5 alpha should produce the same output as BC4 for the same values
+        let mut pixels = [[0u8; 4]; 16];
+        for i in 0..16 {
+            pixels[i] = [128, 64, 32, (i as u8) * 16]; // varying alpha
+        }
+        let dxt5 = encode_dxt5_block(&pixels);
+
+        // Extract alpha values and encode with BC4 directly
+        let mut alpha_vals = [0u8; 16];
+        for i in 0..16 { alpha_vals[i] = pixels[i][3]; }
+        let bc4 = encode_bc4_block(&alpha_vals);
+
+        // DXT5 alpha portion (first 8 bytes) should match BC4 output
+        assert_eq!(&dxt5[0..8], &bc4[..], "DXT5 alpha should match BC4 encoder output");
     }
 
     #[test]
