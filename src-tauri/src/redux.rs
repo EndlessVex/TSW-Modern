@@ -716,13 +716,7 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
     let c1 = ((r1 as u16) << 11) | ((g1 as u16) << 5) | (b1 as u16);
 
     let mut block = [0u8; 8];
-    if c0 == c1 {
-        // Same endpoint — use index 3 to match ClientPatcher. In 3-color mode
-        // (c0 <= c1), index 3 = transparent black, used by effect shaders.
-        block[0..2].copy_from_slice(&c0.to_le_bytes());
-        block[2..4].copy_from_slice(&c1.to_le_bytes());
-        block[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-    } else if c0 < c1 {
+    if c0 < c1 {
         block[0..2].copy_from_slice(&c1.to_le_bytes());
         block[2..4].copy_from_slice(&c0.to_le_bytes());
         block[4..8].copy_from_slice(&0x55555555u32.to_le_bytes());
@@ -923,14 +917,9 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
 
     if c0 < c1 { std::mem::swap(&mut c0, &mut c1); }
     if c0 == c1 {
-        // When both endpoints are the same, all palette entries decode to the
-        // same color. Use index 3 (0xFFFFFFFF) to match the ClientPatcher.
-        // In 3-color mode (c0 <= c1), index 3 = transparent black — game shaders
-        // depend on this for effects like the Anima well portal.
         let mut out = [0u8; 8];
         out[0..2].copy_from_slice(&c0.to_le_bytes());
         out[2..4].copy_from_slice(&c1.to_le_bytes());
-        out[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
         return out;
     }
 
