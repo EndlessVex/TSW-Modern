@@ -628,6 +628,7 @@ fn decode_rgb565(c: u16) -> (u8, u8, u8) {
 }
 
 /// Encode (R, G, B) → RGB565.
+#[cfg(test)]
 #[inline]
 fn encode_rgb565(r: u8, g: u8, b: u8) -> u16 {
     let r5 = (r as u16 * 31 / 255) & 0x1F;
