@@ -477,8 +477,10 @@ fn decompress_mixd(
 
 /// Generate a downsampled mip level from DXT block data.
 ///
-/// Decodes 2×2 groups of source blocks to RGBA, box-filters to 4×4,
-/// and re-encodes to DXT blocks.
+/// Matches the ClientPatcher's NVTT pipeline:
+/// 1. Decode entire source mip to full pixel buffer
+/// 2. Box-filter in float space (2x2 average with rounding)
+/// 3. Re-encode block by block from filtered image
 fn generate_mip(
     prev: &[u8],
     prev_w: usize,
@@ -493,72 +495,69 @@ fn generate_mip(
     let new_bx = (new_w / 4).max(1);
     let new_by = (new_h / 4).max(1);
 
-    let mut result = Vec::with_capacity(new_bx * new_by * block_size);
-
-    for by in 0..new_by {
-        for bx in 0..new_bx {
-            let src_bx = bx * 2;
-            let src_by = by * 2;
-
-            let mut pixels = [[0u8; 4]; 64];
-
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let sbx = (src_bx + dx).min(prev_bx - 1);
-                    let sby = (src_by + dy).min(prev_by - 1);
-                    let src_idx = sby * prev_bx + sbx;
-                    let block_off = src_idx * block_size;
-
-                    if block_off + block_size > prev.len() {
-                        continue;
-                    }
-
-                    let block = &prev[block_off..block_off + block_size];
-                    let block_pixels = match codec {
-                        TextureCodec::Dxt1 => decode_dxt1_block(block),
-                        TextureCodec::Dxt5 => decode_dxt5_block(block),
-                        TextureCodec::Ati2 => decode_ati2_block(block),
-                    };
-
-                    for py in 0..4 {
-                        for px in 0..4 {
-                            let gy = dy * 4 + py;
-                            let gx = dx * 4 + px;
-                            pixels[gy * 8 + gx] = block_pixels[py * 4 + px];
-                        }
-                    }
-                }
-            }
-
-            let mut filtered = [[0u8; 4]; 16];
+    // Step 1: Decode entire source mip to pixel buffer
+    let mut src_pixels = vec![[0u8; 4]; prev_w * prev_h];
+    for by in 0..prev_by {
+        for bx in 0..prev_bx {
+            let block_off = (by * prev_bx + bx) * block_size;
+            if block_off + block_size > prev.len() { continue; }
+            let block = &prev[block_off..block_off + block_size];
+            let block_pixels = match codec {
+                TextureCodec::Dxt1 => decode_dxt1_block(block),
+                TextureCodec::Dxt5 => decode_dxt5_block(block),
+                TextureCodec::Ati2 => decode_ati2_block(block),
+            };
             for py in 0..4 {
                 for px in 0..4 {
-                    let mut r = 0u32;
-                    let mut g = 0u32;
-                    let mut b = 0u32;
-                    let mut a = 0u32;
-                    for fy in 0..2 {
-                        for fx in 0..2 {
-                            let p = &pixels[(py * 2 + fy) * 8 + (px * 2 + fx)];
-                            r += p[0] as u32;
-                            g += p[1] as u32;
-                            b += p[2] as u32;
-                            a += p[3] as u32;
-                        }
+                    let x = bx * 4 + px;
+                    let y = by * 4 + py;
+                    if x < prev_w && y < prev_h {
+                        src_pixels[y * prev_w + x] = block_pixels[py * 4 + px];
                     }
-                    filtered[py * 4 + px] = [
-                        (r / 4) as u8,
-                        (g / 4) as u8,
-                        (b / 4) as u8,
-                        (a / 4) as u8,
-                    ];
                 }
             }
+        }
+    }
 
+    // Step 2: Box-filter in float space with rounding
+    let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let sx = x * 2;
+            let sy = y * 2;
+            let x0 = sx.min(prev_w - 1);
+            let y0 = sy.min(prev_h - 1);
+            let x1 = (sx + 1).min(prev_w - 1);
+            let y1 = (sy + 1).min(prev_h - 1);
+
+            let p00 = src_pixels[y0 * prev_w + x0];
+            let p10 = src_pixels[y0 * prev_w + x1];
+            let p01 = src_pixels[y1 * prev_w + x0];
+            let p11 = src_pixels[y1 * prev_w + x1];
+
+            for c in 0..4 {
+                let sum = p00[c] as f32 + p10[c] as f32 + p01[c] as f32 + p11[c] as f32;
+                dst_pixels[y * new_w + x][c] = (sum / 4.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    // Step 3: Re-encode block by block from filtered image
+    let mut result = Vec::with_capacity(new_bx * new_by * block_size);
+    for by in 0..new_by {
+        for bx in 0..new_bx {
+            let mut block_pixels = [[0u8; 4]; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = (bx * 4 + px).min(new_w - 1);
+                    let y = (by * 4 + py).min(new_h - 1);
+                    block_pixels[py * 4 + px] = dst_pixels[y * new_w + x];
+                }
+            }
             match codec {
-                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&filtered)),
-                TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&filtered)),
-                TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&filtered)),
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels)),
+                TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&block_pixels)),
+                TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&block_pixels)),
             }
         }
     }
@@ -1715,6 +1714,26 @@ mod tests {
         let encoded = encode_bc4_iterative(&values, 8);
         assert!((encoded[0] as i16 - encoded[1] as i16).abs() <= 1,
             "Constant block endpoints should be near-equal: {} vs {}", encoded[0], encoded[1]);
+    }
+
+    #[test]
+    fn test_mip_float_rounding() {
+        // Values where integer sum/4 truncates differently than float round:
+        // 3 + 3 + 3 + 2 = 11. Integer: 11/4 = 2. Float: 11/4 = 2.75 → round = 3.
+        let mut src = vec![0u8; 8 * 4]; // 2x2 BC4 blocks = 8x8 pixels
+        // Block 0,1,2: all pixels = 3
+        for i in 0..3 {
+            src[i * 8] = 3; src[i * 8 + 1] = 3;
+            src[i * 8 + 2..i * 8 + 8].copy_from_slice(&[0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
+        }
+        // Block 3: all pixels = 2
+        src[24] = 2; src[25] = 2;
+        src[26..32].copy_from_slice(&[0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
+
+        let mip = generate_mip_bc4(&src, 8, 8, 4, 4);
+        let decoded = decode_bc4_block(&mip);
+        // Float rounding: (3+3+3+2)/4 = 2.75 → round → 3
+        assert_eq!(decoded[0], 3, "Mip should use float rounding, got {}", decoded[0]);
     }
 
 }
