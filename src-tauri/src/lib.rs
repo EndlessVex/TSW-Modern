@@ -944,11 +944,11 @@ async fn run_patching_inner(
     } else {
         4   // <4GB: minimal
     };
-    // Use half the CPU cores for decompression, leaving headroom for OS, UI,
-    // and download networking. The BC4 exhaustive search + LZMA decompression
-    // are CPU-intensive; using all cores causes system-wide sluggishness.
+    // Use half the CPU cores for decompression (minimum 1), leaving headroom
+    // for OS, UI, and download networking. With opt-level=2, each decompression
+    // task runs fast enough that fewer concurrent slots still keep the CPU busy.
     let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let decompress_concurrent = (cpu_cores / 2).max(2);
+    let decompress_concurrent = (cpu_cores / 2).max(1);
     let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
     // Limit downloads to 2x the decompress slots. With opt-level=2, decompression
