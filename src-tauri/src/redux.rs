@@ -722,59 +722,203 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
-    let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
+    // ── WeightedClusterFit (Ghidra: FUN_0067F490 + FUN_0067E280) ──
 
-    for p in pixels {
-        min_r = min_r.min(p[0]);
-        min_g = min_g.min(p[1]);
-        min_b = min_b.min(p[2]);
-        max_r = max_r.max(p[0]);
-        max_g = max_g.max(p[1]);
-        max_b = max_b.max(p[2]);
+    // Step 1: Build color set — float RGB, alpha-weighted, deduplicated
+    let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
+    let mut weights: Vec<f32> = Vec::with_capacity(16);
+    let mut remap = [0usize; 16];
+
+    for (i, p) in pixels.iter().enumerate() {
+        let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+        let w = (p[3] as f32 + 1.0) / 256.0;
+        let mut found = false;
+        for (j, existing) in colors.iter().enumerate() {
+            if (existing[0] - rgb[0]).abs() < 1e-6
+                && (existing[1] - rgb[1]).abs() < 1e-6
+                && (existing[2] - rgb[2]).abs() < 1e-6
+            {
+                weights[j] += w;
+                remap[i] = j;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            remap[i] = colors.len();
+            colors.push(rgb);
+            weights.push(w);
+        }
     }
 
-    let mut c0 = encode_rgb565(max_r, max_g, max_b);
-    let mut c1 = encode_rgb565(min_r, min_g, min_b);
+    let n = colors.len();
 
+    // Step 2: Weighted centroid
+    let total_weight: f32 = weights.iter().sum();
+    let mut centroid = [0.0f32; 3];
+    for (c, &w) in colors.iter().zip(weights.iter()) {
+        for k in 0..3 { centroid[k] += c[k] * w; }
+    }
+    for k in 0..3 { centroid[k] /= total_weight; }
+
+    // Step 3: Weighted covariance matrix [rr, rg, rb, gg, gb, bb]
+    let mut cov = [0.0f32; 6];
+    for (c, &w) in colors.iter().zip(weights.iter()) {
+        let dr = c[0] - centroid[0];
+        let dg = c[1] - centroid[1];
+        let db = c[2] - centroid[2];
+        cov[0] += w * dr * dr;
+        cov[1] += w * dr * dg;
+        cov[2] += w * dr * db;
+        cov[3] += w * dg * dg;
+        cov[4] += w * dg * db;
+        cov[5] += w * db * db;
+    }
+
+    // Step 4: Power iteration — 8 iterations, seed = max-magnitude row
+    let rows: [[f32; 3]; 3] = [
+        [cov[0], cov[1], cov[2]],
+        [cov[1], cov[3], cov[4]],
+        [cov[2], cov[4], cov[5]],
+    ];
+    let mut axis = {
+        let mut best_row = 0;
+        let mut best_mag = 0.0f32;
+        for (i, row) in rows.iter().enumerate() {
+            let mag = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
+            if mag > best_mag { best_mag = mag; best_row = i; }
+        }
+        rows[best_row]
+    };
+    for _ in 0..8 {
+        let next = [
+            cov[0] * axis[0] + cov[1] * axis[1] + cov[2] * axis[2],
+            cov[1] * axis[0] + cov[3] * axis[1] + cov[4] * axis[2],
+            cov[2] * axis[0] + cov[4] * axis[1] + cov[5] * axis[2],
+        ];
+        let max_abs = next[0].abs().max(next[1].abs()).max(next[2].abs());
+        if max_abs > 0.0 {
+            axis = [next[0] / max_abs, next[1] / max_abs, next[2] / max_abs];
+        } else {
+            axis = [0.0; 3];
+            break;
+        }
+    }
+
+    // Step 5: Project colors onto axis and insertion-sort ascending
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut dots: Vec<f32> = colors.iter().map(|c| {
+        c[0] * axis[0] + c[1] * axis[1] + c[2] * axis[2]
+    }).collect();
+    for i in 1..n {
+        let key_dot = dots[i];
+        let key_idx = order[i];
+        let mut j = i;
+        while j > 0 && dots[j - 1] > key_dot {
+            dots[j] = dots[j - 1];
+            order[j] = order[j - 1];
+            j -= 1;
+        }
+        dots[j] = key_dot;
+        order[j] = key_idx;
+    }
+    let sorted_colors: Vec<[f32; 3]> = order.iter().map(|&i| colors[i]).collect();
+    let sorted_weights: Vec<f32> = order.iter().map(|&i| weights[i]).collect();
+
+    // Step 6: Precompute cumulative sums for partition search
+    let mut cum_w = vec![0.0f32; n + 1];
+    let mut cum_rgb = vec![[0.0f32; 3]; n + 1];
+    for i in 0..n {
+        cum_w[i + 1] = cum_w[i] + sorted_weights[i];
+        for k in 0..3 {
+            cum_rgb[i + 1][k] = cum_rgb[i][k] + sorted_colors[i][k] * sorted_weights[i];
+        }
+    }
+    let total_rgb = cum_rgb[n];
+
+    // Step 7: Exhaustive 4-partition search
+    let mut best_err = f32::MAX;
+    let mut best_ep0 = [0.0f32; 3];
+    let mut best_ep1 = [0.0f32; 3];
+
+    for s in 0..=n {
+        let w_a = cum_w[s];
+        for t in s..=n {
+            let w_b = cum_w[t] - cum_w[s];
+            for u in t..=n {
+                let w_c = cum_w[u] - cum_w[t];
+                let w_d = cum_w[n] - cum_w[u];
+
+                let alpha_aa = w_a + w_b * (4.0 / 9.0) + w_c * (1.0 / 9.0);
+                let alpha_bb = w_d + w_c * (4.0 / 9.0) + w_b * (1.0 / 9.0);
+                let alpha_ab = (w_b + w_c) * (2.0 / 9.0);
+                let det = alpha_aa * alpha_bb - alpha_ab * alpha_ab;
+                if det.abs() < 1e-10 { continue; }
+                let inv_det = 1.0 / det;
+
+                let sum_a = cum_rgb[s];
+                let sum_b = [cum_rgb[t][0] - cum_rgb[s][0], cum_rgb[t][1] - cum_rgb[s][1], cum_rgb[t][2] - cum_rgb[s][2]];
+                let sum_c = [cum_rgb[u][0] - cum_rgb[t][0], cum_rgb[u][1] - cum_rgb[t][1], cum_rgb[u][2] - cum_rgb[t][2]];
+                let sum_d = [total_rgb[0] - cum_rgb[u][0], total_rgb[1] - cum_rgb[u][1], total_rgb[2] - cum_rgb[u][2]];
+
+                let mut err = 0.0f32;
+                let mut ep_a = [0.0f32; 3];
+                let mut ep_b = [0.0f32; 3];
+                for k in 0..3 {
+                    let beta_a = sum_a[k] + sum_b[k] * (2.0 / 3.0) + sum_c[k] * (1.0 / 3.0);
+                    let beta_b = sum_d[k] + sum_c[k] * (2.0 / 3.0) + sum_b[k] * (1.0 / 3.0);
+                    let a_k = (beta_a * alpha_bb - beta_b * alpha_ab) * inv_det;
+                    let b_k = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det;
+                    ep_a[k] = a_k.clamp(0.0, 1.0);
+                    ep_b[k] = b_k.clamp(0.0, 1.0);
+                    err += alpha_aa * ep_a[k] * ep_a[k]
+                        + alpha_bb * ep_b[k] * ep_b[k]
+                        + 2.0 * alpha_ab * ep_a[k] * ep_b[k]
+                        - 2.0 * (beta_a * ep_a[k] + beta_b * ep_b[k]);
+                }
+                if err < best_err {
+                    best_err = err;
+                    best_ep0 = ep_a;
+                    best_ep1 = ep_b;
+                }
+            }
+        }
+    }
+
+    // Step 8: Quantize to RGB565
+    let r0 = (best_ep0[0] * 31.0 + 0.5).clamp(0.0, 31.0) as u8;
+    let g0 = (best_ep0[1] * 63.0 + 0.5).clamp(0.0, 63.0) as u8;
+    let b0 = (best_ep0[2] * 31.0 + 0.5).clamp(0.0, 31.0) as u8;
+    let r1 = (best_ep1[0] * 31.0 + 0.5).clamp(0.0, 31.0) as u8;
+    let g1 = (best_ep1[1] * 63.0 + 0.5).clamp(0.0, 63.0) as u8;
+    let b1 = (best_ep1[2] * 31.0 + 0.5).clamp(0.0, 31.0) as u8;
+
+    let mut c0 = ((r0 as u16) << 11) | ((g0 as u16) << 5) | (b0 as u16);
+    let mut c1 = ((r1 as u16) << 11) | ((g1 as u16) << 5) | (b1 as u16);
+
+    if c0 < c1 { std::mem::swap(&mut c0, &mut c1); }
     if c0 == c1 {
-        // All pixels same color → indices all 0
         let mut out = [0u8; 8];
         out[0..2].copy_from_slice(&c0.to_le_bytes());
         out[2..4].copy_from_slice(&c1.to_le_bytes());
         return out;
     }
 
-    // Ensure c0 > c1 for 4-color mode
-    if c0 < c1 {
-        std::mem::swap(&mut c0, &mut c1);
-    }
-
-    // Build palette
-    let (r0, g0, b0) = decode_rgb565(c0);
-    let (r1, g1, b1) = decode_rgb565(c1);
+    // Step 9: Assign closest palette indices
+    let (dr0, dg0, db0) = decode_rgb565(c0);
+    let (dr1, dg1, db1) = decode_rgb565(c1);
     let palette: [(i16, i16, i16); 4] = [
-        (r0 as i16, g0 as i16, b0 as i16),
-        (r1 as i16, g1 as i16, b1 as i16),
-        (
-            (2 * r0 as i16 + r1 as i16 + 1) / 3,
-            (2 * g0 as i16 + g1 as i16 + 1) / 3,
-            (2 * b0 as i16 + b1 as i16 + 1) / 3,
-        ),
-        (
-            (r0 as i16 + 2 * r1 as i16 + 1) / 3,
-            (g0 as i16 + 2 * g1 as i16 + 1) / 3,
-            (b0 as i16 + 2 * b1 as i16 + 1) / 3,
-        ),
+        (dr0 as i16, dg0 as i16, db0 as i16),
+        (dr1 as i16, dg1 as i16, db1 as i16),
+        ((2 * dr0 as i16 + dr1 as i16 + 1) / 3, (2 * dg0 as i16 + dg1 as i16 + 1) / 3, (2 * db0 as i16 + db1 as i16 + 1) / 3),
+        ((dr0 as i16 + 2 * dr1 as i16 + 1) / 3, (dg0 as i16 + 2 * dg1 as i16 + 1) / 3, (db0 as i16 + 2 * db1 as i16 + 1) / 3),
     ];
 
-    // Find closest palette entry for each pixel
     let mut indices = 0u32;
     for (i, p) in pixels.iter().enumerate() {
         let pr = p[0] as i16;
         let pg = p[1] as i16;
         let pb = p[2] as i16;
-
         let mut best_dist = i32::MAX;
         let mut best_sel = 0u32;
         for (sel, &(cr, cg, cb)) in palette.iter().enumerate() {
@@ -782,10 +926,7 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
             let dg = (pg - cg) as i32;
             let db = (pb - cb) as i32;
             let dist = dr * dr + dg * dg + db * db;
-            if dist < best_dist {
-                best_dist = dist;
-                best_sel = sel as u32;
-            }
+            if dist < best_dist { best_dist = dist; best_sel = sel as u32; }
         }
         indices |= best_sel << (i * 2);
     }
@@ -1194,6 +1335,34 @@ mod tests {
         // Re-encode should produce a valid block
         let re_encoded = encode_dxt1_block(&pixels);
         assert_eq!(re_encoded.len(), 8);
+    }
+
+    #[test]
+    fn test_dxt1_gradient_block_quality() {
+        let mut pixels = [[0u8; 4]; 16];
+        for i in 0..16 {
+            let t = (i as f32) / 15.0;
+            pixels[i] = [
+                (255.0 * (1.0 - t)) as u8,
+                0,
+                (255.0 * t) as u8,
+                255,
+            ];
+        }
+        let encoded = encode_dxt1_block(&pixels);
+        let decoded = decode_dxt1_block(&encoded);
+        let mut total_err = 0u64;
+        for i in 0..16 {
+            for c in 0..3 {
+                let d = pixels[i][c] as i64 - decoded[i][c] as i64;
+                total_err += (d * d) as u64;
+            }
+        }
+        // DXT1 encodes 4 palette colors for 16 pixels; a red-to-blue gradient has
+        // unavoidable quantisation error of ~8000–11000 SSE even with optimal endpoints.
+        // This threshold verifies WeightedClusterFit finds near-optimal endpoints
+        // (bounding-box gives ~11561; a poor encoder can reach 50000+).
+        assert!(total_err < 15000, "DXT1 total squared error {} too high for gradient", total_err);
     }
 
     #[test]
