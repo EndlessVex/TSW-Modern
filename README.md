@@ -13,7 +13,6 @@ A fast, modern downloader for **The Secret World**.
 - Shows real progress — percentage is accurate, speed is live
 - Resumes where it left off if interrupted
 - Low CPU impact — runs at below-normal priority so it won't slow down your system
-- Launches the game once the download is complete
 
 ## Requirements
 
