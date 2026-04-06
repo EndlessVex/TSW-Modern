@@ -1013,7 +1013,7 @@ async fn run_patching_inner(
             {
                 let _permit = permit;
                 let _large_permit = if is_large {
-                    Some(large_sem.acquire_owned().await.unwrap())
+                    Some(large_sem.clone().acquire_owned().await.unwrap())
                 } else {
                     None
                 };
@@ -1046,11 +1046,20 @@ async fn run_patching_inner(
                 }
             };
 
+            // Acquire large permit for decompress+write phase too (if large resource).
+            // This prevents memory bloat from multiple large resources in-flight.
+            let _large_permit2 = if is_large {
+                Some(large_sem.clone().acquire_owned().await.unwrap())
+            } else {
+                None
+            };
+
             let _cpu_permit = cpu_sem.acquire_owned().await.unwrap();
 
             let install_base_inner = install_base.clone();
             let decompress_result = tokio::task::spawn_blocking(move || {
                 let decompressed = verify::decompress_cdn(&body)?;
+                drop(body); // free compressed data before writing
                 rdbdata::write_resource_to_rdbdata(
                     &install_base_inner, file_num, rdb_type, id, offset, &decompressed,
                 )?;
@@ -1058,6 +1067,7 @@ async fn run_patching_inner(
             }).await;
 
             drop(_cpu_permit);
+            drop(_large_permit2);
 
             match decompress_result {
                 Ok(Ok(size)) => {
