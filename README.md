@@ -1,18 +1,18 @@
 # TSW Downloader
 
-A fast, modern downloader for **The Secret World**.
+A downloader for **The Secret World**.
 
 ## Download
 
-**[Latest Release](https://github.com/EndlessVex/TSW-Modern/releases/latest)** — grab the `.exe` and run it. No installation required.
+**[Latest Release](https://github.com/EndlessVex/TSW-Modern/releases/latest)** — grab the `.exe` and run it. No install needed.
 
-## What It Does
+## What it does
 
-- Downloads The Secret World (~42GB) at full speed using parallel connections
-- Decompresses and assembles game resources matching the official install
-- Shows real progress — percentage is accurate, speed is live
-- Resumes where it left off if interrupted
-- Low CPU impact — runs at below-normal priority so it won't slow down your system
+- Downloads The Secret World (~42GB) using parallel connections
+- Decompresses and writes game resources to match the official install
+- Shows live progress with accurate percentage and speed
+- Picks up where it left off if interrupted
+- Runs at low priority so your system stays usable
 
 ## Requirements
 
@@ -20,9 +20,9 @@ A fast, modern downloader for **The Secret World**.
 - ~45GB free disk space
 - Internet connection
 
-## Not Affiliated with Funcom
+## Not affiliated with Funcom
 
-This is a community tool. It downloads the same files from the same Funcom CDN — just faster and more reliably.
+Community tool. Same files, same CDN, just faster.
 
 ## License
 
