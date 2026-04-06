@@ -957,30 +957,27 @@ async fn run_patching_inner(
     );
 
     // Adapt concurrency to system resources.
-    // Large resources (>1MB, up to 368MB) are memory-bounded.
-    // Scale concurrent large downloads by available RAM.
     let available_ram_mb = get_available_ram_mb();
-    let large_concurrent = if available_ram_mb > 16000 {
-        32  // 16GB+ RAM: aggressive
-    } else if available_ram_mb > 8000 {
-        16  // 8-16GB: moderate
-    } else if available_ram_mb > 4000 {
-        8   // 4-8GB: conservative
-    } else {
-        4   // <4GB: minimal
-    };
-    // Use a third of the CPU cores for decompression (minimum 1), leaving
-    // headroom for OS, UI, and download networking. Combined with below-normal
-    // process priority, this keeps CPU usage under ~75% even on weak laptops.
     let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+    // CPU slots: 1/3 of cores, minimum 1. Below-normal priority keeps us polite.
     let decompress_concurrent = (cpu_cores / 3).max(1);
     let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
-    // Limit downloads to 2x the decompress slots. With opt-level=2, decompression
-    // is fast enough that a 2x buffer keeps the CPU fed without excessive memory use.
+    // Download slots: 2x CPU slots — keeps a buffer of downloaded files ready.
     let main_concurrent = (decompress_concurrent * 2).min(32);
 
-    log::info!("System: {} cores, {}MB RAM | concurrency: download={}, decompress={}, large={}", cpu_cores, available_ram_mb, main_concurrent, decompress_concurrent, large_concurrent);
+    // Large resource slots: limits how many big files (>1MB, up to 368MB) sit
+    // in memory at once. Capped by RAM to avoid pressure on low-end systems.
+    let large_concurrent = if available_ram_mb > 8000 {
+        4
+    } else if available_ram_mb > 4000 {
+        2
+    } else {
+        1
+    };
+
+    log::info!("System: {} cores, {}MB RAM | download={}, decompress={}, large={}", cpu_cores, available_ram_mb, main_concurrent, decompress_concurrent, large_concurrent);
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
     let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));
