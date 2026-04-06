@@ -1252,6 +1252,135 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
     out
 }
 
+/// Encode 16 channel values → BC4 block using iterative refinement.
+/// Ghidra: FUN_0067C680. Used for ATI2/BC5 channels (normal maps).
+fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
+    let mut min_v = 255u8;
+    let mut max_v = 0u8;
+    for &v in values { min_v = min_v.min(v); max_v = max_v.max(v); }
+
+    if max_v == min_v {
+        let mut out = [0u8; 8];
+        out[0] = max_v;
+        out[1] = min_v;
+        let bits: u64 = 0x249249249249;
+        out[2..8].copy_from_slice(&bits.to_le_bytes()[0..6]);
+        return out;
+    }
+
+    // Initial endpoints: inset by range/34 (Ghidra: divisor 0x22)
+    let inset = ((max_v as i32 - min_v as i32) / 34) as u8;
+    let mut ep0 = max_v - inset;
+    let mut ep1 = min_v + inset;
+    if ep0 < ep1 { std::mem::swap(&mut ep0, &mut ep1); }
+    if ep0 == ep1 { if ep0 < 255 { ep0 += 1; } else { ep1 -= 1; } }
+
+    let mut indices = [0u8; 16];
+    let mut sse = bc4_sse_with_indices(values, ep0, ep1, &mut indices);
+
+    for _ in 0..max_iters {
+        let prev_ep0 = ep0;
+        let prev_ep1 = ep1;
+        let prev_indices = indices;
+        let prev_sse = sse;
+
+        let (new_ep0, new_ep1) = bc4_least_squares_refine(values, &indices);
+        ep0 = new_ep0;
+        ep1 = new_ep1;
+
+        sse = bc4_sse_with_indices(values, ep0, ep1, &mut indices);
+
+        if sse >= prev_sse {
+            ep0 = prev_ep0;
+            ep1 = prev_ep1;
+            indices = prev_indices;
+            break;
+        }
+        if ep0 == prev_ep0 && ep1 == prev_ep1 { break; }
+    }
+
+    let mut bits: u64 = 0;
+    for (i, &idx) in indices.iter().enumerate() {
+        bits |= (idx as u64) << (i * 3);
+    }
+    let mut out = [0u8; 8];
+    out[0] = ep0;
+    out[1] = ep1;
+    out[2..8].copy_from_slice(&bits.to_le_bytes()[0..6]);
+    out
+}
+
+/// Compute SSE and assign best indices for each pixel.
+/// Ghidra: FUN_0067BBB0.
+fn bc4_sse_with_indices(values: &[u8; 16], a0: u8, a1: u8, indices: &mut [u8; 16]) -> u32 {
+    let a0w = a0 as u16;
+    let a1w = a1 as u16;
+    let table: [u8; 8] = if a0 > a1 {
+        [a0, a1,
+         ((6 * a0w + 1 * a1w) / 7) as u8, ((5 * a0w + 2 * a1w) / 7) as u8,
+         ((4 * a0w + 3 * a1w) / 7) as u8, ((3 * a0w + 4 * a1w) / 7) as u8,
+         ((2 * a0w + 5 * a1w) / 7) as u8, ((1 * a0w + 6 * a1w) / 7) as u8]
+    } else {
+        [a0, a1,
+         ((4 * a0w + 1 * a1w) / 5) as u8, ((3 * a0w + 2 * a1w) / 5) as u8,
+         ((2 * a0w + 3 * a1w) / 5) as u8, ((1 * a0w + 4 * a1w) / 5) as u8,
+         0, 255]
+    };
+    let mut total = 0u32;
+    for (i, &v) in values.iter().enumerate() {
+        let mut best_err = u32::MAX;
+        let mut best_idx = 0u8;
+        for (j, &tv) in table.iter().enumerate() {
+            let d = v as i32 - tv as i32;
+            let err = (d * d) as u32;
+            if err < best_err { best_err = err; best_idx = j as u8; }
+        }
+        indices[i] = best_idx;
+        total += best_err;
+    }
+    total
+}
+
+/// Least-squares refinement of BC4 endpoints.
+/// Ghidra: FUN_0067C460.
+fn bc4_least_squares_refine(values: &[u8; 16], indices: &[u8; 16]) -> (u8, u8) {
+    let mut sum_w0w0 = 0.0f32;
+    let mut sum_w1w1 = 0.0f32;
+    let mut sum_w0w1 = 0.0f32;
+    let mut sum_vw0 = 0.0f32;
+    let mut sum_vw1 = 0.0f32;
+
+    for (&v, &idx) in values.iter().zip(indices.iter()) {
+        let w0: f32 = match idx {
+            0 => 1.0,
+            1 => 0.0,
+            i => (8.0 - i as f32) / 7.0,
+        };
+        let w1 = 1.0 - w0;
+        let vf = v as f32;
+        sum_w0w0 += w0 * w0;
+        sum_w1w1 += w1 * w1;
+        sum_w0w1 += w0 * w1;
+        sum_vw0 += vf * w0;
+        sum_vw1 += vf * w1;
+    }
+
+    let det = sum_w0w0 * sum_w1w1 - sum_w0w1 * sum_w0w1;
+    if det.abs() < 1e-10 {
+        let min_v = *values.iter().min().unwrap();
+        let max_v = *values.iter().max().unwrap();
+        return (max_v, min_v);
+    }
+
+    let inv_det = 1.0 / det;
+    let new_a0 = ((sum_vw0 * sum_w1w1 - sum_vw1 * sum_w0w1) * inv_det)
+        .round().clamp(0.0, 255.0) as u8;
+    let new_a1 = ((sum_vw1 * sum_w0w0 - sum_vw0 * sum_w0w1) * inv_det)
+        .round().clamp(0.0, 255.0) as u8;
+
+    if new_a0 >= new_a1 { (new_a0, new_a1) } else { (new_a1, new_a0) }
+}
+
 /// Decode an ATI2/BC5 block (16 bytes) → 16 RGBA pixels.
 ///
 /// ATI2 = two independent BC4 blocks: first → R channel, second → G channel.
@@ -1278,8 +1407,8 @@ fn encode_ati2_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
         green[i] = pixels[i][1];
     }
 
-    let r_block = encode_bc4_block(&red);
-    let g_block = encode_bc4_block(&green);
+    let r_block = encode_bc4_iterative(&red, 8);
+    let g_block = encode_bc4_iterative(&green, 8);
 
     let mut out = [0u8; 16];
     out[0..8].copy_from_slice(&r_block);
@@ -1601,6 +1730,25 @@ mod tests {
 
         assert_eq!(&result[0..4], b"FCTX", "Output should start with FCTX");
         assert_eq!(result.len(), 699088, "Output size should match decomp_size");
+    }
+
+    #[test]
+    fn test_bc4_iterative_refine_basic() {
+        let values: [u8; 16] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160];
+        let encoded = encode_bc4_iterative(&values, 8);
+        let decoded = decode_bc4_block(&encoded);
+        for i in 0..16 {
+            assert!((decoded[i] as i16 - values[i] as i16).abs() <= 12,
+                "Iterative BC4 pixel {}: expected ~{}, got {}", i, values[i], decoded[i]);
+        }
+    }
+
+    #[test]
+    fn test_bc4_iterative_constant_block() {
+        let values = [128u8; 16];
+        let encoded = encode_bc4_iterative(&values, 8);
+        assert!((encoded[0] as i16 - encoded[1] as i16).abs() <= 1,
+            "Constant block endpoints should be near-equal: {} vs {}", encoded[0], encoded[1]);
     }
 
 }
