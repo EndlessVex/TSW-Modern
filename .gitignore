@@ -44,6 +44,10 @@ working_secretworld/
 
 # ── Research (scripts, Ghidra, NSIS, data) ──
 research/
+
+# ── Internal planning docs ──
+docs/plans/
+docs/specs/
 *.json
 !package.json
 !package-lock.json
