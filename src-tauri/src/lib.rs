@@ -987,6 +987,7 @@ async fn run_patching_inner(
     let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let files_processing = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let speed_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
         download::SpeedTracker::new(std::time::Duration::from_secs(15))
     ));
@@ -1021,11 +1022,13 @@ async fn run_patching_inner(
         let bytes_dl = bytes_downloaded.clone();
         let files_comp = files_completed.clone();
         let files_fail = files_failed.clone();
+        let files_proc = files_processing.clone();
         let tracker = speed_tracker.clone();
         let large_sem = large_semaphore.clone();
         let cpu_sem = cpu_semaphore.clone();
         let writer = rdb_writer.clone();
         let is_large = _length > 1_000_000; // Resources > 1MB need large semaphore
+        let cdn_size = _length as u64;
         let ft = files_total;
         let tb = total_bytes;
 
@@ -1061,7 +1064,9 @@ async fn run_patching_inner(
                 }
             } // download permit + large permit released here
 
-            // Phase 2: Decompress + Write (CPU-bound, limited to num_cpus)
+            // Record network bytes as soon as download completes (before decompression).
+            // This drives the speed display so users see actual download speed,
+            // not processing throughput.
             let body = match downloaded_body {
                 Some(b) => b,
                 None => {
@@ -1069,6 +1074,12 @@ async fn run_patching_inner(
                     return;
                 }
             };
+            let net_bytes = bytes_dl.fetch_add(cdn_size, std::sync::atomic::Ordering::Relaxed) + cdn_size;
+            {
+                let mut t = tracker.lock().await;
+                t.record(net_bytes);
+            }
+            files_proc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             // Acquire large permit for decompress+write phase too (if large resource).
             // This prevents memory bloat from multiple large resources in-flight.
@@ -1090,40 +1101,41 @@ async fn run_patching_inner(
             drop(_large_permit2);
 
             match decompress_result {
-                Ok(Ok(size)) => {
-                    let new_bytes = bytes_dl.fetch_add(size as u64,
-                        std::sync::atomic::Ordering::Relaxed) + size as u64;
+                Ok(Ok(_size)) => {
+                    files_proc.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     let completed = files_comp.fetch_add(1,
                         std::sync::atomic::Ordering::Relaxed) + 1;
+                    let cur_bytes = bytes_dl.load(std::sync::atomic::Ordering::Relaxed);
 
-                    let speed = {
-                        let mut t = tracker.lock().await;
-                        t.record(new_bytes);
-                        if completed % 50 == 0 || completed == ft {
-                            Some(t.speed_bps())
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(speed) = speed {
+                    if completed % 50 == 0 || completed == ft {
+                        let speed = { tracker.lock().await.speed_bps() };
                         let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
-                        let pct = (new_bytes as f64 / tb as f64 * 100.0).min(100.0);
+                        let processing = files_proc.load(std::sync::atomic::Ordering::Relaxed);
+                        let pct = (cur_bytes as f64 / tb as f64 * 100.0).min(100.0);
                         let speed_mb = speed as f64 / 1_048_576.0;
+
+                        // If all bytes are downloaded but files are still processing,
+                        // show "patching" phase with 0 speed (CPU-bound work remaining)
+                        let (phase, display_speed) = if cur_bytes >= tb && processing > 0 {
+                            ("patching", 0u64)
+                        } else {
+                            ("downloading", speed)
+                        };
+
                         log::info!(
-                            "Progress: {:.1}% | {}/{} files | {:.1} MB/s | {} failed",
-                            pct, completed, ft, speed_mb, failed
+                            "{}: {:.1}% | {}/{} files | {:.1} MB/s | {} processing | {} failed",
+                            phase, pct, completed, ft, speed_mb, processing, failed
                         );
                         let _ = app.emit(
                             "patch:progress",
                             &download::DownloadProgress {
-                                bytes_downloaded: new_bytes,
+                                bytes_downloaded: cur_bytes,
                                 total_bytes: tb,
                                 files_completed: completed,
                                 files_total: ft,
-                                speed_bps: speed,
+                                speed_bps: display_speed,
                                 current_file: hash_hex.clone(),
-                                phase: "downloading".into(),
+                                phase: phase.into(),
                                 failed_files: failed,
                             },
                         );
