@@ -809,21 +809,21 @@ fn decode_dxt5_block(data: &[u8]) -> [[u8; 4]; 16] {
         [
             a0 as u8,
             a1 as u8,
-            ((6 * a0 + 1 * a1 + 3) / 7) as u8,
-            ((5 * a0 + 2 * a1 + 3) / 7) as u8,
-            ((4 * a0 + 3 * a1 + 3) / 7) as u8,
-            ((3 * a0 + 4 * a1 + 3) / 7) as u8,
-            ((2 * a0 + 5 * a1 + 3) / 7) as u8,
-            ((1 * a0 + 6 * a1 + 3) / 7) as u8,
+            ((6 * a0 + 1 * a1) / 7) as u8,
+            ((5 * a0 + 2 * a1) / 7) as u8,
+            ((4 * a0 + 3 * a1) / 7) as u8,
+            ((3 * a0 + 4 * a1) / 7) as u8,
+            ((2 * a0 + 5 * a1) / 7) as u8,
+            ((1 * a0 + 6 * a1) / 7) as u8,
         ]
     } else {
         [
             a0 as u8,
             a1 as u8,
-            ((4 * a0 + 1 * a1 + 2) / 5) as u8,
-            ((3 * a0 + 2 * a1 + 2) / 5) as u8,
-            ((2 * a0 + 3 * a1 + 2) / 5) as u8,
-            ((1 * a0 + 4 * a1 + 2) / 5) as u8,
+            ((4 * a0 + 1 * a1) / 5) as u8,
+            ((3 * a0 + 2 * a1) / 5) as u8,
+            ((2 * a0 + 3 * a1) / 5) as u8,
+            ((1 * a0 + 4 * a1) / 5) as u8,
             0,
             255,
         ]
@@ -868,12 +868,12 @@ fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
         [
             a0,
             a1,
-            ((6 * a0w + 1 * a1w + 3) / 7) as u8,
-            ((5 * a0w + 2 * a1w + 3) / 7) as u8,
-            ((4 * a0w + 3 * a1w + 3) / 7) as u8,
-            ((3 * a0w + 4 * a1w + 3) / 7) as u8,
-            ((2 * a0w + 5 * a1w + 3) / 7) as u8,
-            ((1 * a0w + 6 * a1w + 3) / 7) as u8,
+            ((6 * a0w + 1 * a1w) / 7) as u8,
+            ((5 * a0w + 2 * a1w) / 7) as u8,
+            ((4 * a0w + 3 * a1w) / 7) as u8,
+            ((3 * a0w + 4 * a1w) / 7) as u8,
+            ((2 * a0w + 5 * a1w) / 7) as u8,
+            ((1 * a0w + 6 * a1w) / 7) as u8,
         ]
     } else if a0 == a1 {
         [a0; 8]
@@ -883,10 +883,10 @@ fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
         [
             a0,
             a1,
-            ((4 * a0w + 1 * a1w + 2) / 5) as u8,
-            ((3 * a0w + 2 * a1w + 2) / 5) as u8,
-            ((2 * a0w + 3 * a1w + 2) / 5) as u8,
-            ((1 * a0w + 4 * a1w + 2) / 5) as u8,
+            ((4 * a0w + 1 * a1w) / 5) as u8,
+            ((3 * a0w + 2 * a1w) / 5) as u8,
+            ((2 * a0w + 3 * a1w) / 5) as u8,
+            ((1 * a0w + 4 * a1w) / 5) as u8,
             0,
             255,
         ]
@@ -1398,6 +1398,21 @@ mod tests {
         let mip0 = &result[24..24 + 131072];
         assert_eq!(mip0.len(), 131072);
         assert_eq!(mip0.len() / 16, 8192, "Should have 8192 DXT5 blocks");
+    }
+
+    #[test]
+    fn test_dxt5_alpha_truncating_division() {
+        let mut block = [0u8; 16];
+        block[0] = 200; // a0
+        block[1] = 50;  // a1
+        // All alpha indices = 2 (palette entry 2)
+        let idx_bits: u64 = 0x492492492492;
+        block[2..8].copy_from_slice(&idx_bits.to_le_bytes()[0..6]);
+        block[8..16].copy_from_slice(&[0u8; 8]);
+
+        let pixels = decode_dxt5_block(&block);
+        // Truncating: (6*200 + 1*50) / 7 = 1250/7 = 178
+        assert_eq!(pixels[0][3], 178, "DXT5 alpha should use truncating division, got {}", pixels[0][3]);
     }
 
     #[test]
