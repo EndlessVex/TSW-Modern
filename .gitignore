@@ -37,35 +37,13 @@ Thumbs.db
 *.log
 
 # ── Game installs (local testing — each ~35-44GB) ──
+game-installs/
 The Secret World/
 our_downloader_secretworld/
 working_secretworld/
-ours-recent/
-ours-loggedin/
-normal-downloaded/
-normal-first-launch/
-normal-full-patch/
-normal-full-loggedin/
-installer-finished/
-failed-attempt/
-weird-size/
 
-# ── NSIS installer extracted files (from Funcom installer analysis) ──
-*{app}*
-*{tmp}*
-
-# ── Game binaries / Ghidra projects (reverse engineering) ──
-TheSecretWorldInstaller.exe
-*.gpr
-*.rep/
-
-# ── Research scripts (one-off analysis, not part of the app) ──
-*.py
-forensic_results.txt
-interceptor_output.txt
-
-# ── Generated data files ──
-le.idx.gz
+# ── Research (scripts, Ghidra, NSIS, data) ──
+research/
 *.json
 !package.json
 !package-lock.json
