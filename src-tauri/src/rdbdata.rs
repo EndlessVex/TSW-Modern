@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::rdb::{LeIndex, LeIndexEntry};
 
@@ -241,6 +242,69 @@ pub fn write_resource_to_rdbdata(
     }
 
     Ok(())
+}
+
+/// Cached file handles for rdbdata writes. Keeps files open across
+/// multiple resource writes to avoid ~22K open/close syscalls.
+pub struct RdbdataWriter {
+    install_dir: std::path::PathBuf,
+    handles: Mutex<HashMap<u8, File>>,
+}
+
+impl RdbdataWriter {
+    pub fn new(install_dir: &Path) -> Self {
+        Self {
+            install_dir: install_dir.to_path_buf(),
+            handles: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Write a resource to its rdbdata file, reusing cached file handle.
+    pub fn write_resource(
+        &self,
+        file_num: u8,
+        rdb_type: u32,
+        id: u32,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let mut handles = self.handles.lock().map_err(|e| e.to_string())?;
+        let file = handles.entry(file_num).or_insert_with(|| {
+            let path = self.install_dir.join("RDB").join(format!("{:02}.rdbdata", file_num));
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("Failed to open {:02}.rdbdata: {}", file_num, e))
+        });
+
+        let size = data.len() as u32;
+        let space = (size + 3) & !3;
+
+        let header_offset = offset.checked_sub(16)
+            .ok_or_else(|| format!("Invalid offset {} for resource {}:{}", offset, rdb_type, id))?;
+
+        file.seek(SeekFrom::Start(header_offset as u64))
+            .map_err(|e| format!("Failed to seek in {:02}.rdbdata: {}", file_num, e))?;
+
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&rdb_type.to_le_bytes());
+        header[4..8].copy_from_slice(&id.to_le_bytes());
+        header[8..12].copy_from_slice(&size.to_le_bytes());
+        header[12..16].copy_from_slice(&space.to_le_bytes());
+
+        file.write_all(&header)
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+        file.write_all(data)
+            .map_err(|e| format!("Failed to write data: {}", e))?;
+
+        if space > size {
+            let pad_len = (space - size) as usize;
+            file.write_all(&[0u8; 4][..pad_len])
+                .map_err(|e| format!("Failed to write padding: {}", e))?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

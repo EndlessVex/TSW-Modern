@@ -842,6 +842,7 @@ async fn run_patching_inner(
         },
     );
     rdbdata::create_rdbdata_files(&base, &le_index, Some(&valid_hashes))?;
+    let rdb_writer = std::sync::Arc::new(rdbdata::RdbdataWriter::new(&base));
 
     // Emit bootstrapping status before heavy setup work.
     let _ = app.emit(
@@ -976,7 +977,6 @@ async fn run_patching_inner(
         .build()
         .map_err(|e| format!("Failed to create download client: {}", e))?;
 
-    let install_base = base.clone();
     let mut handles = Vec::with_capacity(tasks.len());
 
     for (rdb_type, id, file_num, offset, _length, url, hash_hex) in tasks {
@@ -994,13 +994,13 @@ async fn run_patching_inner(
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let client = client.clone();
         let app = app.clone();
-        let install_base = install_base.clone();
         let bytes_dl = bytes_downloaded.clone();
         let files_comp = files_completed.clone();
         let files_fail = files_failed.clone();
         let tracker = speed_tracker.clone();
         let large_sem = large_semaphore.clone();
         let cpu_sem = cpu_semaphore.clone();
+        let writer = rdb_writer.clone();
         let is_large = _length > 1_000_000; // Resources > 1MB need large semaphore
         let ft = files_total;
         let tb = total_bytes;
@@ -1056,13 +1056,10 @@ async fn run_patching_inner(
 
             let _cpu_permit = cpu_sem.acquire_owned().await.unwrap();
 
-            let install_base_inner = install_base.clone();
             let decompress_result = tokio::task::spawn_blocking(move || {
                 let decompressed = verify::decompress_cdn(&body)?;
                 drop(body); // free compressed data before writing
-                rdbdata::write_resource_to_rdbdata(
-                    &install_base_inner, file_num, rdb_type, id, offset, &decompressed,
-                )?;
+                writer.write_resource(file_num, rdb_type, id, offset, &decompressed)?;
                 Ok::<usize, String>(decompressed.len())
             }).await;
 
