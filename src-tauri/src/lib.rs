@@ -980,7 +980,7 @@ async fn run_patching_inner(
     // is fast enough that a 2x buffer keeps the CPU fed without excessive memory use.
     let main_concurrent = (decompress_concurrent * 2).min(32);
 
-    log::info!("System RAM: {}MB, concurrency: main={}, large={}, decompress={}", available_ram_mb, main_concurrent, large_concurrent, decompress_concurrent);
+    log::info!("System: {} cores, {}MB RAM | concurrency: download={}, decompress={}, large={}", cpu_cores, available_ram_mb, main_concurrent, decompress_concurrent, large_concurrent);
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
     let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));
@@ -1108,6 +1108,12 @@ async fn run_patching_inner(
 
                     if let Some(speed) = speed {
                         let failed = files_fail.load(std::sync::atomic::Ordering::Relaxed);
+                        let pct = (new_bytes as f64 / tb as f64 * 100.0).min(100.0);
+                        let speed_mb = speed as f64 / 1_048_576.0;
+                        log::info!(
+                            "Progress: {:.1}% | {}/{} files | {:.1} MB/s | {} failed",
+                            pct, completed, ft, speed_mb, failed
+                        );
                         let _ = app.emit(
                             "patch:progress",
                             &download::DownloadProgress {
@@ -1140,6 +1146,12 @@ async fn run_patching_inner(
     }
 
     let final_failed = files_failed.load(std::sync::atomic::Ordering::Relaxed);
+    let final_bytes = bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "Download complete: {}/{} files, {:.1} MB written, {} failed",
+        files_total - final_failed, files_total,
+        final_bytes as f64 / 1_048_576.0, final_failed
+    );
     if final_failed > 0 {
         return Err(format!(
             "{} of {} resources failed to download",
