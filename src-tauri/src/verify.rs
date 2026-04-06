@@ -335,28 +335,42 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
 
     let original_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
 
-    // Build a standard LZMA alone stream:
-    // props(1) + dict_size(4) from the IOz2 data + uncompressed_size(8) we insert + compressed data
-    let mut lzma_stream = Vec::with_capacity(13 + data.len() - 13);
-    lzma_stream.extend_from_slice(&data[8..13]);    // props(1) + dict_size(4)
-    lzma_stream.extend_from_slice(&original_size.to_le_bytes()); // 8-byte uncompressed size
-    lzma_stream.extend_from_slice(&data[13..]);      // compressed data
+    // Build a virtual LZMA-alone stream using Chain readers to avoid copying
+    // the entire compressed payload. LZMA-alone format:
+    //   props(1) + dict_size(4) + uncompressed_size(8) + compressed_data
+    use std::io::Read;
+    let size_bytes = original_size.to_le_bytes();
+    let mut reader = std::io::BufReader::new(
+        (&data[8..13])              // props(1) + dict_size(4)
+            .chain(&size_bytes[..]) // uncompressed_size(8) — inserted
+            .chain(&data[13..])     // compressed data (zero-copy)
+    );
 
     let mut decompressed = Vec::with_capacity(original_size as usize);
-    lzma_rs::lzma_decompress(&mut lzma_stream.as_slice(), &mut decompressed)
+    lzma_rs::lzma_decompress(&mut reader, &mut decompressed)
         .map_err(|e| format!("IOz2 LZMA decompression failed: {e}"))?;
 
     Ok(decompressed)
 }
 
-/// Decompress CDN data — handles IOz1 (zlib), IOz2 (LZMA), or uncompressed.
+/// Decompress CDN data — handles IOz1 (zlib), IOz2 (LZMA), IOg1 (Redux texture), or uncompressed.
+///
+/// CDN textures are double-wrapped: `IOz1(IOg1(...))`. This function handles nested
+/// compression by recursing after each layer is stripped. IOg1 decompression produces
+/// the final FCTX texture data with a full mipmap chain.
 pub fn decompress_cdn(data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() >= 4 {
         if &data[0..4] == b"IOz1" {
-            return decompress_ioz1(data);
+            let inner = decompress_ioz1(data)?;
+            // Recurse — inner payload may be IOg1 or another format
+            return decompress_cdn(&inner);
         }
         if &data[0..4] == b"IOz2" {
-            return decompress_ioz2(data);
+            let inner = decompress_ioz2(data)?;
+            return decompress_cdn(&inner);
+        }
+        if crate::redux::is_iog1(data) {
+            return crate::redux::decompress_iog1(data);
         }
     }
     Ok(data.to_vec())
