@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -358,16 +359,35 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
 /// CDN textures are double-wrapped: `IOz1(IOg1(...))`. This function handles nested
 /// compression by recursing after each layer is stripped. IOg1 decompression produces
 /// the final FCTX texture data with a full mipmap chain.
-pub fn decompress_cdn(data: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// Returns `Cow::Borrowed(data)` for uncompressed resources to avoid a pointless copy.
+pub fn decompress_cdn(data: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     if data.len() >= 4 {
         if &data[0..4] == b"IOz1" {
             let inner = decompress_ioz1(data)?;
-            // Recurse — inner payload may be IOg1 or another format
-            return decompress_cdn(&inner);
+            return Ok(Cow::Owned(decompress_cdn_owned(&inner)?));
         }
         if &data[0..4] == b"IOz2" {
             let inner = decompress_ioz2(data)?;
-            return decompress_cdn(&inner);
+            return Ok(Cow::Owned(decompress_cdn_owned(&inner)?));
+        }
+        if crate::redux::is_iog1(data) {
+            return Ok(Cow::Owned(crate::redux::decompress_iog1(data)?));
+        }
+    }
+    Ok(Cow::Borrowed(data))
+}
+
+/// Inner helper that always returns owned data (for recursive calls on decompressed intermediates).
+fn decompress_cdn_owned(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() >= 4 {
+        if &data[0..4] == b"IOz1" {
+            let inner = decompress_ioz1(data)?;
+            return decompress_cdn_owned(&inner);
+        }
+        if &data[0..4] == b"IOz2" {
+            let inner = decompress_ioz2(data)?;
+            return decompress_cdn_owned(&inner);
         }
         if crate::redux::is_iog1(data) {
             return crate::redux::decompress_iog1(data);

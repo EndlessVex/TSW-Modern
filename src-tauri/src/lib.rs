@@ -1058,7 +1058,6 @@ async fn run_patching_inner(
 
             let decompress_result = tokio::task::spawn_blocking(move || {
                 let decompressed = verify::decompress_cdn(&body)?;
-                drop(body); // free compressed data before writing
                 writer.write_resource(file_num, rdb_type, id, offset, &decompressed)?;
                 Ok::<usize, String>(decompressed.len())
             }).await;
