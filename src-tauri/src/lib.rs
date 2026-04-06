@@ -1147,10 +1147,12 @@ async fn run_patching_inner(
                     }
                 }
                 Ok(Err(e)) => {
+                    files_proc.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Process failed for {}:{}: {}", rdb_type, id, e);
                     files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
+                    files_proc.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Task panicked for {}:{}: {}", rdb_type, id, e);
                     files_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
