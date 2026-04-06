@@ -951,9 +951,9 @@ async fn run_patching_inner(
     let decompress_concurrent = (cpu_cores / 2).max(2);
     let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
-    // Limit downloads to 4x the decompress slots — prevents memory bloat from
-    // downloaded-but-unprocessed resources queuing in memory.
-    let main_concurrent = (decompress_concurrent * 4).min(64);
+    // Limit downloads to 2x the decompress slots. With opt-level=2, decompression
+    // is fast enough that a 2x buffer keeps the CPU fed without excessive memory use.
+    let main_concurrent = (decompress_concurrent * 2).min(32);
 
     log::info!("System RAM: {}MB, concurrency: main={}, large={}, decompress={}", available_ram_mb, main_concurrent, large_concurrent, decompress_concurrent);
 
