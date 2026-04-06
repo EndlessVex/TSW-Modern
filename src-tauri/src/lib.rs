@@ -843,6 +843,19 @@ async fn run_patching_inner(
     );
     rdbdata::create_rdbdata_files(&base, &le_index, Some(&valid_hashes))?;
 
+    // Pre-build the BC4 error lookup table (~50ms, 32MB).
+    // This happens once and dramatically speeds up IOg1 texture encoding.
+    let _ = app.emit(
+        "patch:progress",
+        &download::DownloadProgress {
+            bytes_downloaded: 0, total_bytes: 0,
+            files_completed: 0, files_total: 0,
+            speed_bps: 0, current_file: "Initializing texture encoder...".into(),
+            phase: "bootstrapping".into(), failed_files: 0,
+        },
+    );
+    crate::redux::init_bc4_lut();
+
     // Build placement map for fast lookup
     let _placement_map = rdbdata::build_placement_map(&le_index);
 
@@ -934,19 +947,21 @@ async fn run_patching_inner(
     } else {
         4   // <4GB: minimal
     };
-    let main_concurrent = if available_ram_mb > 8000 { 128 } else { 64 };
+    // Use half the CPU cores for decompression, leaving headroom for OS, UI,
+    // and download networking. The BC4 exhaustive search + LZMA decompression
+    // are CPU-intensive; using all cores causes system-wide sluggishness.
+    let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let decompress_concurrent = (cpu_cores / 2).max(2);
+    let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(decompress_concurrent));
 
-    log::info!("System RAM: {}MB, concurrency: main={}, large={}", available_ram_mb, main_concurrent, large_concurrent);
+    // Limit downloads to 4x the decompress slots — prevents memory bloat from
+    // downloaded-but-unprocessed resources queuing in memory.
+    let main_concurrent = (decompress_concurrent * 4).min(64);
+
+    log::info!("System RAM: {}MB, concurrency: main={}, large={}, decompress={}", available_ram_mb, main_concurrent, large_concurrent, decompress_concurrent);
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
     let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));
-    // CPU-bound decompression semaphore: limit concurrent IOg1 texture encoding
-    // to available CPU cores. The BC4 exhaustive endpoint search is O(range²) per
-    // block and can process billions of operations per texture. Running 128 of
-    // these simultaneously maxes CPU and starves the async runtime.
-    let cpu_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-    ));
     let bytes_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let files_completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let files_failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
