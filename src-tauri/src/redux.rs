@@ -24,8 +24,8 @@ const HXDR_MAGIC: &[u8; 4] = b"HXDR";
 /// Stream descriptor size between HXDR and LZMA stream.
 const STREAM_DESC_SIZE: usize = 26;
 
-/// DXT1 solid-block lookup tables extracted from ClientPatcher.exe via Ghidra.
-/// VA 0x873F08 (5-bit R/B channels) and VA 0x874108 (6-bit G channel).
+/// DXT1 solid-block lookup tables matching the original ClientPatcher.
+/// 5-bit (R/B channels) and 6-bit (G channel) optimal endpoint pairs.
 /// Each entry: [c0_quantized, c1_quantized] for input value 0-255.
 static DXT1_SOLID_5BIT: [[u8; 2]; 256] = [
     [ 0, 0], [ 0, 0], [ 0, 1], [ 0, 1], [ 1, 0], [ 1, 0], [ 1, 0], [ 1, 1],
@@ -365,7 +365,7 @@ fn decompress_mixd(
             ch = nh;
         }
 
-        // Assemble per-mip grouped output (Ghidra-verified layout, same as format_enum=6):
+        // Assemble per-mip grouped output (verified layout, same as format_enum=6):
         // Per mip (smallest first): [6-byte prefix × blocks] then [16-byte ATI2 × blocks]
         let mut output = Vec::with_capacity(decomp_size);
         output.extend_from_slice(fctx_hdr);
@@ -432,8 +432,7 @@ fn decompress_mixd(
     }
 
     // -- Assemble output in per-mip grouped layout --
-    // Verified via Ghidra decompilation of the game's FCTX MIXD reader (FUN_00c63360):
-    // the game reads per-mip, NOT as global planes. Each mip has its prefix section
+    // The game reads per-mip, NOT as global planes. Each mip has its prefix section
     // (6 bytes/block) grouped together, then its ATI2 section (16 bytes/block).
     //
     // Layout:
@@ -685,8 +684,7 @@ fn decode_dxt1_block(data: &[u8]) -> [[u8; 4]; 16] {
     pixels
 }
 
-/// Encode a solid-color DXT1 block using Ghidra-verified lookup tables.
-/// Ghidra: FUN_006807F0. Uses precomputed optimal RGB565 endpoint pairs.
+/// Encode a solid-color DXT1 block using precomputed optimal RGB565 endpoint pairs.
 /// Selector bits are always 0xAAAAAAAA (all texels select palette entry 2).
 /// If c0 < c1, swap endpoints and use selector 0x55555555.
 fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
@@ -716,14 +714,14 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 /// mipmap generation where the source is already DXT-compressed.
 fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
     // Solid-color fast path: if all 16 pixels have the same RGB, use lookup tables.
-    // Ghidra: FUN_0067B5A0 checks solid, FUN_006807F0 encodes.
+    // Solid-color fast path: check if all pixels share the same RGB.
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
     let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
     if all_solid {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    // ── WeightedClusterFit (Ghidra: FUN_0067F490 + FUN_0067E280) ──
+    // ── WeightedClusterFit (matching ClientPatcher's squish-based encoder) ──
 
     // Step 1: Build color set — float RGB, alpha-weighted, deduplicated
     let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
@@ -996,7 +994,7 @@ fn decode_dxt5_block(data: &[u8]) -> [[u8; 4]; 16] {
 fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
     // Extract alpha values and encode as BC4 block (same structure).
     // Uses encode_bc4_block for exhaustive endpoint search + squared error
-    // index assignment, matching the ClientPatcher (Ghidra: FUN_00680B60).
+    // index assignment, matching the ClientPatcher's BC4 encoder.
     let mut alpha_values = [0u8; 16];
     for (i, p) in pixels.iter().enumerate() {
         alpha_values[i] = p[3];
@@ -1063,11 +1061,11 @@ fn decode_bc4_block(data: &[u8]) -> [u8; 16] {
 }
 
 /// Sum of squared errors for BC4 block with given endpoints.
-/// Ghidra-verified: FUN_006801F0 — squared-error distance, per-pixel min across palette.
+/// Squared-error distance metric, per-pixel min across palette.
 fn bc4_sse(values: &[u8; 16], a0: u8, a1: u8) -> u32 {
     let a0w = a0 as u16;
     let a1w = a1 as u16;
-    // Build palette with truncating division (Ghidra-verified FUN_0067B0E0)
+    // Build palette with truncating division (matches ClientPatcher)
     let table: [u8; 8] = if a0 > a1 {
         [a0, a1,
          ((6 * a0w + 1 * a1w) / 7) as u8, ((5 * a0w + 2 * a1w) / 7) as u8,
@@ -1118,7 +1116,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
         return out;
     }
 
-    // Ghidra-verified exhaustive endpoint search (FUN_00680B60):
+    // Exhaustive endpoint search (matching ClientPatcher):
     // When range > 8, search (ep0, ep1) pairs for minimum sum-of-squared-errors.
     let (mut best_a0, mut best_a1) = (a0, a1);
 
@@ -1132,7 +1130,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
         while ep0 <= a0 as i32 {
             ep1_max += 1;
             for ep1 in (a1 as i32)..ep1_max {
-                // Ghidra pruning: skip pairs that can't beat current best
+                // Pruning: skip pairs that can't beat current best
                 if (range_remaining + ep1) <= best_error {
                     let err = bc4_sse(values, ep0 as u8, ep1 as u8) as i32;
                     if err < best_error {
@@ -1149,7 +1147,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
 
     let (a0, a1) = (best_a0, best_a1);
 
-    // Build palette with truncating division (Ghidra-verified FUN_0067B0E0)
+    // Build palette with truncating division (matches ClientPatcher)
     let table: [u8; 8] = if a0 > a1 {
         let a0w = a0 as u16;
         let a1w = a1 as u16;
@@ -1179,7 +1177,6 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
     };
 
     // Assign indices: strict < tie-breaking, squared-error distance
-    // Ghidra-verified: FUN_006802B0
     let mut bits: u64 = 0;
     for (i, &v) in values.iter().enumerate() {
         let mut best_dist = u32::MAX;
@@ -1204,7 +1201,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
 }
 
 /// Encode 16 channel values → BC4 block using iterative refinement.
-/// Ghidra: FUN_0067C680. Used for ATI2/BC5 channels (normal maps).
+/// Used for ATI2/BC5 channels (normal maps), matching ClientPatcher.
 fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
     let mut min_v = 255u8;
     let mut max_v = 0u8;
@@ -1219,7 +1216,7 @@ fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
         return out;
     }
 
-    // Initial endpoints: inset by range/34 (Ghidra: divisor 0x22)
+    // Initial endpoints: inset by range/34
     let inset = ((max_v as i32 - min_v as i32) / 34) as u8;
     let mut ep0 = max_v - inset;
     let mut ep1 = min_v + inset;
@@ -1262,7 +1259,7 @@ fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
 }
 
 /// Compute SSE and assign best indices for each pixel.
-/// Ghidra: FUN_0067BBB0.
+/// Matches ClientPatcher's SSE-with-index-assignment function.
 fn bc4_sse_with_indices(values: &[u8; 16], a0: u8, a1: u8, indices: &mut [u8; 16]) -> u32 {
     let a0w = a0 as u16;
     let a1w = a1 as u16;
@@ -1293,7 +1290,7 @@ fn bc4_sse_with_indices(values: &[u8; 16], a0: u8, a1: u8, indices: &mut [u8; 16
 }
 
 /// Least-squares refinement of BC4 endpoints.
-/// Ghidra: FUN_0067C460.
+/// Matches ClientPatcher's least-squares refinement.
 fn bc4_least_squares_refine(values: &[u8; 16], indices: &[u8; 16]) -> (u8, u8) {
     let mut sum_w0w0 = 0.0f32;
     let mut sum_w1w1 = 0.0f32;

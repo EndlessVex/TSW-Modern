@@ -22,7 +22,7 @@ use crate::rdb::{LeIndex, LeIndexEntry};
 /// Only creates files that don't already exist.
 ///
 /// Pre-allocates to 1GB per file, matching the original ClientPatcher
-/// (Ghidra: allocateNewRdbDataFile at 0x00479590). If allocation fails
+/// If allocation fails
 /// (low disk space), retries with halved sizes down to 128MB minimum,
 /// matching the original's retry logic.
 pub fn create_rdbdata_files(
