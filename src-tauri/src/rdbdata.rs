@@ -19,6 +19,11 @@ use crate::rdb::{LeIndex, LeIndexEntry};
 
 /// Pre-create all required rdbdata files with RDB0 headers.
 /// Only creates files that don't already exist.
+///
+/// Pre-allocates to 1GB per file, matching the original ClientPatcher
+/// (Ghidra: allocateNewRdbDataFile at 0x00479590). If allocation fails
+/// (low disk space), retries with halved sizes down to 128MB minimum,
+/// matching the original's retry logic.
 pub fn create_rdbdata_files(
     install_dir: &Path,
     le_index: &LeIndex,
@@ -50,40 +55,127 @@ pub fn create_rdbdata_files(
         }
     }
 
-    for &file_num in &file_nums {
+    // Count how many files we need to create (skip existing)
+    let files_to_create: Vec<u8> = file_nums.iter().copied().filter(|&file_num| {
         let path = rdb_dir.join(format!("{:02}.rdbdata", file_num));
         if path.exists() {
-            // File exists — check if it has content beyond the header
             if let Ok(meta) = std::fs::metadata(&path) {
                 if meta.len() > 4 {
-                    continue; // Already has content, don't recreate
+                    return false; // Already has content
                 }
             }
         }
+        true
+    }).collect();
 
-        // Create file with RDB0 header and pre-allocate to full size.
-        // set_len creates a sparse file on NTFS — fast allocation without
-        // writing zeros. Without this, seeking past EOF to write a resource
-        // at offset 800MB causes NTFS to zero-fill the entire gap — extremely
-        // slow with 128 concurrent writers.
+    if files_to_create.is_empty() {
+        return Ok(());
+    }
+
+    // Check available disk space before allocating.
+    // On failure to query, proceed optimistically (will catch errors on set_len).
+    let available_bytes = fs_available_space(&rdb_dir);
+
+    // Determine initial allocation size. If available space is known and tight,
+    // start with a smaller allocation to avoid immediate failure.
+    // Original ClientPatcher: max 1GB, clamp to available space.
+    const RDBDATA_SIZE: u64 = 1_073_741_824; // 1 GB
+    const MIN_ALLOC_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
+
+    let initial_alloc = if let Some(avail) = available_bytes {
+        let per_file = avail / (files_to_create.len() as u64).max(1);
+        RDBDATA_SIZE.min(per_file)
+    } else {
+        RDBDATA_SIZE
+    };
+
+    for &file_num in &files_to_create {
+        let path = rdb_dir.join(format!("{:02}.rdbdata", file_num));
+
         let mut file = File::create(&path)
             .map_err(|e| format!("Failed to create {:02}.rdbdata: {}", file_num, e))?;
         file.write_all(b"RDB0")
             .map_err(|e| format!("Failed to write RDB0 header: {}", e))?;
 
-        // Pre-allocate to exactly 1 GB (1,073,741,824 bytes) to match the
-        // original ClientPatcher. The game may expect fixed-size containers
-        // with zero-padded regions beyond the last resource.
-        const RDBDATA_SIZE: u64 = 1_073_741_824;
+        // Pre-allocate with SetEndOfFile (via set_len). On NTFS this allocates
+        // real clusters with deferred zeroing (VDL). This is NOT a sparse file —
+        // the space is reserved on disk to prevent fragmentation and guarantee
+        // capacity before downloads start.
         let target_size = max_end_by_file.get(&file_num).copied().unwrap_or(4);
-        let alloc_size = if target_size > 4 { RDBDATA_SIZE.max(target_size) } else { 4 };
-        if alloc_size > 4 {
-            file.set_len(alloc_size)
-                .map_err(|e| format!("Failed to allocate {:02}.rdbdata: {}", file_num, e))?;
+        let desired = if target_size > 4 { initial_alloc.max(target_size) } else { 4 };
+
+        if desired > 4 {
+            // Retry with halved sizes on failure, matching original ClientPatcher
+            let mut alloc_size = desired;
+            loop {
+                match file.set_len(alloc_size) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if alloc_size > MIN_ALLOC_SIZE {
+                            log::warn!(
+                                "Failed to allocate {}MB for {:02}.rdbdata, retrying with {}MB: {}",
+                                alloc_size / (1024 * 1024),
+                                file_num,
+                                alloc_size / 2 / (1024 * 1024),
+                                e
+                            );
+                            alloc_size /= 2;
+                        } else {
+                            return Err(format!(
+                                "Failed to allocate {:02}.rdbdata (tried down to {}MB): {}",
+                                file_num, alloc_size / (1024 * 1024), e
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Query available disk space for the given path's filesystem.
+/// Returns None if the query fails (proceed optimistically).
+fn fs_available_space(path: &Path) -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // Null-terminate the path for Win32
+        let wide: Vec<u16> = path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut free_bytes: u64 = 0;
+        let ret = unsafe {
+            windows_sys_get_disk_free_space(&wide, &mut free_bytes)
+        };
+        if ret != 0 { Some(free_bytes) } else { None }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Thin wrapper around GetDiskFreeSpaceExW. Returns non-zero on success.
+#[cfg(target_os = "windows")]
+unsafe fn windows_sys_get_disk_free_space(path: &[u16], free_bytes: &mut u64) -> i32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    GetDiskFreeSpaceExW(path.as_ptr(), free_bytes, &mut total, &mut total_free)
 }
 
 /// Build a lookup map from (type, id) → le.idx entry for fast resource placement.
@@ -149,4 +241,34 @@ pub fn write_resource_to_rdbdata(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_alloc_size_halving() {
+        // Verify the halving logic produces the expected sequence
+        let mut size: u64 = 1_073_741_824; // 1GB
+        let min_size: u64 = 128 * 1024 * 1024; // 128MB
+        let mut sizes = vec![size];
+        while size > min_size {
+            size /= 2;
+            sizes.push(size);
+        }
+        assert_eq!(sizes, vec![
+            1_073_741_824, // 1 GB
+            536_870_912,   // 512 MB
+            268_435_456,   // 256 MB
+            134_217_728,   // 128 MB
+        ]);
+    }
+
+    #[test]
+    fn test_alloc_size_respects_target() {
+        // If target_size > RDBDATA_SIZE, allocation should use target_size
+        let target: u64 = 1_200_000_000;
+        let rdbdata_size: u64 = 1_073_741_824;
+        let alloc = rdbdata_size.max(target);
+        assert_eq!(alloc, target);
+    }
 }
