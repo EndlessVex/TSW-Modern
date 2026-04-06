@@ -843,8 +843,7 @@ async fn run_patching_inner(
     );
     rdbdata::create_rdbdata_files(&base, &le_index, Some(&valid_hashes))?;
 
-    // Pre-build the BC4 error lookup table (~50ms, 32MB).
-    // This happens once and dramatically speeds up IOg1 texture encoding.
+    // Emit bootstrapping status before heavy setup work.
     let _ = app.emit(
         "patch:progress",
         &download::DownloadProgress {
@@ -854,8 +853,6 @@ async fn run_patching_inner(
             phase: "bootstrapping".into(), failed_files: 0,
         },
     );
-    crate::redux::init_bc4_lut();
-
     // Build placement map for fast lookup
     let _placement_map = rdbdata::build_placement_map(&le_index);
 
