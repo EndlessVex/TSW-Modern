@@ -887,6 +887,7 @@ fn compute_4color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 
 /// Compute the actual weighted error of an encoded DXT1 3-color block against
 /// the original pixels, using the quantized RGB565 palette.
+#[allow(dead_code)]
 fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
     let (r0, g0, b0) = decode_rgb565(c0);
     let (r1, g1, b1) = decode_rgb565(c1);
@@ -1052,6 +1053,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 
 /// WeightedClusterFit 3-color mode (matching squish).
 /// Returns (encoded_block, weighted_error).
+#[allow(dead_code)]
 fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
 
@@ -1175,7 +1177,7 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 /// Uses WeightedClusterFit matching squish (ClientPatcher). When `force_3color`
 /// is false, tries both 3-color and 4-color modes for opaque blocks and picks
 /// the lower error; when true, always uses 3-color mode (required for DXT1a).
-fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
+fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool) -> [u8; 8] {
     // Check for transparent pixels. DXT1 3-color mode (c0 <= c1) uses index 3
     // for transparent black. After box filtering, transparent+opaque pixels blend
     // to intermediate alpha — threshold at 128 to preserve transparency at edges.
