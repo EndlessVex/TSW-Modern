@@ -3566,4 +3566,86 @@ mod tests {
             abs_diffs[2] as f64 / total_pixels as f64);
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_mip2_from_ref_mip1() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        // Test texture 19767 (512x512 DXT1)
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let block_size = 8;
+        // Mip layout (smallest-first, 40-byte header):
+        // mip7(8) mip6(32) mip5(128) mip4(512) mip3(2048) mip2(8192) mip1(32768) mip0(131072)
+        let mip0_offset = ref_data.len() - 131072;
+        let mip1_offset = mip0_offset - 32768;
+        let mip2_offset = mip1_offset - 8192;
+
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + 32768];
+        let ref_mip2 = &ref_data[mip2_offset..mip2_offset + 8192];
+
+        // Generate mip2 from REFERENCE mip1 using our pipeline
+        let our_mip2 = generate_mip(ref_mip1, 256, 256, 128, 128, TextureCodec::Dxt1, false);
+        assert_eq!(our_mip2.len(), 8192);
+
+        // Compare block by block
+        let num_blocks = 8192 / block_size;
+        let mut matching = 0;
+        let mut solid_match = 0;
+        let mut solid_total = 0;
+        let mut nonsolid_match = 0;
+        let mut nonsolid_total = 0;
+
+        for b in 0..num_blocks {
+            let our_block = &our_mip2[b * block_size..(b + 1) * block_size];
+            let ref_block = &ref_mip2[b * block_size..(b + 1) * block_size];
+
+            let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+            let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+            let is_solid = rc0 == rc1;
+
+            if our_block == ref_block {
+                matching += 1;
+                if is_solid { solid_match += 1; } else { nonsolid_match += 1; }
+            }
+            if is_solid { solid_total += 1; } else { nonsolid_total += 1; }
+        }
+
+        eprintln!("  Mip2 from REFERENCE mip1 (texture 19767):");
+        eprintln!("    Total: {}/{} blocks match ({:.1}%)", matching, num_blocks,
+            matching as f64 / num_blocks as f64 * 100.0);
+        eprintln!("    Solid: {}/{} ({:.1}%)", solid_match, solid_total,
+            if solid_total > 0 { solid_match as f64 / solid_total as f64 * 100.0 } else { 0.0 });
+        eprintln!("    Non-solid: {}/{} ({:.1}%)", nonsolid_match, nonsolid_total,
+            if nonsolid_total > 0 { nonsolid_match as f64 / nonsolid_total as f64 * 100.0 } else { 0.0 });
+
+        // Also generate mip2 from OUR mip1 (generated from mip0) for comparison
+        let ref_mip0 = &ref_data[mip0_offset..mip0_offset + 131072];
+        let our_mip1 = generate_mip(ref_mip0, 512, 512, 256, 256, TextureCodec::Dxt1, false);
+        let our_mip2_from_ours = generate_mip(&our_mip1, 256, 256, 128, 128, TextureCodec::Dxt1, false);
+
+        let mut matching2 = 0;
+        for b in 0..num_blocks {
+            if our_mip2_from_ours[b*block_size..(b+1)*block_size] == ref_mip2[b*block_size..(b+1)*block_size] {
+                matching2 += 1;
+            }
+        }
+        eprintln!("    (Comparison: mip2 from OUR mip1: {}/{} ({:.1}%))",
+            matching2, num_blocks, matching2 as f64 / num_blocks as f64 * 100.0);
+    }
+
 }
