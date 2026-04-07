@@ -21,7 +21,7 @@ use crate::rdb::{LeIndex, LeIndexEntry};
 /// Pre-create all required rdbdata files with RDB0 headers.
 /// Only creates files that don't already exist.
 ///
-/// Pre-allocates to 1GB per file, matching the original ClientPatcher
+/// Pre-allocates to 1GB per file, matching the game's patcher
 /// If allocation fails
 /// (low disk space), retries with halved sizes down to 128MB minimum,
 /// matching the original's retry logic.
@@ -79,7 +79,7 @@ pub fn create_rdbdata_files(
 
     // Determine initial allocation size. If available space is known and tight,
     // start with a smaller allocation to avoid immediate failure.
-    // Original ClientPatcher: max 1GB, clamp to available space.
+    // Original patcher: max 1GB, clamp to available space.
     const RDBDATA_SIZE: u64 = 1_073_741_824; // 1 GB
     const MIN_ALLOC_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
 
@@ -106,7 +106,7 @@ pub fn create_rdbdata_files(
         let desired = if target_size > 4 { initial_alloc.max(target_size) } else { 4 };
 
         if desired > 4 {
-            // Retry with halved sizes on failure, matching original ClientPatcher
+            // Retry with halved sizes on failure, matching the game's patcher
             let mut alloc_size = desired;
             loop {
                 match file.set_len(alloc_size) {

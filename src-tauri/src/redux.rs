@@ -24,7 +24,7 @@ const HXDR_MAGIC: &[u8; 4] = b"HXDR";
 /// Stream descriptor size between HXDR and LZMA stream.
 const STREAM_DESC_SIZE: usize = 26;
 
-/// DXT1 solid-block lookup tables matching the original ClientPatcher.
+/// DXT1 solid-block lookup tables matching the game's output.
 /// 5-bit (R/B channels) and 6-bit (G channel) optimal endpoint pairs.
 /// Each entry: [c0_quantized, c1_quantized] for input value 0-255.
 static DXT1_SOLID_5BIT: [[u8; 2]; 256] = [
@@ -267,7 +267,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // ── 5. binaryAlpha flag ──────────────────────────────────────────
-    // The original ClientPatcher has a `binaryAlpha` flag but it's NOT based on
+    // The original encoder has a `binaryAlpha` flag but it's NOT based on
     // scanning DXT1 blocks for 3-color mode — 99.8% of DXT1 textures have at
     // least one c0<=c1 block (degenerate solid-color blocks), so block scanning
     // triggers on virtually everything. The flag is likely a content-pipeline
@@ -503,7 +503,7 @@ fn linear_to_srgb(l: f32) -> u8 {
 
 /// Generate a downsampled mip level from DXT block data.
 ///
-/// Matches the ClientPatcher's NVTT pipeline:
+/// Matches the game's mip generation pipeline:
 /// 1. Decode entire source mip to full pixel buffer
 /// 2. Box-filter in float space (2x2 average with rounding)
 /// 3. Re-encode block by block from filtered image
@@ -548,7 +548,7 @@ fn generate_mip(
 
     // Convert to linear float buffer for sRGB-correct filtering
     // Gamma correction disabled — testing showed it does not improve matching
-    // against the original ClientPatcher output. The original may not apply
+    // against the game's output. The original may not apply
     // gamma correction during mip filtering.
     let use_srgb = false;
     let mut src_linear = vec![[0.0f32; 4]; prev_w * prev_h];
@@ -790,7 +790,7 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 }
 
 /// Build the shared color set for cluster fit: float RGB colors, sqrt-weights,
-/// deduplicated by raw byte equality (matching squish's ColourSet).
+/// deduplicated by raw byte equality (matching the game's color set construction).
 /// Returns (colors, weights, order, n) where colors/weights are sorted along
 /// the principal axis and n is the number of unique colors.
 fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usize>, usize) {
@@ -816,7 +816,7 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usiz
         }
     }
 
-    // Square-root weights after accumulation (matching squish's ColourSet)
+    // Square-root weights after accumulation (matching the game's color set construction)
     for w in weights.iter_mut() {
         *w = w.sqrt();
     }
@@ -970,7 +970,7 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
     total_err as f32
 }
 
-/// WeightedClusterFit 4-color mode (matching squish).
+/// 4-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
@@ -1075,7 +1075,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     }
 
     // Now enforce 4-color mode: c0 > c1. If we need to swap, XOR bit 0 of
-    // each 2-bit index (squish's remapping: 0↔1, 2↔3).
+    // each 2-bit index (the game's remapping: 0↔1, 2↔3).
     if c0 < c1 {
         std::mem::swap(&mut c0, &mut c1);
         let mut remapped = 0u32;
@@ -1102,7 +1102,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     (out, err)
 }
 
-/// WeightedClusterFit 3-color mode (matching squish).
+/// 3-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
 #[allow(dead_code)]
 fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
@@ -1225,7 +1225,7 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 
 /// Encode 16 RGBA pixels → DXT1 block (8 bytes).
 ///
-/// Uses WeightedClusterFit matching squish (ClientPatcher). When `force_3color`
+/// Uses WeightedClusterFit matching the game's encoder. When `force_3color`
 /// is false, tries both 3-color and 4-color modes for opaque blocks and picks
 /// the lower error; when true, always uses 3-color mode (required for DXT1a).
 fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool) -> [u8; 8] {
@@ -1314,8 +1314,8 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool) -> [u8; 8] {
     }
 
     // Use 4-color mode only for opaque blocks.
-    // The original ClientPatcher (alg_squish) does NOT try 3-color for opaque
-    // blocks despite the reference squish code doing so. Trying 3-color causes
+    // The original encoder does NOT try 3-color for opaque
+    // blocks despite the reference encoder doing so. Trying 3-color causes
     // massive mode-change regressions (1.1% -> 25.8% of blocks).
     let (block_4, _) = cluster_fit_4color(pixels);
     block_4
@@ -1378,7 +1378,7 @@ fn decode_dxt5_block(data: &[u8]) -> [[u8; 4]; 16] {
 fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
     // Extract alpha values and encode as BC4 block (same structure).
     // Uses encode_bc4_block for exhaustive endpoint search + squared error
-    // index assignment, matching the ClientPatcher's BC4 encoder.
+    // index assignment, matching the game's encoder.
     let mut alpha_values = [0u8; 16];
     for (i, p) in pixels.iter().enumerate() {
         alpha_values[i] = p[3];
@@ -1407,7 +1407,7 @@ fn decode_bc4_block(data: &[u8]) -> [u8; 16] {
 
     // Use truncating division (no +3 rounding bias) to match the game engine's
     // BC4 interpolation. Verified: this produces byte-identical output for ~53%
-    // of generated mip blocks vs the ClientPatcher, up from ~9% with standard rounding.
+    // of generated mip blocks vs the game's output, up from ~9% with standard rounding.
     let table: [u8; 8] = if a0 > a1 {
         [
             a0 as u8,
@@ -1449,7 +1449,7 @@ fn decode_bc4_block(data: &[u8]) -> [u8; 16] {
 fn bc4_sse(values: &[u8; 16], a0: u8, a1: u8) -> u32 {
     let a0w = a0 as u16;
     let a1w = a1 as u16;
-    // Build palette with truncating division (matches ClientPatcher)
+    // Build palette with truncating division (matches the game's encoder)
     let table: [u8; 8] = if a0 > a1 {
         [a0, a1,
          ((6 * a0w + 1 * a1w) / 7) as u8, ((5 * a0w + 2 * a1w) / 7) as u8,
@@ -1500,7 +1500,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
         return out;
     }
 
-    // Exhaustive endpoint search (matching ClientPatcher):
+    // Exhaustive endpoint search (matching the game's encoder):
     // When range > 8, search (ep0, ep1) pairs for minimum sum-of-squared-errors.
     let (mut best_a0, mut best_a1) = (a0, a1);
 
@@ -1531,7 +1531,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
 
     let (a0, a1) = (best_a0, best_a1);
 
-    // Build palette with truncating division (matches ClientPatcher)
+    // Build palette with truncating division (matches the game's encoder)
     let table: [u8; 8] = if a0 > a1 {
         let a0w = a0 as u16;
         let a1w = a1 as u16;
@@ -1585,7 +1585,7 @@ fn encode_bc4_block(values: &[u8; 16]) -> [u8; 8] {
 }
 
 /// Encode 16 channel values → BC4 block using iterative refinement.
-/// Used for ATI2/BC5 channels (normal maps), matching ClientPatcher.
+/// Used for ATI2/BC5 channels (normal maps), matching the game's encoder.
 fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
     let mut min_v = 255u8;
     let mut max_v = 0u8;
@@ -1643,7 +1643,7 @@ fn encode_bc4_iterative(values: &[u8; 16], max_iters: i32) -> [u8; 8] {
 }
 
 /// Compute SSE and assign best indices for each pixel.
-/// Matches ClientPatcher's SSE-with-index-assignment function.
+/// Matches the game's SSE-with-index-assignment function.
 fn bc4_sse_with_indices(values: &[u8; 16], a0: u8, a1: u8, indices: &mut [u8; 16]) -> u32 {
     let a0w = a0 as u16;
     let a1w = a1 as u16;
@@ -1674,7 +1674,7 @@ fn bc4_sse_with_indices(values: &[u8; 16], a0: u8, a1: u8, indices: &mut [u8; 16
 }
 
 /// Least-squares refinement of BC4 endpoints.
-/// Matches ClientPatcher's least-squares refinement.
+/// Matches the game's least-squares refinement.
 fn bc4_least_squares_refine(values: &[u8; 16], indices: &[u8; 16]) -> (u8, u8) {
     let mut sum_w0w0 = 0.0f32;
     let mut sum_w1w1 = 0.0f32;

@@ -11,7 +11,7 @@ use std::path::Path;
 /// compression, depth texture format, MSAA settings). Without these, the game
 /// uses fallback shader paths that render textures incorrectly (cross-hatch
 /// artifacts on normal maps). The game normally generates these on first launch,
-/// but fails to do so without the ClientPatcher's initialization sequence.
+/// but fails to do so without the game patcher's initialization sequence.
 const SHADER_CACHE_FILES: &[(&str, &[u8])] = &[
     ("shader.cache.local3", include_bytes!("shader_cache/shader.cache.local3")),
     ("shader.cache.dx11.local3", include_bytes!("shader_cache/shader.cache.dx11.local3")),
