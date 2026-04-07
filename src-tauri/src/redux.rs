@@ -546,11 +546,10 @@ fn generate_mip(
         }
     }
 
-    // Step 2: Box-filter using integer math (2×2 average with rounding).
-    // The original uses integer averaging without a float round-trip.
-    // Float round-trip (byte / 255.0 * 255.0) introduces ~1 ULP error
-    // for ~25% of pixel values, which cascades through PCA/sorting into
-    // completely different encoded blocks.
+    // Step 2: Box-filter — float averaging with truncation (no +0.5 rounding).
+    // Testing showed truncating division matches the original better than
+    // rounding. The original likely uses float averaging with truncating
+    // conversion back to u8.
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -568,7 +567,7 @@ fn generate_mip(
 
             for c in 0..4 {
                 let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
-                dst_pixels[y * new_w + x][c] = ((sum + 2) / 4) as u8;
+                dst_pixels[y * new_w + x][c] = (sum / 4) as u8;
             }
         }
     }
@@ -982,12 +981,12 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
         for t in s..=n {
             // Precompute values constant across inner loop
             // (matching fStack_6c, fStack_68, fStack_7c, fStack_64 in the original)
-            let aa_partial: f32 = f32via64!(mid_w as f64 * (4.0f64 / 9.0) + outer_w as f64);
+            let aa_partial: f32 = f32via64!(mid_w as f64 * ((4.0f32 / 9.0) as f64) + outer_w as f64);
             let remaining_w: f32 = f32via64!((total_w as f64 - outer_w as f64) - mid_w as f64);
-            let bb_mid_term: f32 = f32via64!(mid_w as f64 * (1.0f64 / 9.0));
+            let bb_mid_term: f32 = f32via64!(mid_w as f64 * ((1.0f32 / 9.0) as f64));
             let mut beta_a_mid = [0.0f32; 3];
             for k in 0..3 {
-                beta_a_mid[k] = f32via64!(mid_rgb[k] as f64 * (2.0f64 / 3.0));
+                beta_a_mid[k] = f32via64!(mid_rgb[k] as f64 * ((2.0f32 / 3.0) as f64));
             }
 
             // Inner loop: boundary u, group C = sorted[t..u]
@@ -996,10 +995,10 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 
             for u in t..=n {
                 // Partition metrics from incremental sums
-                let alpha_aa: f32 = f32via64!(inner_w as f64 * (1.0f64 / 9.0) + aa_partial as f64);
-                let alpha_bb: f32 = f32via64!(inner_w as f64 * (4.0f64 / 9.0)
+                let alpha_aa: f32 = f32via64!(inner_w as f64 * ((1.0f32 / 9.0) as f64) + aa_partial as f64);
+                let alpha_bb: f32 = f32via64!(inner_w as f64 * ((4.0f32 / 9.0) as f64)
                     + (remaining_w as f64 - inner_w as f64) + bb_mid_term as f64);
-                let alpha_ab: f32 = f32via64!((inner_w as f64 + mid_w as f64) * (2.0f64 / 9.0));
+                let alpha_ab: f32 = f32via64!((inner_w as f64 + mid_w as f64) * ((2.0f32 / 9.0) as f64));
 
                 let det: f32 = f32via64!(alpha_aa as f64 * alpha_bb as f64
                     - alpha_ab as f64 * alpha_ab as f64);
@@ -1013,7 +1012,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                         // beta_a = outer_rgb + mid_rgb*2/3 + inner_rgb*1/3
                         // (matching the original's incremental formula)
                         let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
-                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * (1.0f64 / 3.0));
+                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * ((1.0f32 / 3.0) as f64));
                         // beta_b = total - beta_a (matching the original's subtraction)
                         let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
 
@@ -1026,8 +1025,9 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                     }
 
                     // Grid-snap: quantize to 5/6/5 then dequantize
-                    let grids = [31.0f64, 63.0, 31.0];
-                    let inv_grids = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
+                    // Grid constants: use f32 precision (matching original's stored constants)
+                    let grids = [31.0f32 as f64, 63.0f32 as f64, 31.0f32 as f64];
+                    let inv_grids = [(1.0f32 / 31.0) as f64, (1.0f32 / 63.0) as f64, (1.0f32 / 31.0) as f64];
                     for k in 0..3 {
                         ep_a[k] = f32via64!((ep_a[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
                         ep_b[k] = f32via64!((ep_b[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
@@ -1037,13 +1037,13 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                     let mut err = 0.0f32;
                     for k in 0..3 {
                         let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
-                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * (1.0f64 / 3.0));
+                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * ((1.0f32 / 3.0) as f64));
                         let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
                         let ch_err: f32 = f32via64!(
                             alpha_aa as f64 * ep_a[k] as f64 * ep_a[k] as f64
                             + alpha_bb as f64 * ep_b[k] as f64 * ep_b[k] as f64
-                            + 2.0f64 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
-                            - 2.0f64 * (beta_a as f64 * ep_a[k] as f64
+                            + 2.0 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
+                            - 2.0 * (beta_a as f64 * ep_a[k] as f64
                                 + beta_b as f64 * ep_b[k] as f64)
                         );
                         err += ch_err;
