@@ -1218,12 +1218,31 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
             for u in t..=n {
                 // Partition metrics using x87 for critical operations
                 let alpha_aa = x87_fma_f32(inner_w, c_1_9, aa_partial);
+                // alpha_bb = inner_w*4/9 + (remaining_w - inner_w) + bb_mid_term
+                // Must be ONE x87 sequence — no intermediate f32 stores.
                 let alpha_bb: f32 = {
-                    // inner_w * 4/9 + (remaining_w - inner_w) + bb_mid_term
-                    let t1 = x87_fma_f32(inner_w, c_4_9, remaining_w - inner_w);
-                    t1 + bb_mid_term
+                    let mut result: f32 = 0.0;
+                    unsafe {
+                        std::arch::asm!(
+                            "fld dword ptr [{iw}]",      // st0 = inner_w
+                            "fmul dword ptr [{c49}]",    // st0 = inner_w * 4/9
+                            "fld dword ptr [{rw}]",      // st0 = remaining_w, st1 = inner_w*4/9
+                            "fsub dword ptr [{iw}]",     // st0 = remaining_w - inner_w
+                            "faddp",                      // st0 = inner_w*4/9 + (remaining_w - inner_w)
+                            "fadd dword ptr [{bbm}]",    // st0 = + bb_mid_term
+                            "fstp dword ptr [{out}]",    // store to f32
+                            iw = in(reg) &inner_w,
+                            c49 = in(reg) &c_4_9,
+                            rw = in(reg) &remaining_w,
+                            bbm = in(reg) &bb_mid_term,
+                            out = in(reg) &mut result,
+                            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                        );
+                    }
+                    result
                 };
-                let alpha_ab: f32 = (inner_w + mid_w) * c_2_9;
+                let alpha_ab = x87_fma_f32(inner_w + mid_w, c_2_9, 0.0);
 
                 // Determinant at x87 80-bit — critical for avoiding catastrophic cancellation
                 let det = x87_cross_f32(alpha_aa, alpha_bb, alpha_ab, alpha_ab);
