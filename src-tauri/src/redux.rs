@@ -847,13 +847,18 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
             x87_fma_f32(cov[1], axis[0], x87_fma_f32(cov[3], axis[1], 0.0)) + cov[4] * axis[2],
             x87_fma_f32(cov[2], axis[0], x87_fma_f32(cov[4], axis[1], 0.0)) + cov[5] * axis[2],
         ];
-        let max_abs = next[0].abs().max(next[1].abs()).max(next[2].abs());
-        if max_abs > 0.0 {
-            axis = [next[0] / max_abs, next[1] / max_abs, next[2] / max_abs];
-        } else {
+        // Normalize by max RAW value (not absolute!) — matching original's FUN_00681700.
+        // The original finds the largest component value and divides by it.
+        // This preserves direction differently than dividing by max absolute value.
+        let mut max_val = next[0];
+        if next[0] <= next[1] { max_val = next[1]; }
+        if max_val < next[2] { max_val = next[2]; }
+        if max_val == 0.0 {
             axis = [0.0; 3];
             break;
         }
+        let inv = 1.0f32 / max_val;
+        axis = [next[0] * inv, next[1] * inv, next[2] * inv];
     }
 
     // Project colors onto axis and insertion-sort ascending
