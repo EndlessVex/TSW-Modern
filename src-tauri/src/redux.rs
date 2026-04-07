@@ -763,12 +763,19 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usize>, usize) {
     let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
     let mut weights: Vec<f32> = Vec::with_capacity(16);
+    // Color normalization: multiply by reciprocal constant (matching original's
+    // fmul [0.003921569] instruction). IEEE division `x / 255.0` gives a different
+    // f32 result than `x * (1/255)` for some pixel values because divss uses the
+    // exact divisor while fmul uses the rounded reciprocal.
+    const C_1_255: f32 = 1.0 / 255.0; // = 0x3B808081, same constant as original
+    const C_1_256: f32 = 1.0 / 256.0; // = 0.00390625, same as original's 0.00390625
+
     if dedup {
         let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
         for (_i, p) in pixels.iter().enumerate() {
             let rgb_bytes = [p[0], p[1], p[2]];
-            let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
-            let w = (p[3] as f32 + 1.0) / 256.0;
+            let rgb = [p[0] as f32 * C_1_255, p[1] as f32 * C_1_255, p[2] as f32 * C_1_255];
+            let w = (p[3] as f32 + 1.0) * C_1_256;
             let mut found = false;
             for (j, existing) in color_bytes.iter().enumerate() {
                 if *existing == rgb_bytes {
@@ -786,8 +793,8 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
     } else {
         // No dedup: all 16 pixels as separate entries (matching original's param_4=0)
         for p in pixels.iter() {
-            colors.push([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
-            weights.push((p[3] as f32 + 1.0) / 256.0);
+            colors.push([p[0] as f32 * C_1_255, p[1] as f32 * C_1_255, p[2] as f32 * C_1_255]);
+            weights.push((p[3] as f32 + 1.0) * C_1_256);
         }
     }
 
@@ -1244,70 +1251,109 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                 };
                 let alpha_ab = x87_fma_f32(inner_w + mid_w, c_2_9, 0.0);
 
-                // Determinant and endpoint solve — one x87 block keeping inv_det at 80-bit.
-                // The original's disassembly shows inv_det stays on the FPU stack (80-bit)
-                // across all 3 channel endpoint computations. Storing to f32 loses 41 bits
-                // of mantissa, causing endpoints near quantization boundaries to differ.
+                // Determinant and endpoint solve — single x87 block matching the original.
+                // FPU stack trace shows: inv_det is computed ONCE at 80-bit and stays
+                // on the FPU stack across ALL 6 endpoint multiplications (3 channels × 2).
+                // beta_a values computed with beta_a_mid + outer at 80-bit (via FST keep).
                 let det = x87_cross_f32(alpha_aa, alpha_bb, alpha_ab, alpha_ab);
 
                 if det.abs() >= f32::MIN_POSITIVE {
+                    // Compute all beta values first (matching original's sequence)
+                    let beta_a = [
+                        x87_add_fma_f32(beta_a_mid[0], outer_rgb[0], inner_rgb[0], c_1_3),
+                        x87_add_fma_f32(beta_a_mid[1], outer_rgb[1], inner_rgb[1], c_1_3),
+                        x87_add_fma_f32(beta_a_mid[2], outer_rgb[2], inner_rgb[2], c_1_3),
+                    ];
+                    let beta_b = [
+                        x87_sub_f32(total_rgb[0], beta_a[0]),
+                        x87_sub_f32(total_rgb[1], beta_a[1]),
+                        x87_sub_f32(total_rgb[2], beta_a[2]),
+                    ];
+
+                    // Single asm block: compute inv_det ONCE at 80-bit, then all 6 endpoints.
+                    // Uses array pointers to stay within register limits.
                     let mut ep_a = [0.0f32; 3];
                     let mut ep_b = [0.0f32; 3];
+                    let mut _dummy: f32 = 0.0;
+                    let alphas = [alpha_aa, alpha_bb, alpha_ab];
+                    unsafe {
+                        std::arch::asm!(
+                            // --- Compute inv_det at 80-bit (stays on stack) ---
+                            "fld dword ptr [{al}]",        // aa
+                            "fmul dword ptr [{al} + 4]",   // * bb
+                            "fld dword ptr [{al} + 8]",    // ab
+                            "fmul dword ptr [{al} + 8]",   // * ab
+                            "fsubp",                        // det = aa*bb - ab*ab (80-bit)
+                            "fld1",
+                            "fdivrp",                       // st0 = inv_det (80-bit)
 
-                    // Compute inv_det at 80-bit and use it for all 3 channels
-                    // without storing to f32 in between.
+                            // --- Channel R ---
+                            "fld dword ptr [{ba}]",        // beta_a[0]
+                            "fmul dword ptr [{al} + 4]",   // * bb
+                            "fld dword ptr [{bv}]",        // beta_b[0]
+                            "fmul dword ptr [{al} + 8]",   // * ab
+                            "fsubp",
+                            "fmul st, st(1)",               // * inv_det (80-bit!)
+                            "fstp dword ptr [{ea}]",        // ep_a[0]
+
+                            "fld dword ptr [{bv}]",        // beta_b[0]
+                            "fmul dword ptr [{al}]",       // * aa
+                            "fld dword ptr [{ba}]",        // beta_a[0]
+                            "fmul dword ptr [{al} + 8]",   // * ab
+                            "fsubp",
+                            "fmul st, st(1)",
+                            "fstp dword ptr [{eb}]",        // ep_b[0]
+
+                            // --- Channel G ---
+                            "fld dword ptr [{ba} + 4]",
+                            "fmul dword ptr [{al} + 4]",
+                            "fld dword ptr [{bv} + 4]",
+                            "fmul dword ptr [{al} + 8]",
+                            "fsubp",
+                            "fmul st, st(1)",
+                            "fstp dword ptr [{ea} + 4]",
+
+                            "fld dword ptr [{bv} + 4]",
+                            "fmul dword ptr [{al}]",
+                            "fld dword ptr [{ba} + 4]",
+                            "fmul dword ptr [{al} + 8]",
+                            "fsubp",
+                            "fmul st, st(1)",
+                            "fstp dword ptr [{eb} + 4]",
+
+                            // --- Channel B ---
+                            "fld dword ptr [{ba} + 8]",
+                            "fmul dword ptr [{al} + 4]",
+                            "fld dword ptr [{bv} + 8]",
+                            "fmul dword ptr [{al} + 8]",
+                            "fsubp",
+                            "fmul st, st(1)",
+                            "fstp dword ptr [{ea} + 8]",
+
+                            "fld dword ptr [{bv} + 8]",
+                            "fmul dword ptr [{al}]",
+                            "fld dword ptr [{ba} + 8]",
+                            "fmul dword ptr [{al} + 8]",
+                            "fsubp",
+                            "fmul st, st(1)",
+                            "fstp dword ptr [{eb} + 8]",
+
+                            // Pop inv_det
+                            "fstp dword ptr [{dm}]",
+
+                            al = in(reg) alphas.as_ptr(),
+                            ba = in(reg) beta_a.as_ptr(),
+                            bv = in(reg) beta_b.as_ptr(),
+                            ea = in(reg) ep_a.as_mut_ptr(),
+                            eb = in(reg) ep_b.as_mut_ptr(),
+                            dm = in(reg) &mut _dummy,
+                            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                        );
+                    }
                     for k in 0..3 {
-                        let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
-                        let beta_b = x87_sub_f32(total_rgb[k], beta_a);
-
-                        // ep_a = (beta_a * alpha_bb - beta_b * alpha_ab) * (1/det)
-                        // ep_b = (beta_b * alpha_aa - beta_a * alpha_ab) * (1/det)
-                        // Both multiplied by inv_det at 80-bit (not f32).
-                        let mut a_k: f32 = 0.0;
-                        let mut b_k: f32 = 0.0;
-                        let mut _dummy: f32 = 0.0;
-                        unsafe {
-                            std::arch::asm!(
-                                // Compute inv_det at 80-bit
-                                "fld dword ptr [{aa}]",
-                                "fmul dword ptr [{bb}]",       // aa * bb
-                                "fld dword ptr [{ab}]",
-                                "fmul dword ptr [{ab}]",       // ab * ab
-                                "fsubp",                        // det = aa*bb - ab*ab (80-bit)
-                                "fld1",
-                                "fdivrp",                       // inv_det = 1/det (80-bit, stays on stack)
-                                // ep_a = (beta_a * alpha_bb - beta_b * alpha_ab) * inv_det
-                                "fld dword ptr [{ba}]",
-                                "fmul dword ptr [{bb}]",       // beta_a * alpha_bb
-                                "fld dword ptr [{bb_val}]",
-                                "fmul dword ptr [{ab}]",       // beta_b * alpha_ab
-                                "fsubp",                        // beta_a*bb - beta_b*ab (80-bit)
-                                "fmul st, st(1)",               // * inv_det (80-bit!)
-                                "fstp dword ptr [{out_a}]",     // store ep_a to f32
-                                // ep_b = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det
-                                "fld dword ptr [{bb_val}]",
-                                "fmul dword ptr [{aa}]",       // beta_b * alpha_aa
-                                "fld dword ptr [{ba}]",
-                                "fmul dword ptr [{ab}]",       // beta_a * alpha_ab
-                                "fsubp",                        // beta_b*aa - beta_a*ab (80-bit)
-                                "fmul st, st(1)",               // * inv_det (80-bit!)
-                                "fstp dword ptr [{out_b}]",     // store ep_b to f32
-                                // Clean up inv_det from stack
-                                "fstp dword ptr [{dummy}]",     // pop inv_det
-                                aa = in(reg) &alpha_aa,
-                                bb = in(reg) &alpha_bb,
-                                ab = in(reg) &alpha_ab,
-                                ba = in(reg) &beta_a,
-                                bb_val = in(reg) &beta_b,
-                                out_a = in(reg) &mut a_k,
-                                out_b = in(reg) &mut b_k,
-                                dummy = in(reg) &mut _dummy,
-                                out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-                                out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
-                            );
-                        }
-                        ep_a[k] = a_k.clamp(0.0, 1.0);
-                        ep_b[k] = b_k.clamp(0.0, 1.0);
+                        ep_a[k] = ep_a[k].clamp(0.0, 1.0);
+                        ep_b[k] = ep_b[k].clamp(0.0, 1.0);
                     }
 
                     // Grid-snap: quantize to 5/6/5 then dequantize
