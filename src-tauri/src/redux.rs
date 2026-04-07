@@ -266,21 +266,14 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    // ── 5. Detect DXT1a binary alpha ─────────────────────────────────
-    // If ANY mip0 block uses 3-color mode (c0 <= c1), force all generated mips
-    // to use 3-color mode, matching the ClientPatcher's binaryAlpha flag.
-    let has_binary_alpha = if codec == TextureCodec::Dxt1 {
-        let block_count = (stream1.width / 4).max(1) * (stream1.height / 4).max(1);
-        (0..block_count).any(|i| {
-            let off = i * 8;
-            if off + 4 > mip_sizes[0] { return false; }
-            let c0 = u16::from_le_bytes([mip0_data[off], mip0_data[off + 1]]);
-            let c1 = u16::from_le_bytes([mip0_data[off + 2], mip0_data[off + 3]]);
-            c0 <= c1  // 3-color mode = has transparency
-        })
-    } else {
-        false
-    };
+    // ── 5. binaryAlpha flag ──────────────────────────────────────────
+    // The original ClientPatcher has a `binaryAlpha` flag but it's NOT based on
+    // scanning DXT1 blocks for 3-color mode — 99.8% of DXT1 textures have at
+    // least one c0<=c1 block (degenerate solid-color blocks), so block scanning
+    // triggers on virtually everything. The flag is likely a content-pipeline
+    // metadata flag we don't have access to. Disabled until we can determine
+    // the correct detection method.
+    let has_binary_alpha = false;
 
     // ── 6. Generate all mips, then write SMALLEST-FIRST ────────────
     // The FCTX format stores mips smallest-first (1x1 at start, full mip0 at end).
@@ -1260,13 +1253,6 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
 
     // ── All opaque: existing path ──
 
-    // If texture has binary alpha, force 3-color mode for all blocks
-    // (must come before the solid-color fast path so solid blocks also use 3-color).
-    if force_3color {
-        let (block_3, _) = cluster_fit_3color(pixels);
-        return block_3;
-    }
-
     // Solid-color fast path: check if all pixels share the same RGB.
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
     let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
@@ -1274,10 +1260,12 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    // Otherwise try both modes and pick lower error
-    let (block_3, err_3) = cluster_fit_3color(pixels);
-    let (block_4, err_4) = cluster_fit_4color(pixels);
-    if err_3 <= err_4 { block_3 } else { block_4 }
+    // Use 4-color mode only for opaque blocks.
+    // The original ClientPatcher (alg_squish) does NOT try 3-color for opaque
+    // blocks despite the reference squish code doing so. Trying 3-color causes
+    // massive mode-change regressions (1.1% -> 25.8% of blocks).
+    let (block_4, _) = cluster_fit_4color(pixels);
+    block_4
 }
 
 // ─── DXT5 decode/encode ──────────────────────────────────────────────────────
