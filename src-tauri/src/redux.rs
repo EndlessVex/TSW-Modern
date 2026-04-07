@@ -485,6 +485,28 @@ fn decompress_mixd(
 
 // ─── Mipmap generation ───────────────────────────────────────────────────────
 
+/// Convert sRGB byte value [0,255] to linear float [0,1].
+#[inline]
+fn srgb_to_linear(s: u8) -> f32 {
+    let s = s as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Convert linear float [0,1] back to sRGB byte [0,255].
+#[inline]
+fn linear_to_srgb(l: f32) -> u8 {
+    let s = if l <= 0.0031308 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+}
+
 /// Generate a downsampled mip level from DXT block data.
 ///
 /// Matches the ClientPatcher's NVTT pipeline:
@@ -530,7 +552,29 @@ fn generate_mip(
         }
     }
 
-    // Step 2: Box-filter in float space with rounding
+    // Convert to linear float buffer for sRGB-correct filtering
+    let use_srgb = matches!(codec, TextureCodec::Dxt1 | TextureCodec::Dxt5);
+    let mut src_linear = vec![[0.0f32; 4]; prev_w * prev_h];
+    for i in 0..src_pixels.len() {
+        let p = src_pixels[i];
+        if use_srgb {
+            src_linear[i] = [
+                srgb_to_linear(p[0]),
+                srgb_to_linear(p[1]),
+                srgb_to_linear(p[2]),
+                p[3] as f32 / 255.0,
+            ];
+        } else {
+            src_linear[i] = [
+                p[0] as f32 / 255.0,
+                p[1] as f32 / 255.0,
+                p[2] as f32 / 255.0,
+                p[3] as f32 / 255.0,
+            ];
+        }
+    }
+
+    // Step 2: Box-filter in linear float space, then convert back
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -541,15 +585,22 @@ fn generate_mip(
             let x1 = (sx + 1).min(prev_w - 1);
             let y1 = (sy + 1).min(prev_h - 1);
 
-            let p00 = src_pixels[y0 * prev_w + x0];
-            let p10 = src_pixels[y0 * prev_w + x1];
-            let p01 = src_pixels[y1 * prev_w + x0];
-            let p11 = src_pixels[y1 * prev_w + x1];
+            let p00 = src_linear[y0 * prev_w + x0];
+            let p10 = src_linear[y0 * prev_w + x1];
+            let p01 = src_linear[y1 * prev_w + x0];
+            let p11 = src_linear[y1 * prev_w + x1];
 
-            for c in 0..4 {
-                let sum = p00[c] as f32 + p10[c] as f32 + p01[c] as f32 + p11[c] as f32;
-                dst_pixels[y * new_w + x][c] = (sum / 4.0).round().clamp(0.0, 255.0) as u8;
+            for c in 0..3 {
+                let avg = (p00[c] + p10[c] + p01[c] + p11[c]) / 4.0;
+                dst_pixels[y * new_w + x][c] = if use_srgb {
+                    linear_to_srgb(avg)
+                } else {
+                    (avg * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+                };
             }
+            // Alpha: always linear averaging
+            let alpha_avg = (p00[3] + p10[3] + p01[3] + p11[3]) / 4.0;
+            dst_pixels[y * new_w + x][3] = (alpha_avg * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
 
