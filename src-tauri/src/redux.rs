@@ -816,11 +816,6 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usiz
         }
     }
 
-    // Square-root weights after accumulation (matching the game's color set construction)
-    for w in weights.iter_mut() {
-        *w = w.sqrt();
-    }
-
     let n = colors.len();
 
     // Weighted centroid
@@ -919,7 +914,7 @@ fn compute_4color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
     ];
     let mut total_err = 0.0f64;
     for p in pixels.iter() {
-        let w = ((p[3] as f64 + 1.0) / 256.0).sqrt();
+        let w = (p[3] as f64 + 1.0) / 256.0;
         let pr = p[0] as f64 / 255.0;
         let pg = p[1] as f64 / 255.0;
         let pb = p[2] as f64 / 255.0;
@@ -953,7 +948,7 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
     ];
     let mut total_err = 0.0f64;
     for p in pixels.iter() {
-        let w = ((p[3] as f64 + 1.0) / 256.0).sqrt();
+        let w = (p[3] as f64 + 1.0) / 256.0;
         let pr = p[0] as f64 / 255.0;
         let pg = p[1] as f64 / 255.0;
         let pb = p[2] as f64 / 255.0;
