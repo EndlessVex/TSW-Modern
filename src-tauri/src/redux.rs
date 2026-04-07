@@ -1244,25 +1244,68 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                 };
                 let alpha_ab = x87_fma_f32(inner_w + mid_w, c_2_9, 0.0);
 
-                // Determinant at x87 80-bit — critical for avoiding catastrophic cancellation
+                // Determinant and endpoint solve — one x87 block keeping inv_det at 80-bit.
+                // The original's disassembly shows inv_det stays on the FPU stack (80-bit)
+                // across all 3 channel endpoint computations. Storing to f32 loses 41 bits
+                // of mantissa, causing endpoints near quantization boundaries to differ.
                 let det = x87_cross_f32(alpha_aa, alpha_bb, alpha_ab, alpha_ab);
 
                 if det.abs() >= f32::MIN_POSITIVE {
-                    let inv_det = x87_rcp_f32(det);
-
                     let mut ep_a = [0.0f32; 3];
                     let mut ep_b = [0.0f32; 3];
+
+                    // Compute inv_det at 80-bit and use it for all 3 channels
+                    // without storing to f32 in between.
                     for k in 0..3 {
-                        // beta_a = mid*2/3 + outer + inner*1/3
-                        // Critical: mid*2/3 + outer must stay at 80-bit (not truncated to
-                        // f32) before adding inner*1/3. Use x87_add_fma_f32 which keeps
-                        // the intermediate sum on the FPU stack.
                         let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
                         let beta_b = x87_sub_f32(total_rgb[k], beta_a);
 
-                        // Endpoint solve: (beta_a*alpha_bb - beta_b*alpha_ab) * inv_det
-                        let a_k = x87_cross_mul_f32(beta_a, alpha_bb, beta_b, alpha_ab, inv_det);
-                        let b_k = x87_cross_mul_f32(beta_b, alpha_aa, beta_a, alpha_ab, inv_det);
+                        // ep_a = (beta_a * alpha_bb - beta_b * alpha_ab) * (1/det)
+                        // ep_b = (beta_b * alpha_aa - beta_a * alpha_ab) * (1/det)
+                        // Both multiplied by inv_det at 80-bit (not f32).
+                        let mut a_k: f32 = 0.0;
+                        let mut b_k: f32 = 0.0;
+                        let mut _dummy: f32 = 0.0;
+                        unsafe {
+                            std::arch::asm!(
+                                // Compute inv_det at 80-bit
+                                "fld dword ptr [{aa}]",
+                                "fmul dword ptr [{bb}]",       // aa * bb
+                                "fld dword ptr [{ab}]",
+                                "fmul dword ptr [{ab}]",       // ab * ab
+                                "fsubp",                        // det = aa*bb - ab*ab (80-bit)
+                                "fld1",
+                                "fdivrp",                       // inv_det = 1/det (80-bit, stays on stack)
+                                // ep_a = (beta_a * alpha_bb - beta_b * alpha_ab) * inv_det
+                                "fld dword ptr [{ba}]",
+                                "fmul dword ptr [{bb}]",       // beta_a * alpha_bb
+                                "fld dword ptr [{bb_val}]",
+                                "fmul dword ptr [{ab}]",       // beta_b * alpha_ab
+                                "fsubp",                        // beta_a*bb - beta_b*ab (80-bit)
+                                "fmul st, st(1)",               // * inv_det (80-bit!)
+                                "fstp dword ptr [{out_a}]",     // store ep_a to f32
+                                // ep_b = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det
+                                "fld dword ptr [{bb_val}]",
+                                "fmul dword ptr [{aa}]",       // beta_b * alpha_aa
+                                "fld dword ptr [{ba}]",
+                                "fmul dword ptr [{ab}]",       // beta_a * alpha_ab
+                                "fsubp",                        // beta_b*aa - beta_a*ab (80-bit)
+                                "fmul st, st(1)",               // * inv_det (80-bit!)
+                                "fstp dword ptr [{out_b}]",     // store ep_b to f32
+                                // Clean up inv_det from stack
+                                "fstp dword ptr [{dummy}]",     // pop inv_det
+                                aa = in(reg) &alpha_aa,
+                                bb = in(reg) &alpha_bb,
+                                ab = in(reg) &alpha_ab,
+                                ba = in(reg) &beta_a,
+                                bb_val = in(reg) &beta_b,
+                                out_a = in(reg) &mut a_k,
+                                out_b = in(reg) &mut b_k,
+                                dummy = in(reg) &mut _dummy,
+                                out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                                out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                            );
+                        }
                         ep_a[k] = a_k.clamp(0.0, 1.0);
                         ep_b[k] = b_k.clamp(0.0, 1.0);
                     }
