@@ -2450,4 +2450,164 @@ mod tests {
             (matching_blocks as f64 / total_blocks as f64) * 100.0);
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_diagnose_block() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        // Read texture 19767 (512x512 DXT1)
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut file = std::fs::File::open(&ref_path).unwrap();
+            file.seek(std::io::SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let fctx_hdr_size = 40;
+        let block_size = 8; // DXT1
+        let width = 512;
+        let height = 512;
+
+        // Mip sizes for 512x512 DXT1
+        let mut mip_sizes = Vec::new();
+        let mut w = width;
+        let mut h = height;
+        loop {
+            let bw = (w + 3) / 4;
+            let bh = (h + 3) / 4;
+            mip_sizes.push(bw * bh * block_size);
+            if w <= 4 && h <= 4 { break; }
+            w = (w / 2).max(4);
+            h = (h / 2).max(4);
+        }
+
+        // Extract mip0 and mip1 from reference (stored smallest-first)
+        let mut offsets = vec![0usize; mip_sizes.len()];
+        let mut off = fctx_hdr_size;
+        for i in (0..mip_sizes.len()).rev() {
+            offsets[i] = off;
+            off += mip_sizes[i];
+        }
+        let ref_mip0 = &ref_data[offsets[0]..offsets[0] + mip_sizes[0]];
+        let ref_mip1 = &ref_data[offsets[1]..offsets[1] + mip_sizes[1]];
+
+        // Generate mip1 from mip0 using our pipeline
+        let our_mip1 = generate_mip(ref_mip0, 512, 512, 256, 256, TextureCodec::Dxt1, false);
+
+        // Find first mismatching block
+        let num_blocks = our_mip1.len() / block_size;
+        let mut first_diff = None;
+        for b in 0..num_blocks {
+            let ours = &our_mip1[b*block_size..(b+1)*block_size];
+            let refs = &ref_mip1[b*block_size..(b+1)*block_size];
+            if ours != refs {
+                first_diff = Some(b);
+                break;
+            }
+        }
+
+        let b = first_diff.expect("No differences found");
+        let our_block = &our_mip1[b*block_size..(b+1)*block_size];
+        let ref_block = &ref_mip1[b*block_size..(b+1)*block_size];
+
+        eprintln!("First mismatching block index: {} (of {})", b, num_blocks);
+        eprintln!("  Ref block: {:02x?}", ref_block);
+        eprintln!("  Our block: {:02x?}", our_block);
+
+        // Decode both blocks to see the pixel difference
+        let ref_pixels = decode_dxt1_block(ref_block);
+        let our_pixels = decode_dxt1_block(our_block);
+        eprintln!("  Ref decoded pixels (first 4):");
+        for i in 0..4 { eprintln!("    [{}: {:?}]", i, ref_pixels[i]); }
+        eprintln!("  Our decoded pixels (first 4):");
+        for i in 0..4 { eprintln!("    [{}: {:?}]", i, our_pixels[i]); }
+
+        // Now decode the 2x2 source blocks from mip0 that feed into this mip1 block
+        // Block b in mip1 (256x256) corresponds to a 2x2 group of blocks in mip0 (512x512)
+        let mip1_blocks_w = 256 / 4; // 64 blocks wide
+        let block_y = b / mip1_blocks_w;
+        let block_x = b % mip1_blocks_w;
+
+        // The 4 source blocks in mip0
+        let mip0_blocks_w = 512 / 4; // 128 blocks wide
+        let src_blocks = [
+            (block_y * 2) * mip0_blocks_w + (block_x * 2),
+            (block_y * 2) * mip0_blocks_w + (block_x * 2 + 1),
+            (block_y * 2 + 1) * mip0_blocks_w + (block_x * 2),
+            (block_y * 2 + 1) * mip0_blocks_w + (block_x * 2 + 1),
+        ];
+
+        eprintln!("\n  Source mip0 blocks for this mip1 block:");
+        for (i, &sb) in src_blocks.iter().enumerate() {
+            let src = &ref_mip0[sb*block_size..(sb+1)*block_size];
+            eprintln!("    src[{}] (block {}): {:02x?}", i, sb, src);
+        }
+
+        // Now generate the input pixels by decoding mip0 and box-filtering
+        // This is what generate_mip does internally. Let's trace it.
+        // Decode the 4 source blocks to get 4x4 pixels each = 8x8 pixel region
+        let mut src_pixels = [[0u8; 4]; 64]; // 8x8
+        for (qi, &sb) in src_blocks.iter().enumerate() {
+            let src_block = &ref_mip0[sb*block_size..(sb+1)*block_size];
+            let decoded = decode_dxt1_block(src_block);
+            let qy = qi / 2; // 0 or 1
+            let qx = qi % 2; // 0 or 1
+            for py in 0..4 {
+                for px in 0..4 {
+                    src_pixels[(qy * 4 + py) * 8 + (qx * 4 + px)] = decoded[py * 4 + px];
+                }
+            }
+        }
+
+        // Box-filter 2x2 to get 4x4 block for the encoder
+        let mut filtered = [[0u8; 4]; 16];
+        for by in 0..4 {
+            for bx in 0..4 {
+                let mut r = 0.0f32;
+                let mut g = 0.0f32;
+                let mut b_val = 0.0f32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let p = src_pixels[(by * 2 + dy) * 8 + (bx * 2 + dx)];
+                        r += p[0] as f32;
+                        g += p[1] as f32;
+                        b_val += p[2] as f32;
+                    }
+                }
+                filtered[by * 4 + bx] = [
+                    (r / 4.0 + 0.5) as u8,
+                    (g / 4.0 + 0.5) as u8,
+                    (b_val / 4.0 + 0.5) as u8,
+                    255,
+                ];
+            }
+        }
+
+        eprintln!("\n  Box-filtered 4x4 pixels (input to encoder):");
+        for row in 0..4 {
+            eprintln!("    row {}: {:?} {:?} {:?} {:?}",
+                row,
+                filtered[row*4], filtered[row*4+1], filtered[row*4+2], filtered[row*4+3]);
+        }
+
+        // Now encode with our encoder and the reference encoder (which we have the output of)
+        let (our_encoded, _) = cluster_fit_4color(&filtered);
+        eprintln!("\n  Encoding the filtered pixels:");
+        eprintln!("    Ref mip1 block: {:02x?}", ref_block);
+        eprintln!("    Our re-encoded: {:02x?}", our_encoded);
+        eprintln!("    Match: {}", our_encoded == ref_block);
+
+        // If our re-encoded matches, the issue is in how generate_mip box-filters
+        // If our re-encoded doesn't match, the issue is in the encoder
+    }
+
 }
