@@ -732,9 +732,10 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 /// Uses bounding-box endpoint selection for speed. Quality is sufficient for
 /// mipmap generation where the source is already DXT-compressed.
 fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
-    // Check for transparent pixels (alpha=0).
-    // DXT1 3-color mode (c0 <= c1) uses index 3 for transparent black.
-    let has_transparent = pixels.iter().any(|p| p[3] == 0);
+    // Check for transparent pixels. DXT1 3-color mode (c0 <= c1) uses index 3
+    // for transparent black. After box filtering, transparent+opaque pixels blend
+    // to intermediate alpha — threshold at 128 to preserve transparency at edges.
+    let has_transparent = pixels.iter().any(|p| p[3] < 128);
 
     if has_transparent {
         let opaque_count = pixels.iter().filter(|p| p[3] > 0).count();
@@ -780,7 +781,7 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
         // Assign indices: transparent → 3, opaque → nearest palette entry
         let mut indices = 0u32;
         for (i, p) in pixels.iter().enumerate() {
-            if p[3] == 0 {
+            if p[3] < 128 {
                 indices |= 3 << (i * 2);
             } else {
                 let pr = p[0] as i16;
