@@ -787,6 +787,7 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usiz
     let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
     let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
     let mut weights: Vec<f32> = Vec::with_capacity(16);
+    let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
     for (_i, p) in pixels.iter().enumerate() {
         let rgb_bytes = [p[0], p[1], p[2]];
         let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
@@ -960,18 +961,23 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let (colors, weights, order, n) = build_color_set(pixels);
 
-    // Precompute cumulative sums for partition search
-    let mut cum_w = vec![0.0f32; n + 1];
-    let mut cum_rgb = vec![[0.0f32; 3]; n + 1];
+    // Pre-multiply colors by weights (matching the original which stores
+    // color*weight at object offset 0x20 in FUN_0067f490)
+    let mut wt_colors = vec![[0.0f32; 3]; n];
     for i in 0..n {
-        cum_w[i + 1] = cum_w[i] + weights[i];
         for k in 0..3 {
-            cum_rgb[i + 1][k] = cum_rgb[i][k] + colors[i][k] * weights[i];
+            wt_colors[i][k] = colors[i][k] * weights[i];
         }
     }
-    let total_rgb = cum_rgb[n];
 
-    // Exhaustive 4-partition search
+    // Precompute totals (matching offsets 0x13c-0x148 in the original)
+    let mut total_rgb = [0.0f32; 3];
+    let mut total_w: f32 = 0.0;
+    for i in 0..n {
+        for k in 0..3 { total_rgb[k] += wt_colors[i][k]; }
+        total_w += weights[i];
+    }
+
     let mut best_err = f32::MAX;
     let mut best_ep0 = [0.0f32; 3];
     let mut best_ep1 = [0.0f32; 3];
@@ -979,86 +985,122 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let mut best_t = 0usize;
     let mut best_u = 0usize;
 
-    // x87 emulation: compute at f64 (proxy for 80-bit extended), truncate to f32
-    // at each named variable. This matches the original's x87 FPU behavior where
-    // intermediates are computed at 80-bit precision but stored to 32-bit float
-    // stack variables via fstp dword.
-    //
-    // Helper: compute expression at f64, truncate result to f32.
-    // f64 has enough mantissa bits (53) that f32*f32 products are exact in f64,
-    // so the final f32 rounding matches x87's 80-bit→32-bit rounding.
+    // Incremental accumulation matching the original's triple-nested loop
+    // structure (FUN_0067e280). Each loop accumulates partial sums one color
+    // at a time, avoiding cumulative-sum-with-difference which rounds differently.
+
+    // f64 intermediates emulate x87: compute at extended precision, store to f32.
     macro_rules! f32via64 {
         ($expr:expr) => { ($expr) as f32 }
     }
 
+    // Outer loop: boundary s, group A = sorted[0..s]
+    let mut outer_rgb = [0.0f32; 3];
+    let mut outer_w: f32 = 0.0;
+
     for s in 0..=n {
-        let w_a = cum_w[s];
+        // Middle loop: boundary t, group B = sorted[s..t]
+        let mut mid_rgb = [0.0f32; 3];
+        let mut mid_w: f32 = 0.0;
+
         for t in s..=n {
-            let w_b = cum_w[t] - cum_w[s];
+            // Precompute values constant across inner loop
+            // (matching fStack_6c, fStack_68, fStack_7c, fStack_64 in the original)
+            let aa_partial: f32 = f32via64!(mid_w as f64 * (4.0f64 / 9.0) + outer_w as f64);
+            let remaining_w: f32 = f32via64!((total_w as f64 - outer_w as f64) - mid_w as f64);
+            let bb_mid_term: f32 = f32via64!(mid_w as f64 * (1.0f64 / 9.0));
+            let mut beta_a_mid = [0.0f32; 3];
+            for k in 0..3 {
+                beta_a_mid[k] = f32via64!(mid_rgb[k] as f64 * (2.0f64 / 3.0));
+            }
+
+            // Inner loop: boundary u, group C = sorted[t..u]
+            let mut inner_rgb = [0.0f32; 3];
+            let mut inner_w: f32 = 0.0;
+
             for u in t..=n {
-                let w_c = cum_w[u] - cum_w[t];
-                let w_d = cum_w[n] - cum_w[u];
+                // Partition metrics from incremental sums
+                let alpha_aa: f32 = f32via64!(inner_w as f64 * (1.0f64 / 9.0) + aa_partial as f64);
+                let alpha_bb: f32 = f32via64!(inner_w as f64 * (4.0f64 / 9.0)
+                    + (remaining_w as f64 - inner_w as f64) + bb_mid_term as f64);
+                let alpha_ab: f32 = f32via64!((inner_w as f64 + mid_w as f64) * (2.0f64 / 9.0));
 
-                // Each alpha is stored to f32 (fstp dword), but the sub-expressions
-                // stay at extended precision within the FPU
-                let alpha_aa: f32 = f32via64!(w_a as f64 + w_b as f64 * (4.0f64 / 9.0) + w_c as f64 * (1.0f64 / 9.0));
-                let alpha_bb: f32 = f32via64!(w_d as f64 + w_c as f64 * (4.0f64 / 9.0) + w_b as f64 * (1.0f64 / 9.0));
-                let alpha_ab: f32 = f32via64!((w_b as f64 + w_c as f64) * (2.0f64 / 9.0));
+                let det: f32 = f32via64!(alpha_aa as f64 * alpha_bb as f64
+                    - alpha_ab as f64 * alpha_ab as f64);
 
-                // Determinant: the products stay at extended precision before subtraction,
-                // avoiding catastrophic cancellation at f32
-                let det: f32 = f32via64!(alpha_aa as f64 * alpha_bb as f64 - alpha_ab as f64 * alpha_ab as f64);
-                if det.abs() < 1e-6 { continue; }
-                let inv_det: f32 = f32via64!(1.0f64 / det as f64);
+                if det.abs() >= f32::MIN_POSITIVE {
+                    let inv_det: f32 = f32via64!(1.0f64 / det as f64);
 
-                let sum_a = cum_rgb[s];
-                let sum_b = [cum_rgb[t][0] - cum_rgb[s][0], cum_rgb[t][1] - cum_rgb[s][1], cum_rgb[t][2] - cum_rgb[s][2]];
-                let sum_c = [cum_rgb[u][0] - cum_rgb[t][0], cum_rgb[u][1] - cum_rgb[t][1], cum_rgb[u][2] - cum_rgb[t][2]];
-                let sum_d = [total_rgb[0] - cum_rgb[u][0], total_rgb[1] - cum_rgb[u][1], total_rgb[2] - cum_rgb[u][2]];
+                    let mut ep_a = [0.0f32; 3];
+                    let mut ep_b = [0.0f32; 3];
+                    for k in 0..3 {
+                        // beta_a = outer_rgb + mid_rgb*2/3 + inner_rgb*1/3
+                        // (matching the original's incremental formula)
+                        let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
+                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * (1.0f64 / 3.0));
+                        // beta_b = total - beta_a (matching the original's subtraction)
+                        let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
 
-                let mut ep_a = [0.0f32; 3];
-                let mut ep_b = [0.0f32; 3];
-                for k in 0..3 {
-                    // beta values: computed at extended precision, stored to f32
-                    let beta_a: f32 = f32via64!(sum_a[k] as f64 + sum_b[k] as f64 * (2.0f64 / 3.0) + sum_c[k] as f64 * (1.0f64 / 3.0));
-                    let beta_b: f32 = f32via64!(sum_d[k] as f64 + sum_c[k] as f64 * (2.0f64 / 3.0) + sum_b[k] as f64 * (1.0f64 / 3.0));
-                    // Endpoint solve: each multiply-subtract stays at extended precision
-                    let a_k: f32 = f32via64!((beta_a as f64 * alpha_bb as f64 - beta_b as f64 * alpha_ab as f64) * inv_det as f64);
-                    let b_k: f32 = f32via64!((beta_b as f64 * alpha_aa as f64 - beta_a as f64 * alpha_ab as f64) * inv_det as f64);
-                    ep_a[k] = a_k.clamp(0.0, 1.0);
-                    ep_b[k] = b_k.clamp(0.0, 1.0);
+                        let a_k: f32 = f32via64!((beta_a as f64 * alpha_bb as f64
+                            - beta_b as f64 * alpha_ab as f64) * inv_det as f64);
+                        let b_k: f32 = f32via64!((beta_b as f64 * alpha_aa as f64
+                            - beta_a as f64 * alpha_ab as f64) * inv_det as f64);
+                        ep_a[k] = a_k.clamp(0.0, 1.0);
+                        ep_b[k] = b_k.clamp(0.0, 1.0);
+                    }
+
+                    // Grid-snap: quantize to 5/6/5 then dequantize
+                    let grids = [31.0f64, 63.0, 31.0];
+                    let inv_grids = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
+                    for k in 0..3 {
+                        ep_a[k] = f32via64!((ep_a[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
+                        ep_b[k] = f32via64!((ep_b[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
+                    }
+
+                    // Error: recompute betas for grid-snapped error evaluation
+                    let mut err = 0.0f32;
+                    for k in 0..3 {
+                        let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
+                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * (1.0f64 / 3.0));
+                        let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
+                        let ch_err: f32 = f32via64!(
+                            alpha_aa as f64 * ep_a[k] as f64 * ep_a[k] as f64
+                            + alpha_bb as f64 * ep_b[k] as f64 * ep_b[k] as f64
+                            + 2.0f64 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
+                            - 2.0f64 * (beta_a as f64 * ep_a[k] as f64
+                                + beta_b as f64 * ep_b[k] as f64)
+                        );
+                        err += ch_err;
+                    }
+
+                    if err < best_err {
+                        best_err = err;
+                        best_ep0 = ep_a;
+                        best_ep1 = ep_b;
+                        best_s = s;
+                        best_t = t;
+                        best_u = u;
+                    }
                 }
 
-                // Grid-snap: quantize to 5/6/5 then dequantize back
-                for k in 0..3 {
-                    let grid = [31.0f64, 63.0, 31.0][k];
-                    let inv = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0][k];
-                    ep_a[k] = f32via64!((ep_a[k] as f64 * grid + 0.5).floor() * inv);
-                    ep_b[k] = f32via64!((ep_b[k] as f64 * grid + 0.5).floor() * inv);
-                }
-
-                let mut err = 0.0f32;
-                for k in 0..3 {
-                    let beta_a: f32 = f32via64!(sum_a[k] as f64 + sum_b[k] as f64 * (2.0f64 / 3.0) + sum_c[k] as f64 * (1.0f64 / 3.0));
-                    let beta_b: f32 = f32via64!(sum_d[k] as f64 + sum_c[k] as f64 * (2.0f64 / 3.0) + sum_b[k] as f64 * (1.0f64 / 3.0));
-                    // Error per channel: entire expression at extended precision, then store to f32
-                    let ch_err: f32 = f32via64!(
-                        alpha_aa as f64 * ep_a[k] as f64 * ep_a[k] as f64
-                        + alpha_bb as f64 * ep_b[k] as f64 * ep_b[k] as f64
-                        + 2.0f64 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
-                        - 2.0f64 * (beta_a as f64 * ep_a[k] as f64 + beta_b as f64 * ep_b[k] as f64)
-                    );
-                    err += ch_err;
-                }
-                if err < best_err {
-                    best_err = err;
-                    best_ep0 = ep_a;
-                    best_ep1 = ep_b;
-                    best_s = s;
-                    best_t = t;
-                    best_u = u;
+                // Advance inner accumulation (add color[u] to inner sums)
+                if u < n {
+                    for k in 0..3 { inner_rgb[k] += wt_colors[u][k]; }
+                    inner_w += weights[u];
                 }
             }
+
+            // Advance middle accumulation
+            if t < n {
+                for k in 0..3 { mid_rgb[k] += wt_colors[t][k]; }
+                mid_w += weights[t];
+            }
+        }
+
+        // Advance outer accumulation
+        if s < n {
+            for k in 0..3 { outer_rgb[k] += wt_colors[s][k]; }
+            outer_w += weights[s];
         }
     }
 
@@ -1097,9 +1139,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
         unique_to_index[i] = idx;
     }
 
-    // Step 2: For each pixel, find its unique color, look up sorted position, get index
-    // We need to re-do the dedup mapping since build_color_set doesn't return it.
-    // Rebuild the pixel → unique color mapping.
+    // Map each pixel through dedup + sort to find its partition group index.
     let mut color_bytes_list: Vec<[u8; 3]> = Vec::with_capacity(16);
     let mut pixel_to_unique = [0usize; 16];
     for (i, p) in pixels.iter().enumerate() {
@@ -1115,8 +1155,6 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
         pixel_to_unique[i] = unique_idx;
     }
 
-    // order[sorted_pos] = original_unique_idx, so we need the inverse:
-    // inv_order[original_unique_idx] = sorted_pos
     let mut inv_order = vec![0usize; n];
     for (sorted_pos, &orig_idx) in order.iter().enumerate() {
         inv_order[orig_idx] = sorted_pos;
