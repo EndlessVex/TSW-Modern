@@ -1257,7 +1257,10 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                 // beta_a values computed with beta_a_mid + outer at 80-bit (via FST keep).
                 let det = x87_cross_f32(alpha_aa, alpha_bb, alpha_ab, alpha_ab);
 
-                if det.abs() >= f32::MIN_POSITIVE {
+                // Original has NO det check — computes 1/det unconditionally.
+                // Infinity from zero det gets clamped to [0,1], producing high
+                // error that loses the partition comparison naturally.
+                if true {
                     // Compute all beta values first (matching original's sequence)
                     let beta_a = [
                         x87_add_fma_f32(beta_a_mid[0], outer_rgb[0], inner_rgb[0], c_1_3),
@@ -1369,18 +1372,31 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                         ep_b[k] = (qb * inv_vals[k] as f64) as f32;
                     }
 
-                    // Error computation
+                    // Error computation — per-channel error at extended precision (80-bit),
+                    // then stored to f32 per channel, accumulated in f32.
+                    // The Python trace showed competing partitions differ by only 0.006 in
+                    // error. x87's 80-bit intermediate precision during the multi-term
+                    // error sum causes different partitions to win vs f32.
                     let mut err = 0.0f32;
                     for k in 0..3 {
                         let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
                         let beta_b = x87_sub_f32(total_rgb[k], beta_a);
 
-                        // aa*ea^2 + bb*eb^2 + 2*ab*ea*eb - 2*(ba*ea + bb_val*eb)
-                        let t1 = alpha_aa * ep_a[k] * ep_a[k];
-                        let t2 = alpha_bb * ep_b[k] * ep_b[k];
-                        let t3 = c_2 * alpha_ab * ep_a[k] * ep_b[k];
-                        let t4 = c_2 * (beta_a * ep_a[k] + beta_b * ep_b[k]);
-                        let ch_err = t1 + t2 + t3 - t4;
+                        // Error computation matching original's structure (from decompilation):
+                        // The original separates into "cross" and "diag" terms with
+                        // separate f32 stores, then combines as cross*2 + diag.
+                        // This gives different f32 truncation than our previous single-expression.
+                        let ea = ep_a[k];
+                        let eb = ep_b[k];
+                        // diag = ea²*aa + eb²*bb (stored to f32)
+                        let diag: f32 = (ea as f64 * ea as f64 * alpha_aa as f64
+                            + eb as f64 * eb as f64 * alpha_bb as f64) as f32;
+                        // cross = eb*ea*ab - beta_a*ea - eb*beta_b (stored to f32)
+                        let cross: f32 = (eb as f64 * ea as f64 * alpha_ab as f64
+                            - beta_a as f64 * ea as f64
+                            - eb as f64 * beta_b as f64) as f32;
+                        // ch_err = cross*2 + diag (stored to f32)
+                        let ch_err: f32 = (cross as f64 * 2.0 + diag as f64) as f32;
                         err += ch_err;
                     }
 
