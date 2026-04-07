@@ -1011,7 +1011,6 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                 let sum_c = [cum_rgb[u][0] - cum_rgb[t][0], cum_rgb[u][1] - cum_rgb[t][1], cum_rgb[u][2] - cum_rgb[t][2]];
                 let sum_d = [total_rgb[0] - cum_rgb[u][0], total_rgb[1] - cum_rgb[u][1], total_rgb[2] - cum_rgb[u][2]];
 
-                let mut err = 0.0f64;
                 let mut ep_a = [0.0f64; 3];
                 let mut ep_b = [0.0f64; 3];
                 for k in 0..3 {
@@ -1021,6 +1020,22 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                     let b_k = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det;
                     ep_a[k] = a_k.clamp(0.0, 1.0);
                     ep_b[k] = b_k.clamp(0.0, 1.0);
+                }
+
+                // Grid-snap: quantize to 5/6/5 then dequantize back,
+                // matching the original encoder which evaluates error
+                // using grid-aligned endpoints
+                let grid = [31.0f64, 63.0, 31.0];
+                let inv_grid = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
+                for k in 0..3 {
+                    ep_a[k] = (ep_a[k] * grid[k] + 0.5).floor() * inv_grid[k];
+                    ep_b[k] = (ep_b[k] * grid[k] + 0.5).floor() * inv_grid[k];
+                }
+
+                let mut err = 0.0f64;
+                for k in 0..3 {
+                    let beta_a = sum_a[k] + sum_b[k] * (2.0f64 / 3.0) + sum_c[k] * (1.0f64 / 3.0);
+                    let beta_b = sum_d[k] + sum_c[k] * (2.0f64 / 3.0) + sum_b[k] * (1.0f64 / 3.0);
                     err += alpha_aa * ep_a[k] * ep_a[k]
                         + alpha_bb * ep_b[k] * ep_b[k]
                         + 2.0 * alpha_ab * ep_a[k] * ep_b[k]
