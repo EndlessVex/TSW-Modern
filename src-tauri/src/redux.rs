@@ -975,21 +975,27 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
 
+    // Convert to f32 at the boundary (build_color_set returns f64)
+    let colors: Vec<[f32; 3]> = sorted_colors.iter()
+        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
+    let weights: Vec<f32> = sorted_weights.iter()
+        .map(|&w| w as f32).collect();
+
     // Precompute cumulative sums for partition search
-    let mut cum_w = vec![0.0f64; n + 1];
-    let mut cum_rgb = vec![[0.0f64; 3]; n + 1];
+    let mut cum_w = vec![0.0f32; n + 1];
+    let mut cum_rgb = vec![[0.0f32; 3]; n + 1];
     for i in 0..n {
-        cum_w[i + 1] = cum_w[i] + sorted_weights[i];
+        cum_w[i + 1] = cum_w[i] + weights[i];
         for k in 0..3 {
-            cum_rgb[i + 1][k] = cum_rgb[i][k] + sorted_colors[i][k] * sorted_weights[i];
+            cum_rgb[i + 1][k] = cum_rgb[i][k] + colors[i][k] * weights[i];
         }
     }
     let total_rgb = cum_rgb[n];
 
     // Exhaustive 4-partition search
-    let mut best_err = f64::MAX;
-    let mut best_ep0 = [0.0f64; 3];
-    let mut best_ep1 = [0.0f64; 3];
+    let mut best_err = f32::MAX;
+    let mut best_ep0 = [0.0f32; 3];
+    let mut best_ep1 = [0.0f32; 3];
 
     for s in 0..=n {
         let w_a = cum_w[s];
@@ -999,43 +1005,41 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                 let w_c = cum_w[u] - cum_w[t];
                 let w_d = cum_w[n] - cum_w[u];
 
-                let alpha_aa = w_a + w_b * (4.0f64 / 9.0) + w_c * (1.0f64 / 9.0);
-                let alpha_bb = w_d + w_c * (4.0f64 / 9.0) + w_b * (1.0f64 / 9.0);
-                let alpha_ab = (w_b + w_c) * (2.0f64 / 9.0);
+                let alpha_aa = w_a + w_b * (4.0f32 / 9.0) + w_c * (1.0f32 / 9.0);
+                let alpha_bb = w_d + w_c * (4.0f32 / 9.0) + w_b * (1.0f32 / 9.0);
+                let alpha_ab = (w_b + w_c) * (2.0f32 / 9.0);
                 let det = alpha_aa * alpha_bb - alpha_ab * alpha_ab;
-                if det.abs() < 1e-10 { continue; }
-                let inv_det = 1.0 / det;
+                if det.abs() < 1e-6 { continue; }
+                let inv_det: f32 = 1.0 / det;
 
                 let sum_a = cum_rgb[s];
                 let sum_b = [cum_rgb[t][0] - cum_rgb[s][0], cum_rgb[t][1] - cum_rgb[s][1], cum_rgb[t][2] - cum_rgb[s][2]];
                 let sum_c = [cum_rgb[u][0] - cum_rgb[t][0], cum_rgb[u][1] - cum_rgb[t][1], cum_rgb[u][2] - cum_rgb[t][2]];
                 let sum_d = [total_rgb[0] - cum_rgb[u][0], total_rgb[1] - cum_rgb[u][1], total_rgb[2] - cum_rgb[u][2]];
 
-                let mut ep_a = [0.0f64; 3];
-                let mut ep_b = [0.0f64; 3];
+                let mut ep_a = [0.0f32; 3];
+                let mut ep_b = [0.0f32; 3];
                 for k in 0..3 {
-                    let beta_a = sum_a[k] + sum_b[k] * (2.0f64 / 3.0) + sum_c[k] * (1.0f64 / 3.0);
-                    let beta_b = sum_d[k] + sum_c[k] * (2.0f64 / 3.0) + sum_b[k] * (1.0f64 / 3.0);
+                    let beta_a = sum_a[k] + sum_b[k] * (2.0f32 / 3.0) + sum_c[k] * (1.0f32 / 3.0);
+                    let beta_b = sum_d[k] + sum_c[k] * (2.0f32 / 3.0) + sum_b[k] * (1.0f32 / 3.0);
                     let a_k = (beta_a * alpha_bb - beta_b * alpha_ab) * inv_det;
                     let b_k = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det;
                     ep_a[k] = a_k.clamp(0.0, 1.0);
                     ep_b[k] = b_k.clamp(0.0, 1.0);
                 }
 
-                // Grid-snap: quantize to 5/6/5 then dequantize back,
-                // matching the original encoder which evaluates error
-                // using grid-aligned endpoints
-                let grid = [31.0f64, 63.0, 31.0];
-                let inv_grid = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
+                // Grid-snap: quantize to 5/6/5 then dequantize back
+                let grid = [31.0f32, 63.0, 31.0];
+                let inv_grid = [1.0f32 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
                 for k in 0..3 {
                     ep_a[k] = (ep_a[k] * grid[k] + 0.5).floor() * inv_grid[k];
                     ep_b[k] = (ep_b[k] * grid[k] + 0.5).floor() * inv_grid[k];
                 }
 
-                let mut err = 0.0f64;
+                let mut err = 0.0f32;
                 for k in 0..3 {
-                    let beta_a = sum_a[k] + sum_b[k] * (2.0f64 / 3.0) + sum_c[k] * (1.0f64 / 3.0);
-                    let beta_b = sum_d[k] + sum_c[k] * (2.0f64 / 3.0) + sum_b[k] * (1.0f64 / 3.0);
+                    let beta_a = sum_a[k] + sum_b[k] * (2.0f32 / 3.0) + sum_c[k] * (1.0f32 / 3.0);
+                    let beta_b = sum_d[k] + sum_c[k] * (2.0f32 / 3.0) + sum_b[k] * (1.0f32 / 3.0);
                     err += alpha_aa * ep_a[k] * ep_a[k]
                         + alpha_bb * ep_b[k] * ep_b[k]
                         + 2.0 * alpha_ab * ep_a[k] * ep_b[k]
@@ -1050,7 +1054,8 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
         }
     }
 
-    // Quantize to RGB565
+    // Quantize to RGB565 (endpoints are already grid-snapped,
+    // but we re-quantize here for the integer values)
     let r0 = (best_ep0[0] * 31.0 + 0.5).floor().clamp(0.0, 31.0) as u8;
     let g0 = (best_ep0[1] * 63.0 + 0.5).floor().clamp(0.0, 63.0) as u8;
     let b0 = (best_ep0[2] * 31.0 + 0.5).floor().clamp(0.0, 31.0) as u8;
@@ -1090,7 +1095,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     }
 
     // Now enforce 4-color mode: c0 > c1. If we need to swap, XOR bit 0 of
-    // each 2-bit index (the game's remapping: 0↔1, 2↔3).
+    // each 2-bit index (the game's remapping: 0<->1, 2<->3).
     if c0 < c1 {
         std::mem::swap(&mut c0, &mut c1);
         let mut remapped = 0u32;
