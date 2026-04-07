@@ -692,19 +692,16 @@ fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new
 
 // ─── DXT1 decode/encode ──────────────────────────────────────────────────────
 
-/// Decode RGB565 → (R, G, B) as u8 using bit-replication.
-/// This matches squish/NVTT's decode formula: (r << 3) | (r >> 2) for 5-bit,
-/// (g << 2) | (g >> 4) for 6-bit. Our previous formula (r * 255 / 31) gave
-/// values off by 1 for many inputs, cascading through mip generation.
+/// Decode RGB565 → (R, G, B) as u8.
 #[inline]
 fn decode_rgb565(c: u16) -> (u8, u8, u8) {
-    let r = ((c >> 11) & 0x1F) as u8;
-    let g = ((c >> 5) & 0x3F) as u8;
-    let b = (c & 0x1F) as u8;
+    let r = ((c >> 11) & 0x1F) as u32;
+    let g = ((c >> 5) & 0x3F) as u32;
+    let b = (c & 0x1F) as u32;
     (
-        (r << 3) | (r >> 2),
-        (g << 2) | (g >> 4),
-        (b << 3) | (b >> 2),
+        (r * 255 / 31) as u8,
+        (g * 255 / 63) as u8,
+        (b * 255 / 31) as u8,
     )
 }
 
