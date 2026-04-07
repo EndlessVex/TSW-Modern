@@ -266,7 +266,23 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    // ── 5. Generate all mips, then write SMALLEST-FIRST ────────────
+    // ── 5. Detect DXT1a binary alpha ─────────────────────────────────
+    // If ANY mip0 block uses 3-color mode (c0 <= c1), force all generated mips
+    // to use 3-color mode, matching the ClientPatcher's binaryAlpha flag.
+    let has_binary_alpha = if codec == TextureCodec::Dxt1 {
+        let block_count = (stream1.width / 4).max(1) * (stream1.height / 4).max(1);
+        (0..block_count).any(|i| {
+            let off = i * 8;
+            if off + 4 > mip_sizes[0] { return false; }
+            let c0 = u16::from_le_bytes([mip0_data[off], mip0_data[off + 1]]);
+            let c1 = u16::from_le_bytes([mip0_data[off + 2], mip0_data[off + 3]]);
+            c0 <= c1  // 3-color mode = has transparency
+        })
+    } else {
+        false
+    };
+
+    // ── 6. Generate all mips, then write SMALLEST-FIRST ────────────
     // The FCTX format stores mips smallest-first (1x1 at start, full mip0 at end).
     let mut all_mips: Vec<Vec<u8>> = vec![mip0_data[..mip_sizes[0]].to_vec()];
     let mut current_w = stream1.width;
@@ -278,6 +294,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
 
         let mip_data = generate_mip(
             &all_mips[mip_idx - 1], current_w, current_h, new_w, new_h, codec,
+            has_binary_alpha,
         );
 
         if mip_data.len() != mip_sizes[mip_idx] {
@@ -359,7 +376,7 @@ fn decompress_mixd(
         for mip_idx in 1..mip_count {
             let nw = (cw / 2).max(4);
             let nh = (ch / 2).max(4);
-            let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2);
+            let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2, false);
             ati2_mips.push(mip);
             cw = nw;
             ch = nh;
@@ -406,7 +423,7 @@ fn decompress_mixd(
     for mip_idx in 1..mip_count {
         let nw = (cw / 2).max(4);
         let nh = (ch / 2).max(4);
-        let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2);
+        let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2, false);
         ati2_mips.push(mip);
         cw = nw;
         ch = nh;
@@ -488,6 +505,7 @@ fn generate_mip(
     new_w: usize,
     new_h: usize,
     codec: TextureCodec,
+    force_3color: bool,
 ) -> Vec<u8> {
     let block_size = codec.block_size();
     let prev_bx = (prev_w / 4).max(1);
@@ -555,7 +573,7 @@ fn generate_mip(
                 }
             }
             match codec {
-                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels)),
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels, force_3color)),
                 TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&block_pixels)),
                 TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&block_pixels)),
             }
@@ -1163,7 +1181,7 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 ///
 /// Uses WeightedClusterFit matching squish (ClientPatcher). Tries both 3-color
 /// and 4-color modes for opaque blocks and picks the lower error.
-fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
+fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
     // Check for transparent pixels. DXT1 3-color mode (c0 <= c1) uses index 3
     // for transparent black. After box filtering, transparent+opaque pixels blend
     // to intermediate alpha — threshold at 128 to preserve transparency at edges.
@@ -1247,7 +1265,14 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    // ── WeightedClusterFit: try both modes, pick lower error ──
+    // ── WeightedClusterFit ──
+    // If texture has binary alpha, force 3-color mode for all blocks
+    if force_3color {
+        let (block_3, _) = cluster_fit_3color(pixels);
+        return block_3;
+    }
+
+    // Otherwise try both modes and pick lower error
     let (block_3, err_3) = cluster_fit_3color(pixels);
     let (block_4, err_4) = cluster_fit_4color(pixels);
     if err_3 <= err_4 { block_3 } else { block_4 }
@@ -1317,8 +1342,8 @@ fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
     }
     let alpha_block = encode_bc4_block(&alpha_values);
 
-    // Color portion (DXT1)
-    let color_block = encode_dxt1_block(pixels);
+    // Color portion (DXT1) — DXT5 never uses binary alpha
+    let color_block = encode_dxt1_block(pixels, false);
 
     // DXT5 = alpha(8) + color(8)
     let mut out = [0u8; 16];
@@ -1726,7 +1751,7 @@ mod tests {
         }
 
         // Re-encode should produce a valid block
-        let re_encoded = encode_dxt1_block(&pixels);
+        let re_encoded = encode_dxt1_block(&pixels, false);
         assert_eq!(re_encoded.len(), 8);
     }
 
@@ -1742,7 +1767,7 @@ mod tests {
                 255,
             ];
         }
-        let encoded = encode_dxt1_block(&pixels);
+        let encoded = encode_dxt1_block(&pixels, false);
         let decoded = decode_dxt1_block(&encoded);
         let mut total_err = 0u64;
         for i in 0..16 {
@@ -1862,7 +1887,7 @@ mod tests {
         let pixels = decode_dxt1_block(&block);
         assert_eq!(pixels[0][3], 0, "Should decode as transparent");
 
-        let re_encoded = encode_dxt1_block(&pixels);
+        let re_encoded = encode_dxt1_block(&pixels, false);
         let re_decoded = decode_dxt1_block(&re_encoded);
         for i in 0..16 {
             assert_eq!(re_decoded[i][3], 0,
@@ -1876,7 +1901,7 @@ mod tests {
         for i in 0..8 { pixels[i] = [255, 0, 0, 255]; }
         for i in 8..16 { pixels[i] = [0, 0, 0, 0]; }
 
-        let encoded = encode_dxt1_block(&pixels);
+        let encoded = encode_dxt1_block(&pixels, false);
         let c0 = u16::from_le_bytes([encoded[0], encoded[1]]);
         let c1 = u16::from_le_bytes([encoded[2], encoded[3]]);
         assert!(c0 <= c1, "Should be 3-color mode, got c0={} c1={}", c0, c1);
@@ -1894,7 +1919,7 @@ mod tests {
     fn test_dxt1_opaque_unchanged() {
         let mut pixels = [[0u8; 4]; 16];
         for i in 0..16 { pixels[i] = [128, 64, 32, 255]; }
-        let encoded = encode_dxt1_block(&pixels);
+        let encoded = encode_dxt1_block(&pixels, false);
         let decoded = decode_dxt1_block(&encoded);
         for i in 0..16 {
             assert_eq!(decoded[i][3], 255, "Opaque pixel {} got alpha={}", i, decoded[i][3]);
