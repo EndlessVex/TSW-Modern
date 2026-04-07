@@ -801,18 +801,24 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
     }
     for k in 0..3 { centroid[k] /= total_weight; }
 
+    // Set x87 to extended precision for PCA (matching original 32-bit x87 behavior)
+    #[cfg(target_arch = "x86_64")]
+    let saved_cw = unsafe { x87_set_extended_precision() };
+
     // Weighted covariance matrix [rr, rg, rb, gg, gb, bb]
+    // Each element is accumulated via x87: w*dr*dr stays at 80-bit, stored to f32
     let mut cov = [0.0f32; 6];
     for (c, &w) in colors.iter().zip(weights.iter()) {
         let dr = c[0] - centroid[0];
         let dg = c[1] - centroid[1];
         let db = c[2] - centroid[2];
-        cov[0] += w * dr * dr;
-        cov[1] += w * dr * dg;
-        cov[2] += w * dr * db;
-        cov[3] += w * dg * dg;
-        cov[4] += w * dg * db;
-        cov[5] += w * db * db;
+        // x87 fma: w*dr*dr at 80-bit, then add to accumulator
+        cov[0] += x87_fma_f32(dr, dr, 0.0) * w;
+        cov[1] += x87_fma_f32(dr, dg, 0.0) * w;
+        cov[2] += x87_fma_f32(dr, db, 0.0) * w;
+        cov[3] += x87_fma_f32(dg, dg, 0.0) * w;
+        cov[4] += x87_fma_f32(dg, db, 0.0) * w;
+        cov[5] += x87_fma_f32(db, db, 0.0) * w;
     }
 
     // Power iteration — 8 iterations, seed = max-magnitude row
@@ -825,16 +831,21 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
         let mut best_row = 0;
         let mut best_mag = 0.0f32;
         for (i, row) in rows.iter().enumerate() {
-            let mag = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
+            // x87 dot product for magnitude
+            let t1 = x87_fma_f32(row[0], row[0], 0.0);
+            let t2 = x87_fma_f32(row[1], row[1], 0.0);
+            let t3 = x87_fma_f32(row[2], row[2], 0.0);
+            let mag = t1 + t2 + t3;
             if mag > best_mag { best_mag = mag; best_row = i; }
         }
         rows[best_row]
     };
     for _ in 0..8 {
+        // Matrix-vector product at x87 precision
         let next = [
-            cov[0] * axis[0] + cov[1] * axis[1] + cov[2] * axis[2],
-            cov[1] * axis[0] + cov[3] * axis[1] + cov[4] * axis[2],
-            cov[2] * axis[0] + cov[4] * axis[1] + cov[5] * axis[2],
+            x87_fma_f32(cov[0], axis[0], x87_fma_f32(cov[1], axis[1], 0.0)) + cov[2] * axis[2],
+            x87_fma_f32(cov[1], axis[0], x87_fma_f32(cov[3], axis[1], 0.0)) + cov[4] * axis[2],
+            x87_fma_f32(cov[2], axis[0], x87_fma_f32(cov[4], axis[1], 0.0)) + cov[5] * axis[2],
         ];
         let max_abs = next[0].abs().max(next[1].abs()).max(next[2].abs());
         if max_abs > 0.0 {
@@ -848,8 +859,12 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
     // Project colors onto axis and insertion-sort ascending
     let mut order: Vec<usize> = (0..n).collect();
     let mut dots: Vec<f32> = colors.iter().map(|c| {
-        c[0] * axis[0] + c[1] * axis[1] + c[2] * axis[2]
+        // Dot product at x87 precision for sort-critical projection
+        x87_fma_f32(c[0], axis[0], x87_fma_f32(c[1], axis[1], 0.0)) + c[2] * axis[2]
     }).collect();
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe { x87_restore(saved_cw); }
     for i in 1..n {
         let key_dot = dots[i];
         let key_idx = order[i];
@@ -942,7 +957,140 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 
 /// 4-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
+// ─── x87 FPU helpers for byte-exact replication ─────────────────────────────
+// The original 32-bit encoder uses x87 with 64-bit extended precision (80-bit).
+// On x86-64 Windows, the x87 FPU defaults to 53-bit (double) precision.
+// These helpers set the FPU to extended precision, matching the original.
+
+/// Set x87 FPU to 64-bit extended precision. Returns the saved control word.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x87_set_extended_precision() -> u16 {
+    let mut save_cw: u16 = 0;
+    let mut new_cw: u16 = 0;
+    unsafe {
+        std::arch::asm!(
+            "fnstcw [{save}]",
+            "mov ax, [{save}]",
+            "or ax, 0x0300",       // set PC bits to 11 (extended precision)
+            "mov [{new}], ax",
+            "fldcw [{new}]",
+            save = in(reg) &mut save_cw,
+            new = in(reg) &mut new_cw,
+            out("ax") _,
+        );
+    }
+    save_cw
+}
+
+/// Restore x87 FPU control word.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x87_restore(saved_cw: u16) {
+    let cw = saved_cw;
+    unsafe {
+        std::arch::asm!(
+            "fldcw [{cw}]",
+            cw = in(reg) &cw,
+        );
+    }
+}
+
+/// Compute (a * b - c * d) at x87 80-bit precision, return as f32.
+/// Matches: fld a; fmul b; fld c; fmul d; fsubp; fstp result
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_cross_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{a}]",
+            "fmul dword ptr [{b}]",
+            "fld dword ptr [{c}]",
+            "fmul dword ptr [{d}]",
+            "fsubp",
+            "fstp dword ptr [{out}]",
+            a = in(reg) &a, b = in(reg) &b,
+            c = in(reg) &c, d = in(reg) &d,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
+/// Compute a * b + c at x87 80-bit precision, return as f32.
+/// Matches: fld a; fmul b; fadd c; fstp result
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{a}]",
+            "fmul dword ptr [{b}]",
+            "fadd dword ptr [{c}]",
+            "fstp dword ptr [{out}]",
+            a = in(reg) &a, b = in(reg) &b,
+            c = in(reg) &c,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
+/// Compute 1.0 / a at x87 80-bit precision, return as f32.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_rcp_f32(a: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    let one: f32 = 1.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{one}]",
+            "fdiv dword ptr [{a}]",
+            "fstp dword ptr [{out}]",
+            one = in(reg) &one, a = in(reg) &a,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
+/// Compute (a * b - c * d) * e at x87 80-bit precision, return as f32.
+/// Matches: fld a; fmul b; fld c; fmul d; fsubp; fmul e; fstp result
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_cross_mul_f32(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{a}]",
+            "fmul dword ptr [{b}]",
+            "fld dword ptr [{c}]",
+            "fmul dword ptr [{d}]",
+            "fsubp",
+            "fmul dword ptr [{e}]",
+            "fstp dword ptr [{out}]",
+            a = in(reg) &a, b = in(reg) &b,
+            c = in(reg) &c, d = in(reg) &d,
+            e = in(reg) &e,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
+    // Set x87 FPU to 64-bit extended precision (matching original 32-bit code)
+    #[cfg(target_arch = "x86_64")]
+    let saved_cw = unsafe { x87_set_extended_precision() };
+
     let (colors, weights, order, n) = build_color_set(pixels, dedup);
 
     // Pre-multiply colors by weights (matching the original which stores
@@ -990,12 +1138,28 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
         for t in s..=n {
             // Precompute values constant across inner loop
             // (matching fStack_6c, fStack_68, fStack_7c, fStack_64 in the original)
-            let aa_partial: f32 = f32via64!(mid_w as f64 * ((4.0f32 / 9.0) as f64) + outer_w as f64);
-            let remaining_w: f32 = f32via64!((total_w as f64 - outer_w as f64) - mid_w as f64);
-            let bb_mid_term: f32 = f32via64!(mid_w as f64 * ((1.0f32 / 9.0) as f64));
+            let c_4_9: f32 = 4.0 / 9.0;
+            let c_1_9: f32 = 1.0 / 9.0;
+            let c_2_9: f32 = 2.0 / 9.0;
+            let c_2_3: f32 = 2.0 / 3.0;
+            let c_1_3: f32 = 1.0 / 3.0;
+            let c_1_31: f32 = 1.0 / 31.0;
+            let c_1_63: f32 = 1.0 / 63.0;
+            let c_31: f32 = 31.0;
+            let c_63: f32 = 63.0;
+            let c_half: f32 = 0.5;
+            let c_2: f32 = 2.0;
+
+            let aa_partial = x87_fma_f32(mid_w, c_4_9, outer_w);
+            let remaining_w: f32 = {
+                // (total_w - outer_w) - mid_w — two subtractions
+                let tmp = total_w - outer_w; // f32 sub (stored to stack in original)
+                tmp - mid_w
+            };
+            let bb_mid_term = x87_fma_f32(mid_w, c_1_9, 0.0); // mid_w * 1/9 (no add, but fma with 0)
             let mut beta_a_mid = [0.0f32; 3];
             for k in 0..3 {
-                beta_a_mid[k] = f32via64!(mid_rgb[k] as f64 * ((2.0f32 / 3.0) as f64));
+                beta_a_mid[k] = mid_rgb[k] * c_2_3; // simple f32 multiply
             }
 
             // Inner loop: boundary u, group C = sorted[t..u]
@@ -1003,58 +1167,59 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
             let mut inner_w: f32 = 0.0;
 
             for u in t..=n {
-                // Partition metrics from incremental sums
-                let alpha_aa: f32 = f32via64!(inner_w as f64 * ((1.0f32 / 9.0) as f64) + aa_partial as f64);
-                let alpha_bb: f32 = f32via64!(inner_w as f64 * ((4.0f32 / 9.0) as f64)
-                    + (remaining_w as f64 - inner_w as f64) + bb_mid_term as f64);
-                let alpha_ab: f32 = f32via64!((inner_w as f64 + mid_w as f64) * ((2.0f32 / 9.0) as f64));
+                // Partition metrics using x87 for critical operations
+                let alpha_aa = x87_fma_f32(inner_w, c_1_9, aa_partial);
+                let alpha_bb: f32 = {
+                    // inner_w * 4/9 + (remaining_w - inner_w) + bb_mid_term
+                    let t1 = x87_fma_f32(inner_w, c_4_9, remaining_w - inner_w);
+                    t1 + bb_mid_term
+                };
+                let alpha_ab: f32 = (inner_w + mid_w) * c_2_9;
 
-                let det: f32 = f32via64!(alpha_aa as f64 * alpha_bb as f64
-                    - alpha_ab as f64 * alpha_ab as f64);
+                // Determinant at x87 80-bit — critical for avoiding catastrophic cancellation
+                let det = x87_cross_f32(alpha_aa, alpha_bb, alpha_ab, alpha_ab);
 
                 if det.abs() >= f32::MIN_POSITIVE {
-                    let inv_det: f32 = f32via64!(1.0f64 / det as f64);
+                    let inv_det = x87_rcp_f32(det);
 
                     let mut ep_a = [0.0f32; 3];
                     let mut ep_b = [0.0f32; 3];
                     for k in 0..3 {
-                        // beta_a = outer_rgb + mid_rgb*2/3 + inner_rgb*1/3
-                        // (matching the original's incremental formula)
-                        let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
-                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * ((1.0f32 / 3.0) as f64));
-                        // beta_b = total - beta_a (matching the original's subtraction)
-                        let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
+                        let beta_a = x87_fma_f32(inner_rgb[k], c_1_3,
+                            beta_a_mid[k] + outer_rgb[k]);
+                        let beta_b = total_rgb[k] - beta_a;
 
-                        let a_k: f32 = f32via64!((beta_a as f64 * alpha_bb as f64
-                            - beta_b as f64 * alpha_ab as f64) * inv_det as f64);
-                        let b_k: f32 = f32via64!((beta_b as f64 * alpha_aa as f64
-                            - beta_a as f64 * alpha_ab as f64) * inv_det as f64);
+                        // Endpoint solve: (beta_a*alpha_bb - beta_b*alpha_ab) * inv_det
+                        let a_k = x87_cross_mul_f32(beta_a, alpha_bb, beta_b, alpha_ab, inv_det);
+                        let b_k = x87_cross_mul_f32(beta_b, alpha_aa, beta_a, alpha_ab, inv_det);
                         ep_a[k] = a_k.clamp(0.0, 1.0);
                         ep_b[k] = b_k.clamp(0.0, 1.0);
                     }
 
                     // Grid-snap: quantize to 5/6/5 then dequantize
-                    // Grid constants: use f32 precision (matching original's stored constants)
-                    let grids = [31.0f32 as f64, 63.0f32 as f64, 31.0f32 as f64];
-                    let inv_grids = [(1.0f32 / 31.0) as f64, (1.0f32 / 63.0) as f64, (1.0f32 / 31.0) as f64];
+                    let grid_vals = [c_31, c_63, c_31];
+                    let inv_vals = [c_1_31, c_1_63, c_1_31];
                     for k in 0..3 {
-                        ep_a[k] = f32via64!((ep_a[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
-                        ep_b[k] = f32via64!((ep_b[k] as f64 * grids[k] + 0.5).floor() * inv_grids[k]);
+                        // floor(ep * grid + 0.5) * inv_grid
+                        let qa = x87_fma_f32(ep_a[k], grid_vals[k], c_half);
+                        ep_a[k] = qa.floor() * inv_vals[k];
+                        let qb = x87_fma_f32(ep_b[k], grid_vals[k], c_half);
+                        ep_b[k] = qb.floor() * inv_vals[k];
                     }
 
-                    // Error: recompute betas for grid-snapped error evaluation
+                    // Error computation
                     let mut err = 0.0f32;
                     for k in 0..3 {
-                        let beta_a: f32 = f32via64!(beta_a_mid[k] as f64
-                            + outer_rgb[k] as f64 + inner_rgb[k] as f64 * ((1.0f32 / 3.0) as f64));
-                        let beta_b: f32 = f32via64!(total_rgb[k] as f64 - beta_a as f64);
-                        let ch_err: f32 = f32via64!(
-                            alpha_aa as f64 * ep_a[k] as f64 * ep_a[k] as f64
-                            + alpha_bb as f64 * ep_b[k] as f64 * ep_b[k] as f64
-                            + 2.0 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
-                            - 2.0 * (beta_a as f64 * ep_a[k] as f64
-                                + beta_b as f64 * ep_b[k] as f64)
-                        );
+                        let beta_a = x87_fma_f32(inner_rgb[k], c_1_3,
+                            beta_a_mid[k] + outer_rgb[k]);
+                        let beta_b = total_rgb[k] - beta_a;
+
+                        // aa*ea^2 + bb*eb^2 + 2*ab*ea*eb - 2*(ba*ea + bb_val*eb)
+                        let t1 = alpha_aa * ep_a[k] * ep_a[k];
+                        let t2 = alpha_bb * ep_b[k] * ep_b[k];
+                        let t3 = c_2 * alpha_ab * ep_a[k] * ep_b[k];
+                        let t4 = c_2 * (beta_a * ep_a[k] + beta_b * ep_b[k]);
+                        let ch_err = t1 + t2 + t3 - t4;
                         err += ch_err;
                     }
 
@@ -1176,6 +1341,8 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
         out[0..2].copy_from_slice(&c0.to_le_bytes());
         out[2..4].copy_from_slice(&c1.to_le_bytes());
         let err = compute_4color_error(pixels, c0, c1);
+        #[cfg(target_arch = "x86_64")]
+        unsafe { x87_restore(saved_cw); }
         return (out, err);
     }
 
@@ -1184,6 +1351,8 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
     out[2..4].copy_from_slice(&c1.to_le_bytes());
     out[4..8].copy_from_slice(&indices.to_le_bytes());
     let err = compute_4color_error(pixels, c0, c1);
+    #[cfg(target_arch = "x86_64")]
+    unsafe { x87_restore(saved_cw); }
     (out, err)
 }
 
