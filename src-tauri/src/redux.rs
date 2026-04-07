@@ -1179,8 +1179,9 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 
 /// Encode 16 RGBA pixels → DXT1 block (8 bytes).
 ///
-/// Uses WeightedClusterFit matching squish (ClientPatcher). Tries both 3-color
-/// and 4-color modes for opaque blocks and picks the lower error.
+/// Uses WeightedClusterFit matching squish (ClientPatcher). When `force_3color`
+/// is false, tries both 3-color and 4-color modes for opaque blocks and picks
+/// the lower error; when true, always uses 3-color mode (required for DXT1a).
 fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
     // Check for transparent pixels. DXT1 3-color mode (c0 <= c1) uses index 3
     // for transparent black. After box filtering, transparent+opaque pixels blend
@@ -1258,18 +1259,19 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], force_3color: bool) -> [u8; 8] {
     }
 
     // ── All opaque: existing path ──
+
+    // If texture has binary alpha, force 3-color mode for all blocks
+    // (must come before the solid-color fast path so solid blocks also use 3-color).
+    if force_3color {
+        let (block_3, _) = cluster_fit_3color(pixels);
+        return block_3;
+    }
+
     // Solid-color fast path: check if all pixels share the same RGB.
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
     let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
     if all_solid {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
-    }
-
-    // ── WeightedClusterFit ──
-    // If texture has binary alpha, force 3-color mode for all blocks
-    if force_3color {
-        let (block_3, _) = cluster_fit_3color(pixels);
-        return block_3;
     }
 
     // Otherwise try both modes and pick lower error
