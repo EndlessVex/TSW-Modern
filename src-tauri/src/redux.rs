@@ -1111,11 +1111,9 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let mut c0 = ((r0 as u16) << 11) | ((g0 as u16) << 5) | (b0 as u16);
     let mut c1 = ((r1 as u16) << 11) | ((g1 as u16) << 5) | (b1 as u16);
 
-    // 3-color mode requires c0 <= c1; swap endpoints and remap 0↔1 if needed
-    let mut swap = false;
+    // 3-color mode requires c0 <= c1; swap endpoints if needed
     if c0 > c1 {
         std::mem::swap(&mut c0, &mut c1);
-        swap = true;
     }
     if c0 == c1 {
         if c1 < 0xFFFF { c1 += 1; }
@@ -1149,10 +1147,6 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
             let db = (pb - cb) as i32;
             let dist = dr * dr + dg * dg + db * db;
             if dist < best_dist { best_dist = dist; best_sel = sel as u32; }
-        }
-        // If endpoints were swapped, remap: 0↔1 (midpoint index 2 stays)
-        if swap && best_sel < 2 {
-            best_sel ^= 1;
         }
         indices |= best_sel << (i * 2);
     }
