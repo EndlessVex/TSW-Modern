@@ -1065,6 +1065,50 @@ fn x87_rcp_f32(a: f32) -> f32 {
     result
 }
 
+/// Compute a + b + c * d at x87 80-bit precision, return as f32.
+/// Matches: fld a; fadd b; fld c; fmul d; faddp; fstp result
+/// Critical: a+b stays at 80-bit without f32 truncation before adding c*d.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_add_fma_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{a}]",
+            "fadd dword ptr [{b}]",
+            "fld dword ptr [{c}]",
+            "fmul dword ptr [{d}]",
+            "faddp",
+            "fstp dword ptr [{out}]",
+            a = in(reg) &a, b = in(reg) &b,
+            c = in(reg) &c, d = in(reg) &d,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
+/// Compute a - b at x87 80-bit precision, return as f32.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x87_sub_f32(a: f32, b: f32) -> f32 {
+    let mut result: f32 = 0.0;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{a}]",
+            "fsub dword ptr [{b}]",
+            "fstp dword ptr [{out}]",
+            a = in(reg) &a, b = in(reg) &b,
+            out = in(reg) &mut result,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    result
+}
+
 /// Compute (a * b - c * d) * e at x87 80-bit precision, return as f32.
 /// Matches: fld a; fmul b; fld c; fmul d; fsubp; fmul e; fstp result
 #[cfg(target_arch = "x86_64")]
@@ -1190,9 +1234,12 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                     let mut ep_a = [0.0f32; 3];
                     let mut ep_b = [0.0f32; 3];
                     for k in 0..3 {
-                        let beta_a = x87_fma_f32(inner_rgb[k], c_1_3,
-                            beta_a_mid[k] + outer_rgb[k]);
-                        let beta_b = total_rgb[k] - beta_a;
+                        // beta_a = mid*2/3 + outer + inner*1/3
+                        // Critical: mid*2/3 + outer must stay at 80-bit (not truncated to
+                        // f32) before adding inner*1/3. Use x87_add_fma_f32 which keeps
+                        // the intermediate sum on the FPU stack.
+                        let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
+                        let beta_b = x87_sub_f32(total_rgb[k], beta_a);
 
                         // Endpoint solve: (beta_a*alpha_bb - beta_b*alpha_ab) * inv_det
                         let a_k = x87_cross_mul_f32(beta_a, alpha_bb, beta_b, alpha_ab, inv_det);
@@ -1206,10 +1253,8 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                     let inv_vals = [c_1_31, c_1_63, c_1_31];
                     for k in 0..3 {
                         // Grid-snap matching original's FUN_006818c0 path:
-                        // Original: computes ep*grid+0.5 at x87 80-bit, casts to f64,
-                        // floors the f64, then stores result as f32.
-                        // Critical: must floor at f64 precision, NOT f32, because
-                        // f32 truncation can round up past integer boundaries.
+                        // floor at f64 precision (not f32) to avoid rounding past
+                        // integer boundaries.
                         let qa = (ep_a[k] as f64 * grid_vals[k] as f64 + 0.5f64).floor();
                         ep_a[k] = (qa * inv_vals[k] as f64) as f32;
                         let qb = (ep_b[k] as f64 * grid_vals[k] as f64 + 0.5f64).floor();
@@ -1219,9 +1264,8 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                     // Error computation
                     let mut err = 0.0f32;
                     for k in 0..3 {
-                        let beta_a = x87_fma_f32(inner_rgb[k], c_1_3,
-                            beta_a_mid[k] + outer_rgb[k]);
-                        let beta_b = total_rgb[k] - beta_a;
+                        let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
+                        let beta_b = x87_sub_f32(total_rgb[k], beta_a);
 
                         // aa*ea^2 + bb*eb^2 + 2*ab*ea*eb - 2*(ba*ea + bb_val*eb)
                         let t1 = alpha_aa * ep_a[k] * ep_a[k];
