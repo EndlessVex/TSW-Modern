@@ -3648,4 +3648,124 @@ mod tests {
             matching2, num_blocks, matching2 as f64 / num_blocks as f64 * 100.0);
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_verify_interp() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip0_size = 128 * 128 * 8;
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+        let mip1_size = 64 * 64 * 8;
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // For each output pixel in mip1, it comes from a 2x2 region of source pixels.
+        // Each source pixel comes from a specific mip0 block at a specific index.
+        // If all 4 source pixels have the same block (c0, c1) AND the same index,
+        // the box-filtered result is exactly one palette color.
+
+        // Scan for uniform-index 2x2 regions in mip0.
+        // A mip1 pixel at (x,y) comes from mip0 pixels at (2x,2y), (2x+1,2y), (2x,2y+1), (2x+1,2y+1).
+        // These 4 source pixels may span up to 4 different mip0 blocks.
+        // For simplicity, check within a single mip0 block: 4x4 block contains 2x2 output pixels.
+        // An output pixel at block-relative (ox,oy) uses source (2ox, 2oy)...(2ox+1, 2oy+1).
+
+        let mut counts_by_index = [0u32; 4]; // how many pixels verified per index
+        let mut matches_by_index = [0u32; 4];
+
+        // Check output pixels that are entirely within one mip0 block
+        // (i.e., all 4 source pixels come from the same block)
+        for mip0_by in 0..128 {
+            for mip0_bx in 0..128 {
+                let blk_off = (mip0_by * 128 + mip0_bx) * 8;
+                let block = &ref_mip0[blk_off..blk_off + 8];
+                let c0 = u16::from_le_bytes([block[0], block[1]]);
+                let c1 = u16::from_le_bytes([block[2], block[3]]);
+                let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+                if c0 <= c1 { continue; } // skip 3-color mode blocks
+
+                // Each mip0 4x4 block contains 2x2 groups of 2x2 source pixels
+                // Output pixel at (ox, oy) within this block uses source pixels:
+                // (2*ox, 2*oy), (2*ox+1, 2*oy), (2*ox, 2*oy+1), (2*ox+1, 2*oy+1)
+                for oy in 0..2 {
+                    for ox in 0..2 {
+                        let src_indices = [
+                            ((indices >> (((oy*2)*4 + ox*2) * 2)) & 3) as usize,
+                            ((indices >> (((oy*2)*4 + ox*2+1) * 2)) & 3) as usize,
+                            ((indices >> (((oy*2+1)*4 + ox*2) * 2)) & 3) as usize,
+                            ((indices >> (((oy*2+1)*4 + ox*2+1) * 2)) & 3) as usize,
+                        ];
+
+                        // Check if all 4 use the same index
+                        if src_indices[0] != src_indices[1] || src_indices[0] != src_indices[2] || src_indices[0] != src_indices[3] {
+                            continue;
+                        }
+                        let idx = src_indices[0];
+
+                        // Decode the palette color for this index
+                        let decoded = decode_dxt1_block(block);
+                        let pixel = decoded[(oy * 2) * 4 + ox * 2]; // any of the 4 source pixels (all same)
+
+                        // This pixel, after box filter (identity since all 4 are same), should encode
+                        // to a specific RGB565 value. Check against reference mip1.
+                        let our_r5 = ((pixel[0] as u16 * 31 + 127) / 255) as u16;
+                        let our_g6 = ((pixel[1] as u16 * 63 + 127) / 255) as u16;
+                        let our_b5 = ((pixel[2] as u16 * 31 + 127) / 255) as u16;
+                        let our_c = (our_r5 << 11) | (our_g6 << 5) | our_b5;
+
+                        // Find the corresponding mip1 block and check if it's solid (c0==c1)
+                        let mip1_x = mip0_bx * 2 + ox; // pixel position in mip1
+                        let mip1_y = mip0_by * 2 + oy;
+                        let mip1_bx = mip1_x / 4; // mip1 block position
+                        let mip1_by = mip1_y / 4;
+                        let mip1_blk = &ref_mip1[(mip1_by * 64 + mip1_bx) * 8..];
+                        let ref_c0 = u16::from_le_bytes([mip1_blk[0], mip1_blk[1]]);
+                        let ref_c1 = u16::from_le_bytes([mip1_blk[2], mip1_blk[3]]);
+
+                        // Only check if the mip1 block is solid (c0==c1)
+                        if ref_c0 != ref_c1 { continue; }
+
+                        counts_by_index[idx] += 1;
+                        if our_c == ref_c0 {
+                            matches_by_index[idx] += 1;
+                        } else if counts_by_index[idx] <= 3 {
+                            let (rr, rg, rb) = decode_rgb565(ref_c0);
+                            eprintln!("  Idx {} mismatch: pixel=({},{},{}) our_c={:04x} ref_c={:04x} ref_decoded=({},{},{})",
+                                idx, pixel[0], pixel[1], pixel[2], our_c, ref_c0, rr, rg, rb);
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("\n  Interpolated color verification (texture 19767):");
+        for idx in 0..4 {
+            if counts_by_index[idx] > 0 {
+                eprintln!("    Index {}: {}/{} match ({:.1}%)", idx,
+                    matches_by_index[idx], counts_by_index[idx],
+                    matches_by_index[idx] as f64 / counts_by_index[idx] as f64 * 100.0);
+            } else {
+                eprintln!("    Index {}: no samples", idx);
+            }
+        }
+    }
+
 }
