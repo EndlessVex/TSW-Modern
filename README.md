@@ -22,9 +22,8 @@ A downloader for **The Secret World**.
 
 ## Known issues
 
-**ClientPatcher's "Repair Broken Data" re-downloads textures every time.** If you run the repair tool inside ClientPatcher.exe after installing with this downloader, it will flag around 18,000 textures as corrupted and re-download ~4.6GB of data. Those textures are not actually broken — the game renders them correctly. The repair tool checks MD5 hashes against the original distribution, and our generated mip levels produce valid but non-identical hashes. Running repair again after that will download another ~129MB for the same reason. This loop never resolves because every re-encode produces slightly different compression output.
-
-**The UI modding SDK is not included.** The original installer ships 747 Flash/ActionScript source files in `Data/Gui/Customized/` (~109MB) for players who want to build custom UI mods. Our downloader doesn't include these yet. If you need them, running ClientPatcher's repair will fetch them along with the texture re-downloads mentioned above.
+- **Don't use ClientPatcher's "Repair Broken Data."** It will re-download ~4.6GB of textures that aren't actually broken, then do it again next time (~129MB). The game works fine without this.
+- **UI modding source files not included.** The `Data/Gui/Customized/` folder (~109MB of Flash source for UI modders) is not downloaded yet. ClientPatcher's repair will fetch it, but also triggers the texture loop above.
 
 ## Not affiliated with Funcom
 
