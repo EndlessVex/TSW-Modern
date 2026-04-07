@@ -793,14 +793,14 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 /// deduplicated by raw byte equality (matching the game's color set construction).
 /// Returns (colors, weights, order, n) where colors/weights are sorted along
 /// the principal axis and n is the number of unique colors.
-fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usize>, usize) {
-    let mut colors: Vec<[f64; 3]> = Vec::with_capacity(16);
+fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usize>, usize) {
+    let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
     let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
-    let mut weights: Vec<f64> = Vec::with_capacity(16);
+    let mut weights: Vec<f32> = Vec::with_capacity(16);
     for (_i, p) in pixels.iter().enumerate() {
         let rgb_bytes = [p[0], p[1], p[2]];
-        let rgb = [p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0];
-        let w = (p[3] as f64 + 1.0) / 256.0;
+        let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+        let w = (p[3] as f32 + 1.0) / 256.0;
         let mut found = false;
         for (j, existing) in color_bytes.iter().enumerate() {
             if *existing == rgb_bytes {
@@ -824,15 +824,15 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usiz
     let n = colors.len();
 
     // Weighted centroid
-    let total_weight: f64 = weights.iter().sum();
-    let mut centroid = [0.0f64; 3];
+    let total_weight: f32 = weights.iter().sum();
+    let mut centroid = [0.0f32; 3];
     for (c, &w) in colors.iter().zip(weights.iter()) {
         for k in 0..3 { centroid[k] += c[k] * w; }
     }
     for k in 0..3 { centroid[k] /= total_weight; }
 
     // Weighted covariance matrix [rr, rg, rb, gg, gb, bb]
-    let mut cov = [0.0f64; 6];
+    let mut cov = [0.0f32; 6];
     for (c, &w) in colors.iter().zip(weights.iter()) {
         let dr = c[0] - centroid[0];
         let dg = c[1] - centroid[1];
@@ -846,14 +846,14 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usiz
     }
 
     // Power iteration — 8 iterations, seed = max-magnitude row
-    let rows: [[f64; 3]; 3] = [
+    let rows: [[f32; 3]; 3] = [
         [cov[0], cov[1], cov[2]],
         [cov[1], cov[3], cov[4]],
         [cov[2], cov[4], cov[5]],
     ];
     let mut axis = {
         let mut best_row = 0;
-        let mut best_mag = 0.0f64;
+        let mut best_mag = 0.0f32;
         for (i, row) in rows.iter().enumerate() {
             let mag = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
             if mag > best_mag { best_mag = mag; best_row = i; }
@@ -877,7 +877,7 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usiz
 
     // Project colors onto axis and insertion-sort ascending
     let mut order: Vec<usize> = (0..n).collect();
-    let mut dots: Vec<f64> = colors.iter().map(|c| {
+    let mut dots: Vec<f32> = colors.iter().map(|c| {
         c[0] * axis[0] + c[1] * axis[1] + c[2] * axis[2]
     }).collect();
     for i in 1..n {
@@ -892,8 +892,8 @@ fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usiz
         dots[j] = key_dot;
         order[j] = key_idx;
     }
-    let sorted_colors: Vec<[f64; 3]> = order.iter().map(|&i| colors[i]).collect();
-    let sorted_weights: Vec<f64> = order.iter().map(|&i| weights[i]).collect();
+    let sorted_colors: Vec<[f32; 3]> = order.iter().map(|&i| colors[i]).collect();
+    let sorted_weights: Vec<f32> = order.iter().map(|&i| weights[i]).collect();
 
     (sorted_colors, sorted_weights, order, n)
 }
@@ -973,13 +973,7 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 /// 4-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
-    let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
-
-    // Convert to f32 at the boundary (build_color_set returns f64)
-    let colors: Vec<[f32; 3]> = sorted_colors.iter()
-        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
-    let weights: Vec<f32> = sorted_weights.iter()
-        .map(|&w| w as f32).collect();
+    let (colors, weights, _order, n) = build_color_set(pixels);
 
     // Precompute cumulative sums for partition search
     let mut cum_w = vec![0.0f32; n + 1];
@@ -1129,8 +1123,8 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
 
     // Precompute cumulative sums for partition search
-    let mut cum_w = vec![0.0f64; n + 1];
-    let mut cum_rgb = vec![[0.0f64; 3]; n + 1];
+    let mut cum_w = vec![0.0f32; n + 1];
+    let mut cum_rgb = vec![[0.0f32; 3]; n + 1];
     for i in 0..n {
         cum_w[i + 1] = cum_w[i] + sorted_weights[i];
         for k in 0..3 {
@@ -1140,9 +1134,9 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let total_rgb = cum_rgb[n];
 
     // Exhaustive 3-partition search (2 boundaries)
-    let mut best_err = f64::MAX;
-    let mut best_ep0 = [0.0f64; 3];
-    let mut best_ep1 = [0.0f64; 3];
+    let mut best_err = f32::MAX;
+    let mut best_ep0 = [0.0f32; 3];
+    let mut best_ep1 = [0.0f32; 3];
 
     for s in 0..=n {
         let w_a = cum_w[s];
@@ -1150,20 +1144,20 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
             let w_b = cum_w[t] - cum_w[s];
             let w_c = cum_w[n] - cum_w[t];
 
-            let alpha_aa = w_a + w_b * 0.25;
-            let alpha_bb = w_c + w_b * 0.25;
-            let alpha_ab = w_b * 0.25;
+            let alpha_aa = w_a + w_b * 0.25f32;
+            let alpha_bb = w_c + w_b * 0.25f32;
+            let alpha_ab = w_b * 0.25f32;
             let det = alpha_aa * alpha_bb - alpha_ab * alpha_ab;
-            if det.abs() < 1e-10 { continue; }
-            let inv_det = 1.0 / det;
+            if det.abs() < 1e-6 { continue; }
+            let inv_det: f32 = 1.0 / det;
 
             let sum_a = cum_rgb[s];
             let sum_b = [cum_rgb[t][0] - cum_rgb[s][0], cum_rgb[t][1] - cum_rgb[s][1], cum_rgb[t][2] - cum_rgb[s][2]];
             let sum_c = [total_rgb[0] - cum_rgb[t][0], total_rgb[1] - cum_rgb[t][1], total_rgb[2] - cum_rgb[t][2]];
 
-            let mut err = 0.0f64;
-            let mut ep_a = [0.0f64; 3];
-            let mut ep_b = [0.0f64; 3];
+            let mut err = 0.0f32;
+            let mut ep_a = [0.0f32; 3];
+            let mut ep_b = [0.0f32; 3];
             for k in 0..3 {
                 let beta_a = sum_a[k] + sum_b[k] * 0.5;
                 let beta_b = sum_c[k] + sum_b[k] * 0.5;
