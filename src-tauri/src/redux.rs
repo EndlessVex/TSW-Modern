@@ -777,7 +777,10 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
     if c0 < c1 {
         block[0..2].copy_from_slice(&c1.to_le_bytes());
         block[2..4].copy_from_slice(&c0.to_le_bytes());
-        block[4..8].copy_from_slice(&0x55555555u32.to_le_bytes());
+        // 0xAAAAAAAA ^ 0x55555555 = 0xFFFFFFFF (all index 3)
+        // After swap, index 3 = 2/3*orig_c0 + 1/3*orig_c1 (the target color).
+        // Previous bug: used 0x55555555 (index 1 = raw endpoint, much worse quality).
+        block[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
     } else {
         block[0..2].copy_from_slice(&c0.to_le_bytes());
         block[2..4].copy_from_slice(&c1.to_le_bytes());
