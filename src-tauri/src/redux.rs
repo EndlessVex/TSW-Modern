@@ -2225,4 +2225,102 @@ mod tests {
         eprintln!("noise block: {:02x?}", block3);
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test -- --ignored encoder_replication_comparison
+    fn encoder_replication_comparison() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let our_dir = base.join("game-installs/ours-newest/The Secret World/RDB");
+
+        // Parse both le.idx files
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx"))
+            .expect("Failed to parse reference le.idx");
+        let our_idx = parse_le_index(&our_dir.join("le.idx"))
+            .expect("Failed to parse our le.idx");
+
+        let test_ids: &[u32] = &[19767, 27137, 30186, 105336, 105339, 109115, 111092, 117998, 143403, 143762];
+
+        let mut total_bytes = 0usize;
+        let mut matching_bytes = 0usize;
+        let mut total_resources = 0usize;
+        let mut matching_resources = 0usize;
+
+        for &id in test_ids {
+            // Find entry in reference index (search all entries for this id)
+            let ref_entry = ref_idx.entries.iter().find(|e| e.id == id);
+            let our_entry = our_idx.entries.iter().find(|e| e.id == id);
+
+            let (ref_entry, our_entry) = match (ref_entry, our_entry) {
+                (Some(r), Some(o)) => (r, o),
+                _ => {
+                    eprintln!("  ID {}: not found in one or both indexes, skipping", id);
+                    continue;
+                }
+            };
+
+            eprintln!("  ID {}: type={}, ref=file{:02}@{} len={}, our=file{:02}@{} len={}",
+                id, ref_entry.rdb_type,
+                ref_entry.file_num, ref_entry.offset, ref_entry.length,
+                our_entry.file_num, our_entry.offset, our_entry.length);
+
+            // Read reference resource
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", ref_entry.file_num));
+            let our_path = our_dir.join(format!("{:02}.rdbdata", our_entry.file_num));
+
+            let read_resource = |path: &std::path::Path, offset: u32, length: u32| -> Option<Vec<u8>> {
+                let mut file = std::fs::File::open(path).ok()?;
+                file.seek(SeekFrom::Start(offset as u64)).ok()?;
+                let mut buf = vec![0u8; length as usize];
+                file.read_exact(&mut buf).ok()?;
+                Some(buf)
+            };
+
+            let ref_data = match read_resource(&ref_path, ref_entry.offset, ref_entry.length) {
+                Some(d) => d,
+                None => { eprintln!("    -> failed to read reference data"); continue; }
+            };
+            let our_data = match read_resource(&our_path, our_entry.offset, our_entry.length) {
+                Some(d) => d,
+                None => { eprintln!("    -> failed to read our data"); continue; }
+            };
+
+            total_resources += 1;
+
+            if ref_data.len() != our_data.len() {
+                eprintln!("    -> SIZE MISMATCH: ref={} our={}", ref_data.len(), our_data.len());
+                continue;
+            }
+
+            let len = ref_data.len();
+            let matching = ref_data.iter().zip(our_data.iter()).filter(|(a, b)| a == b).count();
+            let differing = len - matching;
+            total_bytes += len;
+            matching_bytes += matching;
+
+            if differing == 0 {
+                matching_resources += 1;
+                eprintln!("    -> IDENTICAL ({} bytes)", len);
+            } else {
+                // Find first differing byte offset
+                let first_diff = ref_data.iter().zip(our_data.iter())
+                    .position(|(a, b)| a != b).unwrap();
+                eprintln!("    -> {} differing bytes out of {} ({:.1}% match), first diff at offset {}",
+                    differing, len, (matching as f64 / len as f64) * 100.0, first_diff);
+            }
+        }
+
+        eprintln!("\n  SUMMARY:");
+        eprintln!("    Resources compared: {}", total_resources);
+        eprintln!("    Fully identical: {}/{}", matching_resources, total_resources);
+        if total_bytes > 0 {
+            eprintln!("    Total bytes: {} matching / {} total ({:.2}%)",
+                matching_bytes, total_bytes,
+                (matching_bytes as f64 / total_bytes as f64) * 100.0);
+        }
+    }
+
 }
