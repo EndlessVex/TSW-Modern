@@ -585,7 +585,7 @@ fn generate_mip(
                 }
             }
             match codec {
-                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels, force_3color)),
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels, force_3color, true)),
                 TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&block_pixels)),
                 TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&block_pixels)),
             }
@@ -760,27 +760,34 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 /// deduplicated by raw byte equality (matching the game's color set construction).
 /// Returns (colors, weights, order, n) where colors/weights are sorted along
 /// the principal axis and n is the number of unique colors.
-fn build_color_set(pixels: &[[u8; 4]; 16]) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usize>, usize) {
+fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f32>, Vec<usize>, usize) {
     let mut colors: Vec<[f32; 3]> = Vec::with_capacity(16);
-    let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
     let mut weights: Vec<f32> = Vec::with_capacity(16);
-    let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
-    for (_i, p) in pixels.iter().enumerate() {
-        let rgb_bytes = [p[0], p[1], p[2]];
-        let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
-        let w = (p[3] as f32 + 1.0) / 256.0;
-        let mut found = false;
-        for (j, existing) in color_bytes.iter().enumerate() {
-            if *existing == rgb_bytes {
-                weights[j] += w;
-                found = true;
-                break;
+    if dedup {
+        let mut color_bytes: Vec<[u8; 3]> = Vec::with_capacity(16);
+        for (_i, p) in pixels.iter().enumerate() {
+            let rgb_bytes = [p[0], p[1], p[2]];
+            let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+            let w = (p[3] as f32 + 1.0) / 256.0;
+            let mut found = false;
+            for (j, existing) in color_bytes.iter().enumerate() {
+                if *existing == rgb_bytes {
+                    weights[j] += w;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                colors.push(rgb);
+                color_bytes.push(rgb_bytes);
+                weights.push(w);
             }
         }
-        if !found {
-            colors.push(rgb);
-            color_bytes.push(rgb_bytes);
-            weights.push(w);
+    } else {
+        // No dedup: all 16 pixels as separate entries (matching original's param_4=0)
+        for p in pixels.iter() {
+            colors.push([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
+            weights.push((p[3] as f32 + 1.0) / 256.0);
         }
     }
 
@@ -935,8 +942,8 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 
 /// 4-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
-fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
-    let (colors, weights, order, n) = build_color_set(pixels);
+fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
+    let (colors, weights, order, n) = build_color_set(pixels, dedup);
 
     // Pre-multiply colors by weights (matching the original which stores
     // color*weight at object offset 0x20 in FUN_0067f490)
@@ -1117,33 +1124,39 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
         unique_to_index[i] = idx;
     }
 
-    // Map each pixel through dedup + sort to find its partition group index.
-    let mut color_bytes_list: Vec<[u8; 3]> = Vec::with_capacity(16);
-    let mut pixel_to_unique = [0usize; 16];
-    for (i, p) in pixels.iter().enumerate() {
-        let rgb = [p[0], p[1], p[2]];
-        let mut found = None;
-        for (j, existing) in color_bytes_list.iter().enumerate() {
-            if *existing == rgb { found = Some(j); break; }
-        }
-        let unique_idx = match found {
-            Some(j) => j,
-            None => { color_bytes_list.push(rgb); color_bytes_list.len() - 1 }
-        };
-        pixel_to_unique[i] = unique_idx;
-    }
-
+    // Map each pixel through sort to find its partition group index.
     let mut inv_order = vec![0usize; n];
     for (sorted_pos, &orig_idx) in order.iter().enumerate() {
         inv_order[orig_idx] = sorted_pos;
     }
 
     let mut indices = 0u32;
-    for i in 0..16 {
-        let unique_idx = pixel_to_unique[i];
-        let sorted_pos = inv_order[unique_idx];
-        let sel = unique_to_index[sorted_pos];
-        indices |= sel << (i * 2);
+    if dedup {
+        // With dedup: need pixel → unique color → sorted position mapping
+        let mut color_bytes_list: Vec<[u8; 3]> = Vec::with_capacity(16);
+        let mut pixel_to_unique = [0usize; 16];
+        for (i, p) in pixels.iter().enumerate() {
+            let rgb = [p[0], p[1], p[2]];
+            let mut found = None;
+            for (j, existing) in color_bytes_list.iter().enumerate() {
+                if *existing == rgb { found = Some(j); break; }
+            }
+            let unique_idx = match found {
+                Some(j) => j,
+                None => { color_bytes_list.push(rgb); color_bytes_list.len() - 1 }
+            };
+            pixel_to_unique[i] = unique_idx;
+        }
+        for i in 0..16 {
+            let sorted_pos = inv_order[pixel_to_unique[i]];
+            indices |= unique_to_index[sorted_pos] << (i * 2);
+        }
+    } else {
+        // Without dedup: pixel i = entry i directly
+        for i in 0..16 {
+            let sorted_pos = inv_order[i];
+            indices |= unique_to_index[sorted_pos] << (i * 2);
+        }
     }
 
     // Now enforce 4-color mode: c0 > c1. If we need to swap, XOR bit 0 of
@@ -1178,7 +1191,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 /// Returns (encoded_block, weighted_error).
 #[allow(dead_code)]
 fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
-    let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels);
+    let (sorted_colors, sorted_weights, _order, n) = build_color_set(pixels, true);
 
     // Precompute cumulative sums for partition search
     let mut cum_w = vec![0.0f32; n + 1];
@@ -1300,7 +1313,7 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
 /// Uses WeightedClusterFit matching the game's encoder. When `force_3color`
 /// is false, tries both 3-color and 4-color modes for opaque blocks and picks
 /// the lower error; when true, always uses 3-color mode (required for DXT1a).
-fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool) -> [u8; 8] {
+fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool, for_mip: bool) -> [u8; 8] {
     // Check for transparent pixels. DXT1 3-color mode (c0 <= c1) uses index 3
     // for transparent black. After box filtering, transparent+opaque pixels blend
     // to intermediate alpha — threshold at 128 to preserve transparency at edges.
@@ -1378,18 +1391,20 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool) -> [u8; 8] {
 
     // ── All opaque: existing path ──
 
-    // Solid-color fast path: check if all pixels share the same RGB.
-    let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
-    let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
-    if all_solid {
-        return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
+    if !for_mip {
+        // Solid-color fast path (non-mip encoding only).
+        // For mip generation, the original sends ALL blocks through ClusterFit
+        // (even solid ones) because the monochrome check rarely triggers after
+        // box filtering. ClusterFit naturally produces c0=c1 for uniform blocks.
+        let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
+        let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
+        if all_solid {
+            return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
+        }
     }
 
-    // Use 4-color mode only for opaque blocks.
-    // The original encoder does NOT try 3-color for opaque
-    // blocks despite the reference encoder doing so. Trying 3-color causes
-    // massive mode-change regressions (1.1% -> 25.8% of blocks).
-    let (block_4, _) = cluster_fit_4color(pixels);
+    let dedup = !for_mip;
+    let (block_4, _) = cluster_fit_4color(pixels, dedup);
     block_4
 }
 
@@ -1458,7 +1473,7 @@ fn encode_dxt5_block(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
     let alpha_block = encode_bc4_block(&alpha_values);
 
     // Color portion (DXT1) — DXT5 never uses binary alpha
-    let color_block = encode_dxt1_block(pixels, false);
+    let color_block = encode_dxt1_block(pixels, false, false);
 
     // DXT5 = alpha(8) + color(8)
     let mut out = [0u8; 16];
@@ -1866,7 +1881,7 @@ mod tests {
         }
 
         // Re-encode should produce a valid block
-        let re_encoded = encode_dxt1_block(&pixels, false);
+        let re_encoded = encode_dxt1_block(&pixels, false, false);
         assert_eq!(re_encoded.len(), 8);
     }
 
@@ -1882,7 +1897,7 @@ mod tests {
                 255,
             ];
         }
-        let encoded = encode_dxt1_block(&pixels, false);
+        let encoded = encode_dxt1_block(&pixels, false, false);
         let decoded = decode_dxt1_block(&encoded);
         let mut total_err = 0u64;
         for i in 0..16 {
@@ -2002,7 +2017,7 @@ mod tests {
         let pixels = decode_dxt1_block(&block);
         assert_eq!(pixels[0][3], 0, "Should decode as transparent");
 
-        let re_encoded = encode_dxt1_block(&pixels, false);
+        let re_encoded = encode_dxt1_block(&pixels, false, false);
         let re_decoded = decode_dxt1_block(&re_encoded);
         for i in 0..16 {
             assert_eq!(re_decoded[i][3], 0,
@@ -2016,7 +2031,7 @@ mod tests {
         for i in 0..8 { pixels[i] = [255, 0, 0, 255]; }
         for i in 8..16 { pixels[i] = [0, 0, 0, 0]; }
 
-        let encoded = encode_dxt1_block(&pixels, false);
+        let encoded = encode_dxt1_block(&pixels, false, false);
         let c0 = u16::from_le_bytes([encoded[0], encoded[1]]);
         let c1 = u16::from_le_bytes([encoded[2], encoded[3]]);
         assert!(c0 <= c1, "Should be 3-color mode, got c0={} c1={}", c0, c1);
@@ -2034,7 +2049,7 @@ mod tests {
     fn test_dxt1_opaque_unchanged() {
         let mut pixels = [[0u8; 4]; 16];
         for i in 0..16 { pixels[i] = [128, 64, 32, 255]; }
-        let encoded = encode_dxt1_block(&pixels, false);
+        let encoded = encode_dxt1_block(&pixels, false, false);
         let decoded = decode_dxt1_block(&encoded);
         for i in 0..16 {
             assert_eq!(decoded[i][3], 255, "Opaque pixel {} got alpha={}", i, decoded[i][3]);
@@ -2247,7 +2262,7 @@ mod tests {
             let t = i as f32 / 15.0;
             gradient[i] = [(255.0 * (1.0 - t)) as u8, 0, (255.0 * t) as u8, 255];
         }
-        let (block, _err) = cluster_fit_4color(&gradient);
+        let (block, _err) = cluster_fit_4color(&gradient, true);
         let c0 = u16::from_le_bytes([block[0], block[1]]);
         let c1 = u16::from_le_bytes([block[2], block[3]]);
         // 4-color mode: c0 > c1
@@ -2260,7 +2275,7 @@ mod tests {
         for i in 0..16 {
             green_grad[i] = [0, (i as u8) * 17, 0, 255];
         }
-        let (block2, _) = cluster_fit_4color(&green_grad);
+        let (block2, _) = cluster_fit_4color(&green_grad, true);
         let c0_2 = u16::from_le_bytes([block2[0], block2[1]]);
         let c1_2 = u16::from_le_bytes([block2[2], block2[3]]);
         assert!(c0_2 >= c1_2, "4-color mode requires c0 >= c1");
@@ -2273,7 +2288,7 @@ mod tests {
             [50, 130, 180, 255], [70, 140, 170, 255], [90, 150, 160, 255], [110, 160, 150, 255],
             [130, 170, 140, 255], [150, 180, 130, 255], [170, 190, 120, 255], [190, 200, 110, 255],
         ];
-        let (block3, _) = cluster_fit_4color(&noise);
+        let (block3, _) = cluster_fit_4color(&noise, true);
         eprintln!("noise block: {:02x?}", block3);
     }
 
@@ -2789,7 +2804,7 @@ mod tests {
         }
 
         // Now encode with our encoder and the reference encoder (which we have the output of)
-        let (our_encoded, _) = cluster_fit_4color(&filtered);
+        let (our_encoded, _) = cluster_fit_4color(&filtered, true);
         eprintln!("\n  Encoding the filtered pixels:");
         eprintln!("    Ref mip1 block: {:02x?}", ref_block);
         eprintln!("    Our re-encoded: {:02x?}", our_encoded);
@@ -2903,7 +2918,7 @@ mod tests {
             if is_solid { continue; }
 
             // Encode with our encoder
-            let our_encoded = encode_dxt1_block(&pixels, false);
+            let our_encoded = encode_dxt1_block(&pixels, false, false);
 
             // Count unique colors
             let mut unique = std::collections::HashSet::new();
