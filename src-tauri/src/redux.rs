@@ -546,32 +546,11 @@ fn generate_mip(
         }
     }
 
-    // Convert to linear float buffer for sRGB-correct filtering
-    // Gamma correction disabled — testing showed it does not improve matching
-    // against the game's output. The original may not apply
-    // gamma correction during mip filtering.
-    let use_srgb = false;
-    let mut src_linear = vec![[0.0f32; 4]; prev_w * prev_h];
-    for i in 0..src_pixels.len() {
-        let p = src_pixels[i];
-        if use_srgb {
-            src_linear[i] = [
-                srgb_to_linear(p[0]),
-                srgb_to_linear(p[1]),
-                srgb_to_linear(p[2]),
-                p[3] as f32 / 255.0,
-            ];
-        } else {
-            src_linear[i] = [
-                p[0] as f32 / 255.0,
-                p[1] as f32 / 255.0,
-                p[2] as f32 / 255.0,
-                p[3] as f32 / 255.0,
-            ];
-        }
-    }
-
-    // Step 2: Box-filter in linear float space, then convert back
+    // Step 2: Box-filter using integer math (2×2 average with rounding).
+    // The original uses integer averaging without a float round-trip.
+    // Float round-trip (byte / 255.0 * 255.0) introduces ~1 ULP error
+    // for ~25% of pixel values, which cascades through PCA/sorting into
+    // completely different encoded blocks.
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -582,22 +561,15 @@ fn generate_mip(
             let x1 = (sx + 1).min(prev_w - 1);
             let y1 = (sy + 1).min(prev_h - 1);
 
-            let p00 = src_linear[y0 * prev_w + x0];
-            let p10 = src_linear[y0 * prev_w + x1];
-            let p01 = src_linear[y1 * prev_w + x0];
-            let p11 = src_linear[y1 * prev_w + x1];
+            let p00 = src_pixels[y0 * prev_w + x0];
+            let p10 = src_pixels[y0 * prev_w + x1];
+            let p01 = src_pixels[y1 * prev_w + x0];
+            let p11 = src_pixels[y1 * prev_w + x1];
 
-            for c in 0..3 {
-                let avg = (p00[c] + p10[c] + p01[c] + p11[c]) / 4.0;
-                dst_pixels[y * new_w + x][c] = if use_srgb {
-                    linear_to_srgb(avg)
-                } else {
-                    (avg * 255.0 + 0.5).clamp(0.0, 255.0) as u8
-                };
+            for c in 0..4 {
+                let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
+                dst_pixels[y * new_w + x][c] = ((sum + 2) / 4) as u8;
             }
-            // Alpha: always linear averaging
-            let alpha_avg = (p00[3] + p10[3] + p01[3] + p11[3]) / 4.0;
-            dst_pixels[y * new_w + x][3] = (alpha_avg * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
 
@@ -723,20 +695,24 @@ fn decode_dxt1_block(data: &[u8]) -> [[u8; 4]; 16] {
     let (r0, g0, b0) = decode_rgb565(c0);
     let (r1, g1, b1) = decode_rgb565(c1);
 
+    // NVIDIA-style palette interpolation (no +1 rounding).
+    // The original uses alg_nv (NVIDIA texture tools) which omits the
+    // Microsoft +1 in the interpolation formula. This shifts interpolated
+    // colors by 1 unit for many values, cascading through mip generation.
     let palette: [[u8; 4]; 4] = if c0 > c1 {
         [
             [r0, g0, b0, 255],
             [r1, g1, b1, 255],
             [
-                ((2 * r0 as u16 + r1 as u16 + 1) / 3) as u8,
-                ((2 * g0 as u16 + g1 as u16 + 1) / 3) as u8,
-                ((2 * b0 as u16 + b1 as u16 + 1) / 3) as u8,
+                ((2 * r0 as u16 + r1 as u16) / 3) as u8,
+                ((2 * g0 as u16 + g1 as u16) / 3) as u8,
+                ((2 * b0 as u16 + b1 as u16) / 3) as u8,
                 255,
             ],
             [
-                ((r0 as u16 + 2 * r1 as u16 + 1) / 3) as u8,
-                ((g0 as u16 + 2 * g1 as u16 + 1) / 3) as u8,
-                ((b0 as u16 + 2 * b1 as u16 + 1) / 3) as u8,
+                ((r0 as u16 + 2 * r1 as u16) / 3) as u8,
+                ((g0 as u16 + 2 * g1 as u16) / 3) as u8,
+                ((b0 as u16 + 2 * b1 as u16) / 3) as u8,
                 255,
             ],
         ]
@@ -2530,6 +2506,8 @@ mod tests {
         let mut solid_total = 0usize;
         let mut nonsolid_match = 0usize;
         let mut nonsolid_total = 0usize;
+        let mut nonsolid_same_endpoints = 0usize;
+        let mut nonsolid_diff_endpoints = 0usize;
 
         for &(id, width, height) in test_textures {
             let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
@@ -2593,7 +2571,15 @@ mod tests {
                         if matched { solid_match += 1; }
                     } else {
                         nonsolid_total += 1;
-                        if matched { nonsolid_match += 1; }
+                        if matched {
+                            nonsolid_match += 1;
+                        } else {
+                            if our_block[0..4] == ref_block[0..4] {
+                                nonsolid_same_endpoints += 1;
+                            } else {
+                                nonsolid_diff_endpoints += 1;
+                            }
+                        }
                     }
                 }
 
@@ -2609,6 +2595,13 @@ mod tests {
         eprintln!("  Non-solid blocks: {}/{} match ({:.2}%)",
             nonsolid_match, nonsolid_total,
             if nonsolid_total > 0 { (nonsolid_match as f64 / nonsolid_total as f64) * 100.0 } else { 0.0 });
+
+        let nonsolid_mismatch = nonsolid_total - nonsolid_match;
+        eprintln!("  Non-solid endpoint analysis:");
+        eprintln!("    Same endpoints, different indices: {}/{}",
+            nonsolid_same_endpoints, nonsolid_mismatch);
+        eprintln!("    Different endpoints: {}/{}",
+            nonsolid_diff_endpoints, nonsolid_mismatch);
 
         eprintln!("  OVERALL: {}/{} blocks match ({:.2}%)",
             matching_blocks, total_blocks,
