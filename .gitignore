@@ -48,6 +48,10 @@ research/
 # ── Internal planning docs ──
 docs/plans/
 docs/specs/
+docs/original/
+
+# ── Project instructions (local only) ──
+CLAUDE.md
 *.json
 !package.json
 !package-lock.json
