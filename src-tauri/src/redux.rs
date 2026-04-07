@@ -647,7 +647,6 @@ fn decode_rgb565(c: u16) -> (u8, u8, u8) {
 }
 
 /// Encode (R, G, B) → RGB565.
-#[cfg(test)]
 #[inline]
 fn encode_rgb565(r: u8, g: u8, b: u8) -> u16 {
     let r5 = (r as u16 * 31 / 255) & 0x1F;
@@ -733,7 +732,81 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
 /// Uses bounding-box endpoint selection for speed. Quality is sufficient for
 /// mipmap generation where the source is already DXT-compressed.
 fn encode_dxt1_block(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
-    // Solid-color fast path: if all 16 pixels have the same RGB, use lookup tables.
+    // Check for transparent pixels (alpha=0).
+    // DXT1 3-color mode (c0 <= c1) uses index 3 for transparent black.
+    let has_transparent = pixels.iter().any(|p| p[3] == 0);
+
+    if has_transparent {
+        let opaque_count = pixels.iter().filter(|p| p[3] > 0).count();
+
+        if opaque_count == 0 {
+            // All transparent — 3-color mode, all index 3.
+            // c0=0 < c1=1 guarantees 3-color mode.
+            let mut out = [0u8; 8];
+            out[2] = 1; // c1 = 0x0001
+            out[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+            return out;
+        }
+
+        // Mixed: some opaque, some transparent.
+        // Bounding box of opaque pixels for endpoints.
+        let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
+        let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
+        for p in pixels.iter().filter(|p| p[3] > 0) {
+            min_r = min_r.min(p[0]); min_g = min_g.min(p[1]); min_b = min_b.min(p[2]);
+            max_r = max_r.max(p[0]); max_g = max_g.max(p[1]); max_b = max_b.max(p[2]);
+        }
+
+        let mut c0 = encode_rgb565(min_r, min_g, min_b);
+        let mut c1 = encode_rgb565(max_r, max_g, max_b);
+
+        // Ensure c0 <= c1 for 3-color mode
+        if c0 > c1 { std::mem::swap(&mut c0, &mut c1); }
+        if c0 == c1 && c1 < 0xFFFF { c1 += 1; }
+
+        // Build 3-color palette
+        let (r0, g0, b0) = decode_rgb565(c0);
+        let (r1, g1, b1) = decode_rgb565(c1);
+        let palette: [(i16, i16, i16); 3] = [
+            (r0 as i16, g0 as i16, b0 as i16),
+            (r1 as i16, g1 as i16, b1 as i16),
+            (
+                ((r0 as i16 + r1 as i16) / 2),
+                ((g0 as i16 + g1 as i16) / 2),
+                ((b0 as i16 + b1 as i16) / 2),
+            ),
+        ];
+
+        // Assign indices: transparent → 3, opaque → nearest palette entry
+        let mut indices = 0u32;
+        for (i, p) in pixels.iter().enumerate() {
+            if p[3] == 0 {
+                indices |= 3 << (i * 2);
+            } else {
+                let pr = p[0] as i16;
+                let pg = p[1] as i16;
+                let pb = p[2] as i16;
+                let mut best_dist = i32::MAX;
+                let mut best_sel = 0u32;
+                for (sel, &(cr, cg, cb)) in palette.iter().enumerate() {
+                    let dr = (pr - cr) as i32;
+                    let dg = (pg - cg) as i32;
+                    let db = (pb - cb) as i32;
+                    let dist = dr * dr + dg * dg + db * db;
+                    if dist < best_dist { best_dist = dist; best_sel = sel as u32; }
+                }
+                indices |= best_sel << (i * 2);
+            }
+        }
+
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&c0.to_le_bytes());
+        out[2..4].copy_from_slice(&c1.to_le_bytes());
+        out[4..8].copy_from_slice(&indices.to_le_bytes());
+        return out;
+    }
+
+    // ── All opaque: existing path ──
     // Solid-color fast path: check if all pixels share the same RGB.
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
     let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
@@ -1556,6 +1629,52 @@ mod tests {
         let decoded = decode_bc4_block(&mip);
         for &v in &decoded {
             assert!((v as i16 - 200).abs() <= 2, "BC4 mip value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dxt1a_transparency_preserved() {
+        // 3-color mode block: c0=0x1082 < c1=0xef7d, all index 3 = transparent
+        let block = [0x82, 0x10, 0x7d, 0xef, 0xff, 0xff, 0xff, 0xff];
+        let pixels = decode_dxt1_block(&block);
+        assert_eq!(pixels[0][3], 0, "Should decode as transparent");
+
+        let re_encoded = encode_dxt1_block(&pixels);
+        let re_decoded = decode_dxt1_block(&re_encoded);
+        for i in 0..16 {
+            assert_eq!(re_decoded[i][3], 0,
+                "Pixel {} should stay transparent after roundtrip, got alpha={}", i, re_decoded[i][3]);
+        }
+    }
+
+    #[test]
+    fn test_dxt1a_mixed_transparency() {
+        let mut pixels = [[0u8; 4]; 16];
+        for i in 0..8 { pixels[i] = [255, 0, 0, 255]; }
+        for i in 8..16 { pixels[i] = [0, 0, 0, 0]; }
+
+        let encoded = encode_dxt1_block(&pixels);
+        let c0 = u16::from_le_bytes([encoded[0], encoded[1]]);
+        let c1 = u16::from_le_bytes([encoded[2], encoded[3]]);
+        assert!(c0 <= c1, "Should be 3-color mode, got c0={} c1={}", c0, c1);
+
+        let decoded = decode_dxt1_block(&encoded);
+        for i in 8..16 {
+            assert_eq!(decoded[i][3], 0, "Pixel {} should be transparent", i);
+        }
+        for i in 0..8 {
+            assert_eq!(decoded[i][3], 255, "Pixel {} should be opaque", i);
+        }
+    }
+
+    #[test]
+    fn test_dxt1_opaque_unchanged() {
+        let mut pixels = [[0u8; 4]; 16];
+        for i in 0..16 { pixels[i] = [128, 64, 32, 255]; }
+        let encoded = encode_dxt1_block(&pixels);
+        let decoded = decode_dxt1_block(&encoded);
+        for i in 0..16 {
+            assert_eq!(decoded[i][3], 255, "Opaque pixel {} got alpha={}", i, decoded[i][3]);
         }
     }
 
