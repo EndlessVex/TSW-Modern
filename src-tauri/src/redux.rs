@@ -1205,11 +1205,15 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                     let grid_vals = [c_31, c_63, c_31];
                     let inv_vals = [c_1_31, c_1_63, c_1_31];
                     for k in 0..3 {
-                        // floor(ep * grid + 0.5) * inv_grid
-                        let qa = x87_fma_f32(ep_a[k], grid_vals[k], c_half);
-                        ep_a[k] = qa.floor() * inv_vals[k];
-                        let qb = x87_fma_f32(ep_b[k], grid_vals[k], c_half);
-                        ep_b[k] = qb.floor() * inv_vals[k];
+                        // Grid-snap matching original's FUN_006818c0 path:
+                        // Original: computes ep*grid+0.5 at x87 80-bit, casts to f64,
+                        // floors the f64, then stores result as f32.
+                        // Critical: must floor at f64 precision, NOT f32, because
+                        // f32 truncation can round up past integer boundaries.
+                        let qa = (ep_a[k] as f64 * grid_vals[k] as f64 + 0.5f64).floor();
+                        ep_a[k] = (qa * inv_vals[k] as f64) as f32;
+                        let qb = (ep_b[k] as f64 * grid_vals[k] as f64 + 0.5f64).floor();
+                        ep_b[k] = (qb * inv_vals[k] as f64) as f32;
                     }
 
                     // Error computation
@@ -3881,6 +3885,109 @@ mod tests {
             max_diff = max_diff.max((ref_decoded[i][c] as i32 - our_decoded[i][c] as i32).abs());
         }}
         eprintln!("  Max decoded pixel diff: {}", max_diff);
+
+        // Detailed trace of encoder internals
+        let (colors, weights, _order, n) = build_color_set(&pixels, false);
+        eprintln!("\n  build_color_set output:");
+        eprintln!("    n = {}", n);
+
+        // Show PCA axis (recompute)
+        let total_weight: f32 = weights.iter().sum();
+        let mut centroid = [0.0f32; 3];
+        for (c, &w) in colors.iter().zip(weights.iter()) {
+            for k in 0..3 { centroid[k] += c[k] * w; }
+        }
+        for k in 0..3 { centroid[k] /= total_weight; }
+        eprintln!("    centroid: ({:.6}, {:.6}, {:.6})", centroid[0], centroid[1], centroid[2]);
+
+        // Show first few sorted colors
+        for i in 0..n.min(4) {
+            eprintln!("    sorted[{}]: ({:.6}, {:.6}, {:.6}) w={:.4}", i,
+                colors[i][0], colors[i][1], colors[i][2], weights[i]);
+        }
+        if n > 4 { eprintln!("    ... ({} more)", n - 4); }
+
+        // Run partition search to find best (s,t,u) and endpoints
+        let mut wt_colors = vec![[0.0f32; 3]; n];
+        for i in 0..n { for k in 0..3 { wt_colors[i][k] = colors[i][k] * weights[i]; } }
+        let mut total_rgb = [0.0f32; 3];
+        for i in 0..n { for k in 0..3 { total_rgb[k] += wt_colors[i][k]; } }
+
+        let mut best_err = f32::MAX;
+        let mut best_s = 0; let mut best_t = 0; let mut best_u = 0;
+        let mut best_ep_a = [0.0f32; 3]; let mut best_ep_b = [0.0f32; 3];
+        let mut best_ep_a_raw = [0.0f32; 3]; let mut best_ep_b_raw = [0.0f32; 3];
+
+        let mut outer_rgb = [0.0f32; 3]; let mut outer_w = 0.0f32;
+        for s in 0..=n {
+            let mut mid_rgb = [0.0f32; 3]; let mut mid_w = 0.0f32;
+            for t in s..=n {
+                let mut inner_rgb = [0.0f32; 3]; let mut inner_w = 0.0f32;
+                for u in t..=n {
+                    let c49: f32 = 4.0/9.0; let c19: f32 = 1.0/9.0; let c29: f32 = 2.0/9.0;
+                    let c23: f32 = 2.0/3.0; let c13: f32 = 1.0/3.0;
+                    let aa = inner_w * c19 + mid_w * c49 + outer_w;
+                    let bb = inner_w * c49 + (total_weight - outer_w - mid_w - inner_w) + mid_w * c19;
+                    let ab = (inner_w + mid_w) * c29;
+                    let det = aa * bb - ab * ab;
+                    if det.abs() >= f32::MIN_POSITIVE {
+                        let inv = 1.0f32 / det;
+                        let mut ep_a = [0.0f32; 3]; let mut ep_b = [0.0f32; 3];
+                        let mut err = 0.0f32;
+                        for k in 0..3 {
+                            let ba = mid_rgb[k] * c23 + outer_rgb[k] + inner_rgb[k] * c13;
+                            let bb_val = total_rgb[k] - ba;
+                            let a_k = (ba * bb - bb_val * ab) * inv;
+                            let b_k = (bb_val * aa - ba * ab) * inv;
+                            ep_a[k] = a_k.clamp(0.0, 1.0);
+                            ep_b[k] = b_k.clamp(0.0, 1.0);
+                        }
+                        let raw_a = ep_a; let raw_b = ep_b;
+                        // grid-snap at f64
+                        let grids = [31.0f64, 63.0, 31.0];
+                        let inv_grids = [1.0f64/31.0, 1.0/63.0, 1.0/31.0];
+                        for k in 0..3 {
+                            let qa = (ep_a[k] as f64 * grids[k] + 0.5).floor();
+                            ep_a[k] = (qa * inv_grids[k]) as f32;
+                            let qb = (ep_b[k] as f64 * grids[k] + 0.5).floor();
+                            ep_b[k] = (qb * inv_grids[k]) as f32;
+                        }
+                        for k in 0..3 {
+                            let ba = mid_rgb[k] * c23 + outer_rgb[k] + inner_rgb[k] * c13;
+                            let bb_val = total_rgb[k] - ba;
+                            err += aa * ep_a[k]*ep_a[k] + bb * ep_b[k]*ep_b[k]
+                                + 2.0 * ab * ep_a[k]*ep_b[k]
+                                - 2.0 * (ba * ep_a[k] + bb_val * ep_b[k]);
+                        }
+                        if err < best_err {
+                            best_err = err; best_s = s; best_t = t; best_u = u;
+                            best_ep_a = ep_a; best_ep_b = ep_b;
+                            best_ep_a_raw = raw_a; best_ep_b_raw = raw_b;
+                        }
+                    }
+                    if u < n { for k in 0..3 { inner_rgb[k] += wt_colors[u][k]; } inner_w += weights[u]; }
+                }
+                if t < n { for k in 0..3 { mid_rgb[k] += wt_colors[t][k]; } mid_w += weights[t]; }
+            }
+            if s < n { for k in 0..3 { outer_rgb[k] += wt_colors[s][k]; } outer_w += weights[s]; }
+        }
+
+        eprintln!("\n  Best partition: s={}, t={}, u={}", best_s, best_t, best_u);
+        eprintln!("    Raw ep_a: ({:.8}, {:.8}, {:.8})", best_ep_a_raw[0], best_ep_a_raw[1], best_ep_a_raw[2]);
+        eprintln!("    Raw ep_b: ({:.8}, {:.8}, {:.8})", best_ep_b_raw[0], best_ep_b_raw[1], best_ep_b_raw[2]);
+
+        // Quantize
+        for k in 0..3 {
+            let grid = [31.0f64, 63.0, 31.0][k];
+            let qa = (best_ep_a_raw[k] as f64 * grid + 0.5).floor();
+            let qb = (best_ep_b_raw[k] as f64 * grid + 0.5).floor();
+            eprintln!("    Channel {}: ep_a raw={:.8} quant={} | ep_b raw={:.8} quant={}",
+                k, best_ep_a_raw[k], qa, best_ep_b_raw[k], qb);
+        }
+
+        eprintln!("    Snapped ep_a: ({:.8}, {:.8}, {:.8})", best_ep_a[0], best_ep_a[1], best_ep_a[2]);
+        eprintln!("    Snapped ep_b: ({:.8}, {:.8}, {:.8})", best_ep_b[0], best_ep_b[1], best_ep_b[2]);
+        eprintln!("    Best err: {:.10}", best_err);
     }
 
 }
