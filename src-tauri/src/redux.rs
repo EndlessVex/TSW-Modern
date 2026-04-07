@@ -3430,4 +3430,140 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_pixel_nonsolid() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip0_size = 128 * 128 * 8;
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+        let mip1_size = 64 * 64 * 8;
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // Decode mip0 to pixels
+        let mut src_pixels = vec![[0u8; 4]; 512 * 512];
+        for by in 0..128 {
+            for bx in 0..128 {
+                let off = (by * 128 + bx) * 8;
+                let block = &ref_mip0[off..off + 8];
+                let pixels = decode_dxt1_block(block);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        src_pixels[(by * 4 + py) * 512 + bx * 4 + px] = pixels[py * 4 + px];
+                    }
+                }
+            }
+        }
+
+        // Box-filter to 256x256 (truncating)
+        let mut dst_pixels = vec![[0u8; 4]; 256 * 256];
+        for y in 0..256 {
+            for x in 0..256 {
+                let p00 = src_pixels[(y * 2) * 512 + x * 2];
+                let p10 = src_pixels[(y * 2) * 512 + x * 2 + 1];
+                let p01 = src_pixels[(y * 2 + 1) * 512 + x * 2];
+                let p11 = src_pixels[(y * 2 + 1) * 512 + x * 2 + 1];
+                for c in 0..4 {
+                    dst_pixels[y * 256 + x][c] = ((p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32) / 4) as u8;
+                }
+            }
+        }
+
+        // For non-solid blocks: compare ALL 16 pixel positions
+        let mut total_pixels = 0u64;
+        let mut exact_match = 0u64;
+        let mut off_by_1 = 0u64;
+        let mut off_by_2plus = 0u64;
+        let mut channel_diffs = [0i64; 3]; // signed sum of (ours - ref_decoded) per channel
+        let mut abs_diffs = [0u64; 3];
+        let mut max_diff = 0i32;
+        let mut blocks_checked = 0u32;
+        let mut sample_printed = 0;
+
+        for b in 0..(64 * 64) {
+            let block = &ref_mip1[b * 8..(b + 1) * 8];
+            let c0 = u16::from_le_bytes([block[0], block[1]]);
+            let c1 = u16::from_le_bytes([block[2], block[3]]);
+            if c0 == c1 { continue; } // skip solid
+
+            blocks_checked += 1;
+            let ref_decoded = decode_dxt1_block(block);
+            let bx = b % 64;
+            let by = b / 64;
+
+            for py in 0..4 {
+                for px in 0..4 {
+                    let our_pixel = dst_pixels[(by * 4 + py) * 256 + bx * 4 + px];
+                    let ref_pixel = ref_decoded[py * 4 + px];
+                    total_pixels += 1;
+
+                    for c in 0..3 {
+                        let diff = our_pixel[c] as i32 - ref_pixel[c] as i32;
+                        channel_diffs[c] += diff as i64;
+                        abs_diffs[c] += diff.unsigned_abs() as u64;
+                        max_diff = max_diff.max(diff.abs());
+                    }
+
+                    let pixel_max = (0..3).map(|c| (our_pixel[c] as i32 - ref_pixel[c] as i32).abs()).max().unwrap();
+                    if pixel_max == 0 { exact_match += 1; }
+                    else if pixel_max == 1 { off_by_1 += 1; }
+                    else { off_by_2plus += 1; }
+                }
+            }
+
+            // Print first 3 non-solid blocks in detail
+            if sample_printed < 3 {
+                sample_printed += 1;
+                eprintln!("\n  Non-solid block {} ({},{}):", b, bx, by);
+                eprintln!("    Ref block: {:02x?}", block);
+                for row in 0..4 {
+                    let mut our_row = String::new();
+                    let mut ref_row = String::new();
+                    for col in 0..4 {
+                        let op = dst_pixels[(by*4+row)*256 + bx*4+col];
+                        let rp = ref_decoded[row*4+col];
+                        our_row += &format!("({:3},{:3},{:3}) ", op[0], op[1], op[2]);
+                        ref_row += &format!("({:3},{:3},{:3}) ", rp[0], rp[1], rp[2]);
+                    }
+                    eprintln!("    Our row{}: {}", row, our_row);
+                    eprintln!("    Ref row{}: {}", row, ref_row);
+                }
+            }
+        }
+
+        eprintln!("\n  Non-solid pixel comparison (texture 19767):");
+        eprintln!("    Blocks checked: {}", blocks_checked);
+        eprintln!("    Total pixels: {}", total_pixels);
+        eprintln!("    Exact match: {} ({:.1}%)", exact_match, exact_match as f64 / total_pixels as f64 * 100.0);
+        eprintln!("    Off by 1: {} ({:.1}%)", off_by_1, off_by_1 as f64 / total_pixels as f64 * 100.0);
+        eprintln!("    Off by 2+: {} ({:.1}%)", off_by_2plus, off_by_2plus as f64 / total_pixels as f64 * 100.0);
+        eprintln!("    Max per-channel diff: {}", max_diff);
+        eprintln!("    Mean signed diff R/G/B: {:.3} / {:.3} / {:.3}",
+            channel_diffs[0] as f64 / total_pixels as f64,
+            channel_diffs[1] as f64 / total_pixels as f64,
+            channel_diffs[2] as f64 / total_pixels as f64);
+        eprintln!("    Mean abs diff R/G/B: {:.3} / {:.3} / {:.3}",
+            abs_diffs[0] as f64 / total_pixels as f64,
+            abs_diffs[1] as f64 / total_pixels as f64,
+            abs_diffs[2] as f64 / total_pixels as f64);
+    }
+
 }
