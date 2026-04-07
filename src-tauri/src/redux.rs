@@ -2605,4 +2605,147 @@ mod tests {
         // If our re-encoded doesn't match, the issue is in the encoder
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_diagnose_nonsolid() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut file = std::fs::File::open(&ref_path).unwrap();
+            file.seek(std::io::SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let width = 512usize;
+        let height = 512usize;
+        let block_size = 8;
+        let fctx_hdr = 40;
+
+        // Compute mip offsets (stored smallest-first)
+        let mut mip_sizes = Vec::new();
+        let (mut w, mut h) = (width, height);
+        loop {
+            mip_sizes.push(((w+3)/4) * ((h+3)/4) * block_size);
+            if w <= 4 && h <= 4 { break; }
+            w = (w/2).max(4); h = (h/2).max(4);
+        }
+        let mut offsets = vec![0usize; mip_sizes.len()];
+        let mut off = fctx_hdr;
+        for i in (0..mip_sizes.len()).rev() { offsets[i] = off; off += mip_sizes[i]; }
+
+        let ref_mip0 = &ref_data[offsets[0]..offsets[0]+mip_sizes[0]];
+        let ref_mip1 = &ref_data[offsets[1]..offsets[1]+mip_sizes[1]];
+
+        // Generate our mip1
+        let our_mip1 = generate_mip(ref_mip0, 512, 512, 256, 256, TextureCodec::Dxt1, false);
+
+        // Now replicate the internal pixel generation to get the input pixels
+        // Step 1: Decode mip0 to pixel buffer
+        let prev_bx = 512 / 4;
+        let prev_by = 512 / 4;
+        let mut src_pixels = vec![[0u8; 4]; 512 * 512];
+        for by in 0..prev_by {
+            for bx in 0..prev_bx {
+                let block_off = (by * prev_bx + bx) * block_size;
+                let block = &ref_mip0[block_off..block_off+block_size];
+                let block_pixels = decode_dxt1_block(block);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        src_pixels[(by*4+py)*512 + bx*4+px] = block_pixels[py*4+px];
+                    }
+                }
+            }
+        }
+
+        // Step 2: Box-filter to 256x256
+        let mut dst_pixels = vec![[0u8; 4]; 256 * 256];
+        for y in 0..256 {
+            for x in 0..256 {
+                let p00 = src_pixels[(y*2)*512 + x*2];
+                let p10 = src_pixels[(y*2)*512 + x*2+1];
+                let p01 = src_pixels[(y*2+1)*512 + x*2];
+                let p11 = src_pixels[(y*2+1)*512 + x*2+1];
+                for c in 0..3 {
+                    let avg = (p00[c] as f32 / 255.0 + p10[c] as f32 / 255.0
+                              + p01[c] as f32 / 255.0 + p11[c] as f32 / 255.0) / 4.0;
+                    dst_pixels[y * 256 + x][c] = (avg * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+                dst_pixels[y * 256 + x][3] = 255;
+            }
+        }
+
+        // Find first 5 non-solid mismatching blocks
+        let mip1_bx = 256 / 4; // 64
+        let num_blocks = our_mip1.len() / block_size;
+        let mut found = 0;
+        for b in 0..num_blocks {
+            let our_block = &our_mip1[b*block_size..(b+1)*block_size];
+            let ref_block = &ref_mip1[b*block_size..(b+1)*block_size];
+            if our_block == ref_block { continue; }
+
+            // Extract 4x4 pixel block
+            let bx_pos = b % mip1_bx;
+            let by_pos = b / mip1_bx;
+            let mut pixels = [[0u8; 4]; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    pixels[py*4+px] = dst_pixels[(by_pos*4+py)*256 + bx_pos*4+px];
+                }
+            }
+
+            // Check if solid
+            let first = (pixels[0][0], pixels[0][1], pixels[0][2]);
+            let is_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first);
+            if is_solid { continue; }
+
+            // Encode with our encoder
+            let our_encoded = encode_dxt1_block(&pixels, false);
+
+            // Count unique colors
+            let mut unique = std::collections::HashSet::new();
+            for p in &pixels { unique.insert((p[0], p[1], p[2])); }
+
+            eprintln!("\n  Block {} (pos {},{}) — {} unique colors:", b, bx_pos, by_pos, unique.len());
+            eprintln!("    Ref block:   {:02x?}", ref_block);
+            eprintln!("    Our mip1:    {:02x?}", our_block);
+            eprintln!("    Our encode:  {:02x?}", &our_encoded[..]);
+            eprintln!("    Our==OurMip: {}", our_block == &our_encoded[..]);
+
+            // Show first few pixels
+            for row in 0..2 {
+                eprintln!("    pixels row{}: {:?} {:?} {:?} {:?}",
+                    row, pixels[row*4], pixels[row*4+1], pixels[row*4+2], pixels[row*4+3]);
+            }
+
+            // Decode ref and our blocks to see RGB difference
+            let ref_decoded = decode_dxt1_block(ref_block);
+            let our_decoded = decode_dxt1_block(our_block);
+            let mut max_diff = 0i32;
+            for i in 0..16 {
+                for c in 0..3 {
+                    let d = (ref_decoded[i][c] as i32 - our_decoded[i][c] as i32).abs();
+                    max_diff = max_diff.max(d);
+                }
+            }
+            eprintln!("    Max pixel diff (ref vs our decoded): {}", max_diff);
+
+            found += 1;
+            if found >= 5 { break; }
+        }
+
+        if found == 0 {
+            eprintln!("No non-solid mismatching blocks found!");
+        }
+    }
+
 }
