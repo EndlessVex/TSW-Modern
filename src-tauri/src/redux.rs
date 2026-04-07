@@ -762,30 +762,20 @@ fn decode_dxt1_block(data: &[u8]) -> [[u8; 4]; 16] {
     pixels
 }
 
-/// Encode a solid-color DXT1 block using precomputed optimal RGB565 endpoint pairs.
-/// Selector bits are always 0xAAAAAAAA (all texels select palette entry 2).
-/// If c0 < c1, swap endpoints and use selector 0x55555555.
+/// Encode a solid-color DXT1 block matching the original game's approach:
+/// both endpoints set to the nearest RGB565 value, all indices = 0.
 fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
-    let [r0, r1] = DXT1_SOLID_5BIT[r as usize];
-    let [g0, g1] = DXT1_SOLID_6BIT[g as usize];
-    let [b0, b1] = DXT1_SOLID_5BIT[b as usize];
-
-    let c0 = ((r0 as u16) << 11) | ((g0 as u16) << 5) | (b0 as u16);
-    let c1 = ((r1 as u16) << 11) | ((g1 as u16) << 5) | (b1 as u16);
+    // Quantize to nearest RGB565 using round-to-nearest (matching the original's
+    // floor(normalized * scale + 0.5) formula from the Compress4 decompilation)
+    let r5 = ((r as u16 * 31 + 127) / 255) as u16;
+    let g6 = ((g as u16 * 63 + 127) / 255) as u16;
+    let b5 = ((b as u16 * 31 + 127) / 255) as u16;
+    let c = (r5 << 11) | (g6 << 5) | b5;
 
     let mut block = [0u8; 8];
-    if c0 < c1 {
-        block[0..2].copy_from_slice(&c1.to_le_bytes());
-        block[2..4].copy_from_slice(&c0.to_le_bytes());
-        // 0xAAAAAAAA ^ 0x55555555 = 0xFFFFFFFF (all index 3)
-        // After swap, index 3 = 2/3*orig_c0 + 1/3*orig_c1 (the target color).
-        // Previous bug: used 0x55555555 (index 1 = raw endpoint, much worse quality).
-        block[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-    } else {
-        block[0..2].copy_from_slice(&c0.to_le_bytes());
-        block[2..4].copy_from_slice(&c1.to_le_bytes());
-        block[4..8].copy_from_slice(&0xAAAAAAAAu32.to_le_bytes());
-    }
+    block[0..2].copy_from_slice(&c.to_le_bytes());
+    block[2..4].copy_from_slice(&c.to_le_bytes());
+    // indices = 0: all pixels select palette entry 0 (= c0 = c1)
     block
 }
 
@@ -1025,14 +1015,18 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                     ep_b[k] = (ep_b[k] * grid[k] + 0.5).floor() * inv_grid[k];
                 }
 
+                // Per-channel error metric weights (squared).
+                // The original stores these at object offsets 0x124/0x128/0x12c.
+                let metric = [1.0f32, 1.0, 1.0];
+
                 let mut err = 0.0f32;
                 for k in 0..3 {
                     let beta_a = sum_a[k] + sum_b[k] * (2.0f32 / 3.0) + sum_c[k] * (1.0f32 / 3.0);
                     let beta_b = sum_d[k] + sum_c[k] * (2.0f32 / 3.0) + sum_b[k] * (1.0f32 / 3.0);
-                    err += alpha_aa * ep_a[k] * ep_a[k]
+                    err += (alpha_aa * ep_a[k] * ep_a[k]
                         + alpha_bb * ep_b[k] * ep_b[k]
                         + 2.0 * alpha_ab * ep_a[k] * ep_b[k]
-                        - 2.0 * (beta_a * ep_a[k] + beta_b * ep_b[k]);
+                        - 2.0 * (beta_a * ep_a[k] + beta_b * ep_b[k])) * metric[k];
                 }
                 if err < best_err {
                     best_err = err;
@@ -2439,6 +2433,91 @@ mod tests {
             total_blocks += tex_total;
             matching_blocks += tex_match;
         }
+
+        // Separate scan: count solid vs non-solid block matches across all textures
+        let mut solid_match = 0usize;
+        let mut solid_total = 0usize;
+        let mut nonsolid_match = 0usize;
+        let mut nonsolid_total = 0usize;
+
+        for &(id, width, height) in test_textures {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            let mut mip_sizes = Vec::new();
+            let mut w = width;
+            let mut h = height;
+            loop {
+                let bw = (w + 3) / 4;
+                let bh = (h + 3) / 4;
+                mip_sizes.push(bw * bh * block_size);
+                if w <= 4 && h <= 4 { break; }
+                w = (w / 2).max(4);
+                h = (h / 2).max(4);
+            }
+            let mip_count = mip_sizes.len();
+
+            // Extract ref mips (stored smallest-first after header)
+            let mut ref_mips: Vec<&[u8]> = Vec::new();
+            let mut offset = fctx_header_size;
+            for i in (0..mip_count).rev() {
+                ref_mips.push(&ref_data[offset..offset + mip_sizes[i]]);
+                offset += mip_sizes[i];
+            }
+            ref_mips.reverse(); // ref_mips[0] = mip0
+
+            // Regenerate mips and compare, tracking solid vs non-solid
+            let mut current_data = ref_mips[0].to_vec();
+            let mut current_w = width;
+            let mut current_h = height;
+
+            for mip_idx in 1..mip_count {
+                let new_w = (current_w / 2).max(4);
+                let new_h = (current_h / 2).max(4);
+
+                let our_mip = generate_mip(
+                    &current_data, current_w, current_h, new_w, new_h,
+                    TextureCodec::Dxt1, false,
+                );
+
+                let ref_mip = ref_mips[mip_idx];
+                let num_blocks = ref_mip.len() / block_size;
+
+                for b in 0..num_blocks {
+                    let ref_block = &ref_mip[b * block_size..(b + 1) * block_size];
+                    let our_block = &our_mip[b * block_size..(b + 1) * block_size];
+                    let c0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                    let c1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                    let solid = c0 == c1;
+                    let matched = our_block == ref_block;
+                    if solid {
+                        solid_total += 1;
+                        if matched { solid_match += 1; }
+                    } else {
+                        nonsolid_total += 1;
+                        if matched { nonsolid_match += 1; }
+                    }
+                }
+
+                current_data = our_mip;
+                current_w = new_w;
+                current_h = new_h;
+            }
+        }
+
+        eprintln!("  Solid blocks:     {}/{} match ({:.2}%)",
+            solid_match, solid_total,
+            if solid_total > 0 { (solid_match as f64 / solid_total as f64) * 100.0 } else { 0.0 });
+        eprintln!("  Non-solid blocks: {}/{} match ({:.2}%)",
+            nonsolid_match, nonsolid_total,
+            if nonsolid_total > 0 { (nonsolid_match as f64 / nonsolid_total as f64) * 100.0 } else { 0.0 });
 
         eprintln!("  OVERALL: {}/{} blocks match ({:.2}%)",
             matching_blocks, total_blocks,
