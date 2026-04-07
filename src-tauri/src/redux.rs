@@ -958,7 +958,7 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 /// 4-color ClusterFit encoder.
 /// Returns (encoded_block, weighted_error).
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
-    let (colors, weights, _order, n) = build_color_set(pixels);
+    let (colors, weights, order, n) = build_color_set(pixels);
 
     // Precompute cumulative sums for partition search
     let mut cum_w = vec![0.0f32; n + 1];
@@ -975,6 +975,21 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let mut best_err = f32::MAX;
     let mut best_ep0 = [0.0f32; 3];
     let mut best_ep1 = [0.0f32; 3];
+    let mut best_s = 0usize;
+    let mut best_t = 0usize;
+    let mut best_u = 0usize;
+
+    // x87 emulation: compute at f64 (proxy for 80-bit extended), truncate to f32
+    // at each named variable. This matches the original's x87 FPU behavior where
+    // intermediates are computed at 80-bit precision but stored to 32-bit float
+    // stack variables via fstp dword.
+    //
+    // Helper: compute expression at f64, truncate result to f32.
+    // f64 has enough mantissa bits (53) that f32*f32 products are exact in f64,
+    // so the final f32 rounding matches x87's 80-bit→32-bit rounding.
+    macro_rules! f32via64 {
+        ($expr:expr) => { ($expr) as f32 }
+    }
 
     for s in 0..=n {
         let w_a = cum_w[s];
@@ -984,12 +999,17 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                 let w_c = cum_w[u] - cum_w[t];
                 let w_d = cum_w[n] - cum_w[u];
 
-                let alpha_aa = w_a + w_b * (4.0f32 / 9.0) + w_c * (1.0f32 / 9.0);
-                let alpha_bb = w_d + w_c * (4.0f32 / 9.0) + w_b * (1.0f32 / 9.0);
-                let alpha_ab = (w_b + w_c) * (2.0f32 / 9.0);
-                let det = alpha_aa * alpha_bb - alpha_ab * alpha_ab;
+                // Each alpha is stored to f32 (fstp dword), but the sub-expressions
+                // stay at extended precision within the FPU
+                let alpha_aa: f32 = f32via64!(w_a as f64 + w_b as f64 * (4.0f64 / 9.0) + w_c as f64 * (1.0f64 / 9.0));
+                let alpha_bb: f32 = f32via64!(w_d as f64 + w_c as f64 * (4.0f64 / 9.0) + w_b as f64 * (1.0f64 / 9.0));
+                let alpha_ab: f32 = f32via64!((w_b as f64 + w_c as f64) * (2.0f64 / 9.0));
+
+                // Determinant: the products stay at extended precision before subtraction,
+                // avoiding catastrophic cancellation at f32
+                let det: f32 = f32via64!(alpha_aa as f64 * alpha_bb as f64 - alpha_ab as f64 * alpha_ab as f64);
                 if det.abs() < 1e-6 { continue; }
-                let inv_det: f32 = 1.0 / det;
+                let inv_det: f32 = f32via64!(1.0f64 / det as f64);
 
                 let sum_a = cum_rgb[s];
                 let sum_b = [cum_rgb[t][0] - cum_rgb[s][0], cum_rgb[t][1] - cum_rgb[s][1], cum_rgb[t][2] - cum_rgb[s][2]];
@@ -999,39 +1019,44 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
                 let mut ep_a = [0.0f32; 3];
                 let mut ep_b = [0.0f32; 3];
                 for k in 0..3 {
-                    let beta_a = sum_a[k] + sum_b[k] * (2.0f32 / 3.0) + sum_c[k] * (1.0f32 / 3.0);
-                    let beta_b = sum_d[k] + sum_c[k] * (2.0f32 / 3.0) + sum_b[k] * (1.0f32 / 3.0);
-                    let a_k = (beta_a * alpha_bb - beta_b * alpha_ab) * inv_det;
-                    let b_k = (beta_b * alpha_aa - beta_a * alpha_ab) * inv_det;
+                    // beta values: computed at extended precision, stored to f32
+                    let beta_a: f32 = f32via64!(sum_a[k] as f64 + sum_b[k] as f64 * (2.0f64 / 3.0) + sum_c[k] as f64 * (1.0f64 / 3.0));
+                    let beta_b: f32 = f32via64!(sum_d[k] as f64 + sum_c[k] as f64 * (2.0f64 / 3.0) + sum_b[k] as f64 * (1.0f64 / 3.0));
+                    // Endpoint solve: each multiply-subtract stays at extended precision
+                    let a_k: f32 = f32via64!((beta_a as f64 * alpha_bb as f64 - beta_b as f64 * alpha_ab as f64) * inv_det as f64);
+                    let b_k: f32 = f32via64!((beta_b as f64 * alpha_aa as f64 - beta_a as f64 * alpha_ab as f64) * inv_det as f64);
                     ep_a[k] = a_k.clamp(0.0, 1.0);
                     ep_b[k] = b_k.clamp(0.0, 1.0);
                 }
 
                 // Grid-snap: quantize to 5/6/5 then dequantize back
-                let grid = [31.0f32, 63.0, 31.0];
-                let inv_grid = [1.0f32 / 31.0, 1.0 / 63.0, 1.0 / 31.0];
                 for k in 0..3 {
-                    ep_a[k] = (ep_a[k] * grid[k] + 0.5).floor() * inv_grid[k];
-                    ep_b[k] = (ep_b[k] * grid[k] + 0.5).floor() * inv_grid[k];
+                    let grid = [31.0f64, 63.0, 31.0][k];
+                    let inv = [1.0f64 / 31.0, 1.0 / 63.0, 1.0 / 31.0][k];
+                    ep_a[k] = f32via64!((ep_a[k] as f64 * grid + 0.5).floor() * inv);
+                    ep_b[k] = f32via64!((ep_b[k] as f64 * grid + 0.5).floor() * inv);
                 }
-
-                // Per-channel error metric weights (squared).
-                // The original stores these at object offsets 0x124/0x128/0x12c.
-                let metric = [1.0f32, 1.0, 1.0];
 
                 let mut err = 0.0f32;
                 for k in 0..3 {
-                    let beta_a = sum_a[k] + sum_b[k] * (2.0f32 / 3.0) + sum_c[k] * (1.0f32 / 3.0);
-                    let beta_b = sum_d[k] + sum_c[k] * (2.0f32 / 3.0) + sum_b[k] * (1.0f32 / 3.0);
-                    err += (alpha_aa * ep_a[k] * ep_a[k]
-                        + alpha_bb * ep_b[k] * ep_b[k]
-                        + 2.0 * alpha_ab * ep_a[k] * ep_b[k]
-                        - 2.0 * (beta_a * ep_a[k] + beta_b * ep_b[k])) * metric[k];
+                    let beta_a: f32 = f32via64!(sum_a[k] as f64 + sum_b[k] as f64 * (2.0f64 / 3.0) + sum_c[k] as f64 * (1.0f64 / 3.0));
+                    let beta_b: f32 = f32via64!(sum_d[k] as f64 + sum_c[k] as f64 * (2.0f64 / 3.0) + sum_b[k] as f64 * (1.0f64 / 3.0));
+                    // Error per channel: entire expression at extended precision, then store to f32
+                    let ch_err: f32 = f32via64!(
+                        alpha_aa as f64 * ep_a[k] as f64 * ep_a[k] as f64
+                        + alpha_bb as f64 * ep_b[k] as f64 * ep_b[k] as f64
+                        + 2.0f64 * alpha_ab as f64 * ep_a[k] as f64 * ep_b[k] as f64
+                        - 2.0f64 * (beta_a as f64 * ep_a[k] as f64 + beta_b as f64 * ep_b[k] as f64)
+                    );
+                    err += ch_err;
                 }
                 if err < best_err {
                     best_err = err;
                     best_ep0 = ep_a;
                     best_ep1 = ep_b;
+                    best_s = s;
+                    best_t = t;
+                    best_u = u;
                 }
             }
         }
@@ -1049,32 +1074,60 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     let mut c0 = ((r0 as u16) << 11) | ((g0 as u16) << 5) | (b0 as u16);
     let mut c1 = ((r1 as u16) << 11) | ((g1 as u16) << 5) | (b1 as u16);
 
-    // Assign closest palette indices using the ORIGINAL endpoint order
-    // (before any swap for 4-color mode enforcement).
-    let (dr0, dg0, db0) = decode_rgb565(c0);
-    let (dr1, dg1, db1) = decode_rgb565(c1);
-    let palette: [(i16, i16, i16); 4] = [
-        (dr0 as i16, dg0 as i16, db0 as i16),
-        (dr1 as i16, dg1 as i16, db1 as i16),
-        ((2 * dr0 as i16 + dr1 as i16 + 1) / 3, (2 * dg0 as i16 + dg1 as i16 + 1) / 3, (2 * db0 as i16 + db1 as i16 + 1) / 3),
-        ((dr0 as i16 + 2 * dr1 as i16 + 1) / 3, (dg0 as i16 + 2 * dg1 as i16 + 1) / 3, (db0 as i16 + 2 * db1 as i16 + 1) / 3),
-    ];
+    // Assign indices from partition boundaries (matching the original encoder).
+    // The partition search found (best_s, best_t, best_u) which divide the n
+    // sorted unique colors into 4 groups:
+    //   sorted[0..s]   → index 0 (endpoint c0)
+    //   sorted[s..t]   → index 2 (2/3 c0 + 1/3 c1)
+    //   sorted[t..u]   → index 3 (1/3 c0 + 2/3 c1)
+    //   sorted[u..n]   → index 1 (endpoint c1)
+    //
+    // build_color_set returns `order`: the mapping from unique color index to
+    // sorted position. Each pixel was assigned a unique color index during dedup
+    // (stored implicitly by position in the colors array). We need to map each
+    // pixel back through the dedup + sort to find its partition group.
+
+    // Step 1: Build sorted_position → DXT1 index mapping for unique colors
+    let mut unique_to_index = vec![0u32; n];
+    for i in 0..n {
+        let idx = if i < best_s { 0u32 }
+            else if i < best_t { 2 }
+            else if i < best_u { 3 }
+            else { 1 };
+        unique_to_index[i] = idx;
+    }
+
+    // Step 2: For each pixel, find its unique color, look up sorted position, get index
+    // We need to re-do the dedup mapping since build_color_set doesn't return it.
+    // Rebuild the pixel → unique color mapping.
+    let mut color_bytes_list: Vec<[u8; 3]> = Vec::with_capacity(16);
+    let mut pixel_to_unique = [0usize; 16];
+    for (i, p) in pixels.iter().enumerate() {
+        let rgb = [p[0], p[1], p[2]];
+        let mut found = None;
+        for (j, existing) in color_bytes_list.iter().enumerate() {
+            if *existing == rgb { found = Some(j); break; }
+        }
+        let unique_idx = match found {
+            Some(j) => j,
+            None => { color_bytes_list.push(rgb); color_bytes_list.len() - 1 }
+        };
+        pixel_to_unique[i] = unique_idx;
+    }
+
+    // order[sorted_pos] = original_unique_idx, so we need the inverse:
+    // inv_order[original_unique_idx] = sorted_pos
+    let mut inv_order = vec![0usize; n];
+    for (sorted_pos, &orig_idx) in order.iter().enumerate() {
+        inv_order[orig_idx] = sorted_pos;
+    }
 
     let mut indices = 0u32;
-    for (i, p) in pixels.iter().enumerate() {
-        let pr = p[0] as i16;
-        let pg = p[1] as i16;
-        let pb = p[2] as i16;
-        let mut best_dist = i32::MAX;
-        let mut best_sel = 0u32;
-        for (sel, &(cr, cg, cb)) in palette.iter().enumerate() {
-            let dr = (pr - cr) as i32;
-            let dg = (pg - cg) as i32;
-            let db = (pb - cb) as i32;
-            let dist = dr * dr + dg * dg + db * db;
-            if dist < best_dist { best_dist = dist; best_sel = sel as u32; }
-        }
-        indices |= best_sel << (i * 2);
+    for i in 0..16 {
+        let unique_idx = pixel_to_unique[i];
+        let sorted_pos = inv_order[unique_idx];
+        let sel = unique_to_index[sorted_pos];
+        indices |= sel << (i * 2);
     }
 
     // Now enforce 4-color mode: c0 > c1. If we need to swap, XOR bit 0 of
