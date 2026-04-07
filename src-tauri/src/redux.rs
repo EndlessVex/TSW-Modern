@@ -3773,4 +3773,114 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn encoder_replication_trace_block() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip1_offset = ref_data.len() - 131072 - 32768;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + 32768];
+        let mip2_offset = mip1_offset - 8192;
+        let ref_mip2 = &ref_data[mip2_offset..mip2_offset + 8192];
+
+        // Decode ref mip1 to pixel buffer (256x256)
+        let mut mip1_pixels = vec![[0u8; 4]; 256 * 256];
+        for by in 0..64 {
+            for bx in 0..64 {
+                let off = (by * 64 + bx) * 8;
+                let block = &ref_mip1[off..off + 8];
+                let pixels = decode_dxt1_block(block);
+                for py in 0..4 { for px in 0..4 {
+                    mip1_pixels[(by*4+py)*256 + bx*4+px] = pixels[py*4+px];
+                }}
+            }
+        }
+
+        // Box-filter to 128x128
+        let mut mip2_pixels = vec![[0u8; 4]; 128 * 128];
+        for y in 0..128 { for x in 0..128 {
+            let p00 = mip1_pixels[(y*2)*256 + x*2];
+            let p10 = mip1_pixels[(y*2)*256 + x*2+1];
+            let p01 = mip1_pixels[(y*2+1)*256 + x*2];
+            let p11 = mip1_pixels[(y*2+1)*256 + x*2+1];
+            for c in 0..4 {
+                mip2_pixels[y*128+x][c] = ((p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32) / 4) as u8;
+            }
+        }}
+
+        // Find a non-solid block in ref_mip2
+        let target_block = {
+            let mut found = None;
+            for b in 0..(32*32) {
+                let blk = &ref_mip2[b*8..(b+1)*8];
+                let c0 = u16::from_le_bytes([blk[0], blk[1]]);
+                let c1 = u16::from_le_bytes([blk[2], blk[3]]);
+                if c0 != c1 { found = Some(b); break; }
+            }
+            found.unwrap()
+        };
+
+        let bx = target_block % 32;
+        let by = target_block / 32;
+        eprintln!("  Target block {} ({},{}) in mip2:", target_block, bx, by);
+        eprintln!("  Ref mip2 block: {:02x?}", &ref_mip2[target_block*8..(target_block+1)*8]);
+
+        // Extract 4x4 pixels for this block
+        let mut pixels = [[0u8; 4]; 16];
+        for py in 0..4 { for px in 0..4 {
+            pixels[py*4+px] = mip2_pixels[(by*4+py)*128 + bx*4+px];
+        }}
+        eprintln!("  Input pixels:");
+        for row in 0..4 {
+            eprintln!("    row{}: ({},{},{}) ({},{},{}) ({},{},{}) ({},{},{})", row,
+                pixels[row*4][0], pixels[row*4][1], pixels[row*4][2],
+                pixels[row*4+1][0], pixels[row*4+1][1], pixels[row*4+1][2],
+                pixels[row*4+2][0], pixels[row*4+2][1], pixels[row*4+2][2],
+                pixels[row*4+3][0], pixels[row*4+3][1], pixels[row*4+3][2]);
+        }
+
+        // Count unique colors
+        let mut unique: Vec<[u8;3]> = Vec::new();
+        for p in &pixels {
+            let rgb = [p[0], p[1], p[2]];
+            if !unique.contains(&rgb) { unique.push(rgb); }
+        }
+        eprintln!("  Unique colors: {}", unique.len());
+
+        // Run through our encoder
+        let our_block = encode_dxt1_block(&pixels, false, true);
+        eprintln!("  Our encoded: {:02x?}", our_block);
+        eprintln!("  Match: {}", our_block == ref_mip2[target_block*8..(target_block+1)*8]);
+
+        // Also encode with dedup=true for comparison
+        let our_block_dedup = encode_dxt1_block(&pixels, false, false);
+        eprintln!("  Our (with dedup): {:02x?}", our_block_dedup);
+        eprintln!("  Match (dedup): {}", our_block_dedup == ref_mip2[target_block*8..(target_block+1)*8]);
+
+        // Decode both to see visual difference
+        let ref_decoded = decode_dxt1_block(&ref_mip2[target_block*8..(target_block+1)*8]);
+        let our_decoded = decode_dxt1_block(&our_block);
+        let mut max_diff = 0;
+        for i in 0..16 { for c in 0..3 {
+            max_diff = max_diff.max((ref_decoded[i][c] as i32 - our_decoded[i][c] as i32).abs());
+        }}
+        eprintln!("  Max decoded pixel diff: {}", max_diff);
+    }
+
 }
