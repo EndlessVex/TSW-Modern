@@ -2167,4 +2167,42 @@ mod tests {
         assert_eq!(decoded[0], 3, "Mip should use float rounding, got {}", decoded[0]);
     }
 
+    #[test]
+    fn test_cluster_fit_4color_output_snapshot() {
+        // Block 1: red-to-blue gradient (exercises partition search heavily)
+        let mut gradient = [[0u8; 4]; 16];
+        for i in 0..16 {
+            let t = i as f32 / 15.0;
+            gradient[i] = [(255.0 * (1.0 - t)) as u8, 0, (255.0 * t) as u8, 255];
+        }
+        let (block, _err) = cluster_fit_4color(&gradient);
+        let c0 = u16::from_le_bytes([block[0], block[1]]);
+        let c1 = u16::from_le_bytes([block[2], block[3]]);
+        // 4-color mode: c0 > c1
+        assert!(c0 >= c1, "4-color mode requires c0 >= c1, got c0={} c1={}", c0, c1);
+        // Print for manual tracking across layers
+        eprintln!("gradient block: {:02x?}", block);
+
+        // Block 2: smooth green gradient (single-channel, tests degenerate partition)
+        let mut green_grad = [[0u8; 4]; 16];
+        for i in 0..16 {
+            green_grad[i] = [0, (i as u8) * 17, 0, 255];
+        }
+        let (block2, _) = cluster_fit_4color(&green_grad);
+        let c0_2 = u16::from_le_bytes([block2[0], block2[1]]);
+        let c1_2 = u16::from_le_bytes([block2[2], block2[3]]);
+        assert!(c0_2 >= c1_2, "4-color mode requires c0 >= c1");
+        eprintln!("green_grad block: {:02x?}", block2);
+
+        // Block 3: mixed color noise (worst case for partition search precision)
+        let noise: [[u8; 4]; 16] = [
+            [200, 50, 100, 255], [180, 60, 110, 255], [160, 70, 120, 255], [140, 80, 130, 255],
+            [120, 90, 140, 255], [100, 100, 150, 255], [80, 110, 160, 255], [60, 120, 170, 255],
+            [50, 130, 180, 255], [70, 140, 170, 255], [90, 150, 160, 255], [110, 160, 150, 255],
+            [130, 170, 140, 255], [150, 180, 130, 255], [170, 190, 120, 255], [190, 200, 110, 255],
+        ];
+        let (block3, _) = cluster_fit_4color(&noise);
+        eprintln!("noise block: {:02x?}", block3);
+    }
+
 }
