@@ -486,25 +486,19 @@ fn decompress_mixd(
 // ─── Mipmap generation ───────────────────────────────────────────────────────
 
 /// Convert sRGB byte value [0,255] to linear float [0,1].
+/// Currently unused — gamma correction did not improve matching
+/// (the original may not gamma-correct during mip filtering).
+#[allow(dead_code)]
 #[inline]
 fn srgb_to_linear(s: u8) -> f32 {
-    let s = s as f32 / 255.0;
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
+    (s as f32 / 255.0).powf(2.2)
 }
 
 /// Convert linear float [0,1] back to sRGB byte [0,255].
+#[allow(dead_code)]
 #[inline]
 fn linear_to_srgb(l: f32) -> u8 {
-    let s = if l <= 0.0031308 {
-        l * 12.92
-    } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
-    };
-    (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    (l.powf(1.0 / 2.2) * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
 /// Generate a downsampled mip level from DXT block data.
@@ -553,7 +547,10 @@ fn generate_mip(
     }
 
     // Convert to linear float buffer for sRGB-correct filtering
-    let use_srgb = matches!(codec, TextureCodec::Dxt1 | TextureCodec::Dxt5);
+    // Gamma correction disabled — testing showed it does not improve matching
+    // against the original ClientPatcher output. The original may not apply
+    // gamma correction during mip filtering.
+    let use_srgb = false;
     let mut src_linear = vec![[0.0f32; 4]; prev_w * prev_h];
     for i in 0..src_pixels.len() {
         let p = src_pixels[i];
@@ -695,16 +692,19 @@ fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new
 
 // ─── DXT1 decode/encode ──────────────────────────────────────────────────────
 
-/// Decode RGB565 → (R, G, B) as u8.
+/// Decode RGB565 → (R, G, B) as u8 using bit-replication.
+/// This matches squish/NVTT's decode formula: (r << 3) | (r >> 2) for 5-bit,
+/// (g << 2) | (g >> 4) for 6-bit. Our previous formula (r * 255 / 31) gave
+/// values off by 1 for many inputs, cascading through mip generation.
 #[inline]
 fn decode_rgb565(c: u16) -> (u8, u8, u8) {
-    let r = ((c >> 11) & 0x1F) as u32;
-    let g = ((c >> 5) & 0x3F) as u32;
-    let b = (c & 0x1F) as u32;
+    let r = ((c >> 11) & 0x1F) as u8;
+    let g = ((c >> 5) & 0x3F) as u8;
+    let b = (c & 0x1F) as u8;
     (
-        (r * 255 / 31) as u8,
-        (g * 255 / 63) as u8,
-        (b * 255 / 31) as u8,
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
     )
 }
 
