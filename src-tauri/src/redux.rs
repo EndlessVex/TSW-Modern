@@ -2323,4 +2323,137 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test -- --ignored encoder_replication_mip_regen
+    fn encoder_replication_mip_regen() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx"))
+            .expect("Failed to parse reference le.idx");
+
+        // Test textures: (id, width, height)
+        let test_textures: &[(u32, usize, usize)] = &[
+            (19767, 512, 512),
+            (27137, 256, 256),
+            (30186, 512, 512),
+            (105339, 256, 256),
+            (117998, 512, 512),
+        ];
+
+        let fctx_header_size = 40usize;
+        let block_size = 8usize; // DXT1
+
+        let mut total_blocks = 0usize;
+        let mut matching_blocks = 0usize;
+
+        for &(id, width, height) in test_textures {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("Texture {} not found in le.idx", id));
+
+            // Read reference FCTX data
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path)
+                    .unwrap_or_else(|e| panic!("Failed to open {:?}: {}", ref_path, e));
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            // Compute mip sizes for this texture
+            let mut mip_sizes = Vec::new();
+            let mut w = width;
+            let mut h = height;
+            loop {
+                let blocks_w = (w + 3) / 4;
+                let blocks_h = (h + 3) / 4;
+                mip_sizes.push(blocks_w * blocks_h * block_size);
+                if w <= 4 && h <= 4 { break; }
+                w = (w / 2).max(4);
+                h = (h / 2).max(4);
+            }
+            let mip_count = mip_sizes.len();
+
+            // Verify total size
+            let total_mip_bytes: usize = mip_sizes.iter().sum();
+            assert_eq!(ref_data.len(), fctx_header_size + total_mip_bytes,
+                "ID {}: size mismatch: {} != {} + {}", id, ref_data.len(), fctx_header_size, total_mip_bytes);
+
+            // Extract mips from reference (stored smallest-first after header)
+            let mut ref_mips: Vec<&[u8]> = Vec::new();
+            let mut offset = fctx_header_size;
+            for i in (0..mip_count).rev() {
+                ref_mips.push(&ref_data[offset..offset + mip_sizes[i]]);
+                offset += mip_sizes[i];
+            }
+            // ref_mips[0] = smallest mip, ref_mips[mip_count-1] = mip0
+            // Reverse so ref_mips[0] = mip0, ref_mips[1] = mip1, etc.
+            ref_mips.reverse();
+
+            // mip0 from the reference (CDN source, should be identical)
+            let mip0 = ref_mips[0];
+
+            // Regenerate mips 1..N using our encoder
+            let mut current_data = mip0.to_vec();
+            let mut current_w = width;
+            let mut current_h = height;
+
+            let mut tex_total = 0usize;
+            let mut tex_match = 0usize;
+
+            for mip_idx in 1..mip_count {
+                let new_w = (current_w / 2).max(4);
+                let new_h = (current_h / 2).max(4);
+
+                let our_mip = generate_mip(
+                    &current_data, current_w, current_h, new_w, new_h,
+                    TextureCodec::Dxt1, false,
+                );
+
+                let ref_mip = ref_mips[mip_idx];
+                assert_eq!(our_mip.len(), ref_mip.len(),
+                    "ID {} mip{}: size mismatch {} vs {}", id, mip_idx, our_mip.len(), ref_mip.len());
+
+                // Compare block by block
+                let num_blocks = our_mip.len() / block_size;
+                let mut mip_match = 0usize;
+                for b in 0..num_blocks {
+                    let our_block = &our_mip[b * block_size..(b + 1) * block_size];
+                    let ref_block = &ref_mip[b * block_size..(b + 1) * block_size];
+                    if our_block == ref_block {
+                        mip_match += 1;
+                    }
+                }
+
+                eprintln!("  ID {} mip{} ({}x{}): {}/{} blocks match ({:.1}%)",
+                    id, mip_idx, new_w, new_h, mip_match, num_blocks,
+                    (mip_match as f64 / num_blocks as f64) * 100.0);
+
+                tex_total += num_blocks;
+                tex_match += mip_match;
+
+                // Use OUR generated mip as input for next level
+                // (matching what the pipeline does -- each mip is generated from the previous)
+                current_data = our_mip;
+                current_w = new_w;
+                current_h = new_h;
+            }
+
+            eprintln!("  ID {} TOTAL: {}/{} blocks ({:.1}%)\n",
+                id, tex_match, tex_total, (tex_match as f64 / tex_total as f64) * 100.0);
+            total_blocks += tex_total;
+            matching_blocks += tex_match;
+        }
+
+        eprintln!("  OVERALL: {}/{} blocks match ({:.2}%)",
+            matching_blocks, total_blocks,
+            (matching_blocks as f64 / total_blocks as f64) * 100.0);
+    }
+
 }
