@@ -666,13 +666,15 @@ fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new
 /// Decode RGB565 → (R, G, B) as u8.
 #[inline]
 fn decode_rgb565(c: u16) -> (u8, u8, u8) {
-    let r = ((c >> 11) & 0x1F) as u32;
-    let g = ((c >> 5) & 0x3F) as u32;
-    let b = (c & 0x1F) as u32;
+    // Bit-replication expansion matching the original's alg_nv library.
+    // Empirically verified: shift+trunc gives 100% solid block match.
+    let r = ((c >> 11) & 0x1F) as u8;
+    let g = ((c >> 5) & 0x3F) as u8;
+    let b = (c & 0x1F) as u8;
     (
-        (r * 255 / 31) as u8,
-        (g * 255 / 63) as u8,
-        (b * 255 / 31) as u8,
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
     )
 }
 
@@ -3053,6 +3055,195 @@ mod tests {
         eprintln!("    Off by >1: {} ({:.1}%)", off_by_more, off_by_more as f64 / total_solid as f64 * 100.0);
         eprintln!("    Max per-channel diff: {}", max_diff);
         eprintln!("    Avg total channel diff: {:.2}", total_channel_diff as f64 / total_solid as f64);
+    }
+
+    #[test]
+    #[ignore]
+    fn encoder_replication_determine_decode() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip0_size = 128 * 128 * 8;
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+        let mip1_size = 64 * 64 * 8;
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // Define decode variants
+        fn expand5_mul(v: u8) -> u8 { (v as u32 * 255 / 31) as u8 }
+        fn expand6_mul(v: u8) -> u8 { (v as u32 * 255 / 63) as u8 }
+        fn expand5_shift(v: u8) -> u8 { (v << 3) | (v >> 2) }
+        fn expand6_shift(v: u8) -> u8 { (v << 2) | (v >> 4) }
+
+        fn interp_plus1(a: u8, b: u8) -> u8 { ((2 * a as u32 + b as u32 + 1) / 3) as u8 }
+        fn interp_trunc(a: u8, b: u8) -> u8 { ((2 * a as u32 + b as u32) / 3) as u8 }
+
+        // Test all 4 combinations: (mul vs shift) x (plus1 vs trunc)
+        let configs: &[(&str, fn(u8)->u8, fn(u8)->u8, fn(u8,u8)->u8)] = &[
+            ("mul+plus1",   expand5_mul,   expand6_mul,   interp_plus1),
+            ("mul+trunc",   expand5_mul,   expand6_mul,   interp_trunc),
+            ("shift+plus1", expand5_shift, expand6_shift, interp_plus1),
+            ("shift+trunc", expand5_shift, expand6_shift, interp_trunc),
+        ];
+
+        for &(name, exp5, exp6, interp) in configs {
+            // Decode mip0 with this config
+            let mut pixels = vec![[0u8; 4]; 512 * 512];
+            for by in 0..128 {
+                for bx in 0..128 {
+                    let off = (by * 128 + bx) * 8;
+                    let block = &ref_mip0[off..off+8];
+                    let c0 = u16::from_le_bytes([block[0], block[1]]);
+                    let c1 = u16::from_le_bytes([block[2], block[3]]);
+                    let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+                    let r0 = exp5(((c0 >> 11) & 0x1F) as u8);
+                    let g0 = exp6(((c0 >> 5) & 0x3F) as u8);
+                    let b0 = exp5((c0 & 0x1F) as u8);
+                    let r1 = exp5(((c1 >> 11) & 0x1F) as u8);
+                    let g1 = exp6(((c1 >> 5) & 0x3F) as u8);
+                    let b1 = exp5((c1 & 0x1F) as u8);
+
+                    let palette: [[u8; 4]; 4] = if c0 > c1 {
+                        [
+                            [r0, g0, b0, 255],
+                            [r1, g1, b1, 255],
+                            [interp(r0, r1), interp(g0, g1), interp(b0, b1), 255],
+                            [interp(r1, r0), interp(g1, g0), interp(b1, b0), 255],
+                        ]
+                    } else {
+                        [
+                            [r0, g0, b0, 255],
+                            [r1, g1, b1, 255],
+                            [((r0 as u16 + r1 as u16) / 2) as u8, ((g0 as u16 + g1 as u16) / 2) as u8, ((b0 as u16 + b1 as u16) / 2) as u8, 255],
+                            [0, 0, 0, 0],
+                        ]
+                    };
+
+                    for i in 0..16 {
+                        let sel = ((indices >> (i * 2)) & 3) as usize;
+                        let px = bx * 4 + (i % 4);
+                        let py = by * 4 + (i / 4);
+                        pixels[py * 512 + px] = palette[sel];
+                    }
+                }
+            }
+
+            // Box-filter to 256x256 (truncating)
+            let mut filtered = vec![[0u8; 4]; 256 * 256];
+            for y in 0..256 {
+                for x in 0..256 {
+                    let p00 = pixels[(y*2)*512 + x*2];
+                    let p10 = pixels[(y*2)*512 + x*2+1];
+                    let p01 = pixels[(y*2+1)*512 + x*2];
+                    let p11 = pixels[(y*2+1)*512 + x*2+1];
+                    for c in 0..4 {
+                        filtered[y*256+x][c] = ((p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32) / 4) as u8;
+                    }
+                }
+            }
+
+            // For each SOLID reference mip1 block (c0==c1), check if our filtered pixel
+            // encodes to the same RGB565 value
+            let mut total = 0;
+            let mut matching = 0;
+            for b in 0..(64*64) {
+                let block = &ref_mip1[b*8..(b+1)*8];
+                let rc0 = u16::from_le_bytes([block[0], block[1]]);
+                let rc1 = u16::from_le_bytes([block[2], block[3]]);
+                if rc0 != rc1 { continue; }
+
+                total += 1;
+                let bx = b % 64;
+                let by = b / 64;
+                let p = filtered[by * 4 * 256 + bx * 4]; // top-left pixel of block
+
+                // Encode our pixel to RGB565 (rounding)
+                let our_r5 = ((p[0] as u16 * 31 + 127) / 255) as u16;
+                let our_g6 = ((p[1] as u16 * 63 + 127) / 255) as u16;
+                let our_b5 = ((p[2] as u16 * 31 + 127) / 255) as u16;
+                let our_c = (our_r5 << 11) | (our_g6 << 5) | our_b5;
+
+                if our_c == rc0 { matching += 1; }
+            }
+            eprintln!("  {}: {}/{} solid blocks match ({:.1}%)", name, matching, total, matching as f64 / total as f64 * 100.0);
+        }
+
+        // Also test with rounding box filter for comparison
+        eprintln!("\n  With ROUNDING box filter ((sum+2)/4):");
+        for &(name, exp5, exp6, interp) in configs {
+            let mut pixels = vec![[0u8; 4]; 512 * 512];
+            for by in 0..128 {
+                for bx in 0..128 {
+                    let off = (by * 128 + bx) * 8;
+                    let block = &ref_mip0[off..off+8];
+                    let c0 = u16::from_le_bytes([block[0], block[1]]);
+                    let c1 = u16::from_le_bytes([block[2], block[3]]);
+                    let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                    let r0 = exp5(((c0 >> 11) & 0x1F) as u8);
+                    let g0 = exp6(((c0 >> 5) & 0x3F) as u8);
+                    let b0 = exp5((c0 & 0x1F) as u8);
+                    let r1 = exp5(((c1 >> 11) & 0x1F) as u8);
+                    let g1 = exp6(((c1 >> 5) & 0x3F) as u8);
+                    let b1 = exp5((c1 & 0x1F) as u8);
+                    let palette: [[u8; 4]; 4] = if c0 > c1 {
+                        [[r0,g0,b0,255],[r1,g1,b1,255],
+                         [interp(r0,r1),interp(g0,g1),interp(b0,b1),255],
+                         [interp(r1,r0),interp(g1,g0),interp(b1,b0),255]]
+                    } else {
+                        [[r0,g0,b0,255],[r1,g1,b1,255],
+                         [((r0 as u16+r1 as u16)/2) as u8,((g0 as u16+g1 as u16)/2) as u8,((b0 as u16+b1 as u16)/2) as u8,255],
+                         [0,0,0,0]]
+                    };
+                    for i in 0..16 {
+                        let sel = ((indices >> (i*2)) & 3) as usize;
+                        pixels[(by*4+i/4)*512 + bx*4+i%4] = palette[sel];
+                    }
+                }
+            }
+            let mut filtered = vec![[0u8; 4]; 256*256];
+            for y in 0..256 { for x in 0..256 {
+                let p00 = pixels[(y*2)*512+x*2];
+                let p10 = pixels[(y*2)*512+x*2+1];
+                let p01 = pixels[(y*2+1)*512+x*2];
+                let p11 = pixels[(y*2+1)*512+x*2+1];
+                for c in 0..4 {
+                    filtered[y*256+x][c] = ((p00[c] as u32+p10[c] as u32+p01[c] as u32+p11[c] as u32+2)/4) as u8;
+                }
+            }}
+            let mut total = 0; let mut matching = 0;
+            for b in 0..(64*64) {
+                let block = &ref_mip1[b*8..(b+1)*8];
+                let rc0 = u16::from_le_bytes([block[0],block[1]]);
+                let rc1 = u16::from_le_bytes([block[2],block[3]]);
+                if rc0 != rc1 { continue; }
+                total += 1;
+                let bx = b%64; let by = b/64;
+                let p = filtered[by*4*256+bx*4];
+                let our_r5 = ((p[0] as u16*31+127)/255) as u16;
+                let our_g6 = ((p[1] as u16*63+127)/255) as u16;
+                let our_b5 = ((p[2] as u16*31+127)/255) as u16;
+                let our_c = (our_r5<<11)|(our_g6<<5)|our_b5;
+                if our_c == rc0 { matching += 1; }
+            }
+            eprintln!("  {}: {}/{} solid blocks match ({:.1}%)", name, matching, total, matching as f64/total as f64*100.0);
+        }
     }
 
 }
