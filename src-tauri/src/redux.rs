@@ -2416,6 +2416,35 @@ mod tests {
                 buf
             };
 
+            // Diagnostic: verify mip0 extraction for texture 19767
+            if id == 19767 {
+                eprintln!("  Header bytes: {:02x?}", &ref_data[0..8]);
+                eprintln!("  Data length: {}", ref_data.len());
+
+                // Check if header is FCTX
+                let is_fctx = &ref_data[0..4] == b"FCTX";
+                eprintln!("  Is FCTX: {}", is_fctx);
+
+                // Read bytes at assumed mip0 start (offset = total - mip0_size)
+                let mip0_size = ((512+3)/4) * ((512+3)/4) * 8;  // 131072
+                let mip0_offset = ref_data.len() - mip0_size;
+                eprintln!("  Assumed mip0 offset: {} (header would be {} bytes)", mip0_offset, mip0_offset - 0);
+                eprintln!("  First mip0 DXT1 block: {:02x?}", &ref_data[mip0_offset..mip0_offset+8]);
+
+                // Also check: are the first bytes after any plausible header a small mip (like 4x4 = 8 bytes)?
+                // A 4x4 DXT1 block is 8 bytes. If stored smallest-first, offset 40 would be the 4x4 mip.
+                for hdr_try in [24, 40, 48] {
+                    if hdr_try + 8 <= ref_data.len() {
+                        eprintln!("  After {:2} byte header: {:02x?} (smallest mip candidate)", hdr_try, &ref_data[hdr_try..hdr_try+8]);
+                    }
+                }
+
+                // Verify by checking mip0 block count: 128*128 blocks, each 8 bytes
+                // Last block of mip0 should be at end of file
+                let last_mip0_block = &ref_data[ref_data.len()-8..];
+                eprintln!("  Last 8 bytes (last mip0 block): {:02x?}", last_mip0_block);
+            }
+
             // Compute mip sizes for this texture
             let mut mip_sizes = Vec::new();
             let mut w = width;
@@ -2909,6 +2938,121 @@ mod tests {
         if found == 0 {
             eprintln!("No non-solid mismatching blocks found!");
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn encoder_replication_pixel_compare() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let fctx_hdr = 40;
+        let block_size = 8;
+        // Extract mip0 (at end, smallest-first storage)
+        let mip0_size = 128 * 128 * block_size; // 131072
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+
+        // Extract reference mip1 (256x256 = 64*64 blocks = 32768 bytes, right before mip0)
+        let mip1_size = 64 * 64 * block_size; // 32768
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // Decode mip0 to 512x512 pixel buffer
+        let mut src_pixels = vec![[0u8; 4]; 512 * 512];
+        for by in 0..128 {
+            for bx in 0..128 {
+                let off = (by * 128 + bx) * block_size;
+                let block = &ref_mip0[off..off + block_size];
+                let pixels = decode_dxt1_block(block);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        src_pixels[(by * 4 + py) * 512 + bx * 4 + px] = pixels[py * 4 + px];
+                    }
+                }
+            }
+        }
+
+        // Box-filter to 256x256 (integer averaging)
+        let mut dst_pixels = vec![[0u8; 4]; 256 * 256];
+        for y in 0..256 {
+            for x in 0..256 {
+                let p00 = src_pixels[(y * 2) * 512 + x * 2];
+                let p10 = src_pixels[(y * 2) * 512 + x * 2 + 1];
+                let p01 = src_pixels[(y * 2 + 1) * 512 + x * 2];
+                let p11 = src_pixels[(y * 2 + 1) * 512 + x * 2 + 1];
+                for c in 0..4 {
+                    let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
+                    dst_pixels[y * 256 + x][c] = ((sum + 2) / 4) as u8;
+                }
+            }
+        }
+
+        // Compare against reference solid blocks
+        let mip1_bw = 64; // blocks wide
+        let mut total_solid = 0;
+        let mut exact_match = 0;
+        let mut off_by_one = 0;  // all channels differ by <= 1
+        let mut off_by_more = 0;
+        let mut total_channel_diff = 0u64;
+        let mut max_diff = 0i32;
+
+        for b in 0..(64 * 64) {
+            let block = &ref_mip1[b * block_size..(b + 1) * block_size];
+            let c0 = u16::from_le_bytes([block[0], block[1]]);
+            let c1 = u16::from_le_bytes([block[2], block[3]]);
+            if c0 != c1 { continue; }  // skip non-solid
+
+            total_solid += 1;
+            let (rr, rg, rb) = decode_rgb565(c0);
+
+            // Get our pixel at the top-left of this block
+            let bx = b % mip1_bw;
+            let by = b / mip1_bw;
+            let our = dst_pixels[by * 4 * 256 + bx * 4];
+
+            let dr = (our[0] as i32 - rr as i32).abs();
+            let dg = (our[1] as i32 - rg as i32).abs();
+            let db = (our[2] as i32 - rb as i32).abs();
+            let block_max = dr.max(dg).max(db);
+            total_channel_diff += (dr + dg + db) as u64;
+            max_diff = max_diff.max(block_max);
+
+            if dr == 0 && dg == 0 && db == 0 {
+                exact_match += 1;
+            } else if block_max <= 1 {
+                off_by_one += 1;
+            } else {
+                off_by_more += 1;
+                if off_by_more <= 5 {
+                    eprintln!("  Block {} ({},{}): ours=({},{},{}) ref_decoded=({},{},{}) diff=({},{},{})",
+                        b, bx, by, our[0], our[1], our[2], rr, rg, rb, dr, dg, db);
+                }
+            }
+        }
+
+        eprintln!("\n  Solid block pixel comparison (texture 19767):");
+        eprintln!("    Total solid blocks: {}", total_solid);
+        eprintln!("    Exact pixel match: {} ({:.1}%)", exact_match, exact_match as f64 / total_solid as f64 * 100.0);
+        eprintln!("    Off by 1: {} ({:.1}%)", off_by_one, off_by_one as f64 / total_solid as f64 * 100.0);
+        eprintln!("    Off by >1: {} ({:.1}%)", off_by_more, off_by_more as f64 / total_solid as f64 * 100.0);
+        eprintln!("    Max per-channel diff: {}", max_diff);
+        eprintln!("    Avg total channel diff: {:.2}", total_channel_diff as f64 / total_solid as f64);
     }
 
 }
