@@ -307,37 +307,21 @@ pub fn write_static_files(install_dir: &Path) -> Result<(), String> {
     let config_path = install_dir.join("LocalConfig.xml");
     if !config_path.exists() {
         let config = r#"<Config>
-
   <Self>
-
     <ConfigKey>Universe/Client/</ConfigKey>
-
   </Self>
-
   <Universe>
-
     <Client>
-
       <ClientFileName>TheSecretWorld.exe</ClientFileName>
-
       <ClientFileNameDX11>TheSecretWorldDX11.exe</ClientFileNameDX11>
-
       <HttpPatchFolder>TSWLiveSteam</HttpPatchFolder>
-
       <HttpPatchAddr>http://update.secretworld.com/tswupm</HttpPatchAddr>
-
       <ControlHttpPatchAddr>ControlHttpPatchAddr.secretworld.com/tswupm</ControlHttpPatchAddr>
-
       <HTTPMaxConnections>5</HTTPMaxConnections>
-
       <UniverseAddr>um.live.secretworld.com:7000</UniverseAddr>
-
       <PatchVersion>xb36bba4f8606fe8fda4fec2a747703bf</PatchVersion>
-
     </Client>
-
   </Universe>
-
 </Config>
 "#;
         std::fs::write(&config_path, config)
