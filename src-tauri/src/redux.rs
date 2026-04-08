@@ -1379,32 +1379,123 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                         ep_b[k] = (qb * inv_vals[k] as f64) as f32;
                     }
 
-                    // Error computation — per-channel error at extended precision (80-bit),
-                    // then stored to f32 per channel, accumulated in f32.
-                    // The Python trace showed competing partitions differ by only 0.006 in
-                    // error. x87's 80-bit intermediate precision during the multi-term
-                    // error sum causes different partitions to win vs f32.
-                    let mut err = 0.0f32;
-                    for k in 0..3 {
-                        let beta_a = x87_add_fma_f32(beta_a_mid[k], outer_rgb[k], inner_rgb[k], c_1_3);
-                        let beta_b = x87_sub_f32(total_rgb[k], beta_a);
+                    // Error computation — ENTIRE error at x87 80-bit precision.
+                    // Hardware test confirmed: x87 gives different f32 results than SSE
+                    // (1 ULP difference). The original uses x87 for the full error
+                    // accumulation across all 3 channels. Competing partitions differ
+                    // by as little as 0.006, so even 1 ULP in the error sum can flip
+                    // the partition comparison.
+                    //
+                    // Structure (from decompilation):
+                    //   For each channel k:
+                    //     diag_k = ea_k² * aa + eb_k² * bb (80-bit, stored to f32)
+                    //     cross_k = eb_k*ea_k*ab - beta_a_k*ea_k - eb_k*beta_b_k (80-bit, stored to f32)
+                    //   total_err = (cross_R*2 + diag_R)*wR² + (cross_G*2 + diag_G)*wG² + (cross_B*2 + diag_B)*wB²
+                    //   With uniform weights (1.0), this simplifies to sum of (cross*2 + diag)
+                    let mut err: f32 = 0.0;
+                    {
+                        // Recompute beta for error (matching original which reuses the same values)
+                        let ba = [
+                            x87_add_fma_f32(beta_a_mid[0], outer_rgb[0], inner_rgb[0], c_1_3),
+                            x87_add_fma_f32(beta_a_mid[1], outer_rgb[1], inner_rgb[1], c_1_3),
+                            x87_add_fma_f32(beta_a_mid[2], outer_rgb[2], inner_rgb[2], c_1_3),
+                        ];
+                        let bv = [
+                            x87_sub_f32(total_rgb[0], ba[0]),
+                            x87_sub_f32(total_rgb[1], ba[1]),
+                            x87_sub_f32(total_rgb[2], ba[2]),
+                        ];
 
-                        // Error computation matching original's structure (from decompilation):
-                        // The original separates into "cross" and "diag" terms with
-                        // separate f32 stores, then combines as cross*2 + diag.
-                        // This gives different f32 truncation than our previous single-expression.
-                        let ea = ep_a[k];
-                        let eb = ep_b[k];
-                        // diag = ea²*aa + eb²*bb (stored to f32)
-                        let diag: f32 = (ea as f64 * ea as f64 * alpha_aa as f64
-                            + eb as f64 * eb as f64 * alpha_bb as f64) as f32;
-                        // cross = eb*ea*ab - beta_a*ea - eb*beta_b (stored to f32)
-                        let cross: f32 = (eb as f64 * ea as f64 * alpha_ab as f64
-                            - beta_a as f64 * ea as f64
-                            - eb as f64 * beta_b as f64) as f32;
-                        // ch_err = cross*2 + diag (stored to f32)
-                        let ch_err: f32 = (cross as f64 * 2.0 + diag as f64) as f32;
-                        err += ch_err;
+                        // Pack inputs for asm block
+                        let err_in = [
+                            alpha_aa, alpha_bb, alpha_ab,   // [0..3] alphas
+                            ep_a[0], ep_a[1], ep_a[2],      // [3..6] ep_a RGB
+                            ep_b[0], ep_b[1], ep_b[2],      // [6..9] ep_b RGB
+                            ba[0], ba[1], ba[2],            // [9..12] beta_a RGB
+                            bv[0], bv[1], bv[2],            // [12..15] beta_b RGB
+                            c_2,                             // [15] constant 2.0
+                        ];
+                        // Compute error at x87 80-bit, accumulate across channels at 80-bit
+                        unsafe {
+                            std::arch::asm!(
+                                // Initialize error sum to 0 on FPU stack
+                                "fldz",                             // st0 = 0 (running sum)
+
+                                // === Channel R (offsets: aa=0, bb=4, ab=8, ea=12, eb=24, ba=36, bv=48, c2=60) ===
+                                // diag_R = ea_R² * aa + eb_R² * bb
+                                "fld dword ptr [{p} + 12]",         // ea_R
+                                "fmul dword ptr [{p} + 12]",        // ea_R²
+                                "fmul dword ptr [{p}]",             // ea_R² * aa
+                                "fld dword ptr [{p} + 24]",         // eb_R
+                                "fmul dword ptr [{p} + 24]",        // eb_R²
+                                "fmul dword ptr [{p} + 4]",         // eb_R² * bb
+                                "faddp",                             // diag_R (80-bit)
+                                // cross_R = eb_R*ea_R*ab - ba_R*ea_R - eb_R*bv_R
+                                "fld dword ptr [{p} + 24]",         // eb_R
+                                "fmul dword ptr [{p} + 12]",        // eb_R * ea_R
+                                "fmul dword ptr [{p} + 8]",         // * ab
+                                "fld dword ptr [{p} + 36]",         // ba_R
+                                "fmul dword ptr [{p} + 12]",        // ba_R * ea_R
+                                "fsubp",                             // eb*ea*ab - ba*ea
+                                "fld dword ptr [{p} + 24]",         // eb_R
+                                "fmul dword ptr [{p} + 48]",        // eb_R * bv_R
+                                "fsubp",                             // cross_R (80-bit)
+                                // ch_err = cross*2 + diag, add to running sum
+                                "fmul dword ptr [{p} + 60]",        // cross * 2.0
+                                "faddp",                             // cross*2 + diag (80-bit)
+                                "faddp",                             // running_sum += ch_err
+
+                                // === Channel G (ea=16, eb=28, ba=40, bv=52) ===
+                                "fld dword ptr [{p} + 16]",
+                                "fmul dword ptr [{p} + 16]",
+                                "fmul dword ptr [{p}]",
+                                "fld dword ptr [{p} + 28]",
+                                "fmul dword ptr [{p} + 28]",
+                                "fmul dword ptr [{p} + 4]",
+                                "faddp",
+                                "fld dword ptr [{p} + 28]",
+                                "fmul dword ptr [{p} + 16]",
+                                "fmul dword ptr [{p} + 8]",
+                                "fld dword ptr [{p} + 40]",
+                                "fmul dword ptr [{p} + 16]",
+                                "fsubp",
+                                "fld dword ptr [{p} + 28]",
+                                "fmul dword ptr [{p} + 52]",
+                                "fsubp",
+                                "fmul dword ptr [{p} + 60]",
+                                "faddp",
+                                "faddp",
+
+                                // === Channel B (ea=20, eb=32, ba=44, bv=56) ===
+                                "fld dword ptr [{p} + 20]",
+                                "fmul dword ptr [{p} + 20]",
+                                "fmul dword ptr [{p}]",
+                                "fld dword ptr [{p} + 32]",
+                                "fmul dword ptr [{p} + 32]",
+                                "fmul dword ptr [{p} + 4]",
+                                "faddp",
+                                "fld dword ptr [{p} + 32]",
+                                "fmul dword ptr [{p} + 20]",
+                                "fmul dword ptr [{p} + 8]",
+                                "fld dword ptr [{p} + 44]",
+                                "fmul dword ptr [{p} + 20]",
+                                "fsubp",
+                                "fld dword ptr [{p} + 32]",
+                                "fmul dword ptr [{p} + 56]",
+                                "fsubp",
+                                "fmul dword ptr [{p} + 60]",
+                                "faddp",
+                                "faddp",
+
+                                // Store final error sum to f32
+                                "fstp dword ptr [{out}]",
+
+                                p = in(reg) err_in.as_ptr(),
+                                out = in(reg) &mut err,
+                                out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                                out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                            );
+                        }
                     }
 
                     if err < best_err {
