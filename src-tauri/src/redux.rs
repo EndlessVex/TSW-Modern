@@ -666,15 +666,16 @@ fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new
 /// Decode RGB565 → (R, G, B) as u8.
 #[inline]
 fn decode_rgb565(c: u16) -> (u8, u8, u8) {
-    // Bit-replication expansion matching the original's alg_nv library.
-    // Empirically verified: shift+trunc gives 100% solid block match.
-    let r = ((c >> 11) & 0x1F) as u8;
-    let g = ((c >> 5) & 0x3F) as u8;
-    let b = (c & 0x1F) as u8;
+    // Multiply-based expansion: val * 255 / 31 (truncating).
+    // Binary search confirmed: NO bit-shift expansion (shl 3 + shr 2) exists
+    // in the entire ClientPatcher.exe. The original uses multiply by 255.
+    let r = ((c >> 11) & 0x1F) as u32;
+    let g = ((c >> 5) & 0x3F) as u32;
+    let b = (c & 0x1F) as u32;
     (
-        (r << 3) | (r >> 2),
-        (g << 2) | (g >> 4),
-        (b << 3) | (b >> 2),
+        (r * 255 / 31) as u8,
+        (g * 255 / 63) as u8,
+        (b * 255 / 31) as u8,
     )
 }
 
