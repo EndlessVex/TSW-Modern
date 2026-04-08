@@ -638,11 +638,77 @@ fn x87_powf(base: f32, exp: f32) -> f32 {
     if base <= 0.0 {
         return 0.0;
     }
-    // Use f64 pow as approximation of x87 80-bit precision.
-    // f64 has 53-bit mantissa vs x87's 64-bit, but for gamma correction
-    // of u8 pixel values, the difference from f32 (23-bit) is what matters.
-    let result = (base as f64).powf(exp as f64);
-    result as f32
+    // x87 pow using FYL2X + F2XM1 + FSCALE, matching FUN_682EE0.
+    // Keeps all intermediates at 80-bit extended precision.
+    let mut result: f32 = 0.0;
+    let cw: u16 = 0x037F; // 80-bit precision, round-to-nearest
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{exp}]",    // st(0) = exp
+            "fld dword ptr [{base}]",   // st(0) = base, st(1) = exp
+            "fyl2x",                     // st(0) = exp * log2(base)
+            "fld st(0)",                 // st(0) = st(1) = exp*log2(base)
+            "frndint",                   // st(0) = int part
+            "fsub st(1), st(0)",         // st(1) = frac part
+            "fxch st(1)",               // st(0) = frac, st(1) = int
+            "f2xm1",                     // st(0) = 2^frac - 1
+            "fld1",                      // st(0) = 1.0
+            "faddp st(1), st(0)",       // st(0) = 2^frac
+            "fscale",                    // st(0) = 2^frac * 2^int = base^exp
+            "fstp st(1)",               // pop int part
+            "fstp dword ptr [{out}]",   // store result as f32
+            cw = in(reg) &cw,
+            exp = in(reg) &exp,
+            base = in(reg) &base,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// x87 pow(base, exp) * scale → floor → i32, all at 80-bit precision.
+/// Matches the original's FUN_682EE0 → fmul 255 → FUN_681c10 chain.
+#[inline(never)]
+fn x87_pow_scale_floor(base: f32, exp: f32, scale: f32) -> i32 {
+    if base <= 0.0 {
+        return 0;
+    }
+    let mut result: i32 = 0;
+    let cw_ext: u16 = 0x037F;  // 80-bit precision, round-to-nearest
+    let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation (round toward zero)
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw_ext}]",
+            "fld dword ptr [{exp}]",
+            "fld dword ptr [{base}]",
+            "fyl2x",
+            "fld st(0)",
+            "frndint",
+            "fsub st(1), st(0)",
+            "fxch st(1)",
+            "f2xm1",
+            "fld1",
+            "faddp st(1), st(0)",
+            "fscale",
+            "fstp st(1)",
+            // Now st(0) = base^exp at 80-bit precision
+            "fmul dword ptr [{scale}]",  // st(0) = base^exp * scale
+            // Floor via truncation mode
+            "fldcw word ptr [{cw_trunc}]",
+            "fistp dword ptr [{out}]",
+            "fldcw word ptr [{cw_ext}]",  // restore
+            cw_ext = in(reg) &cw_ext,
+            cw_trunc = in(reg) &cw_trunc,
+            exp = in(reg) &exp,
+            base = in(reg) &base,
+            scale = in(reg) &scale,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result
 }
 
 /// 1. Decode entire source mip to full pixel buffer
@@ -768,19 +834,24 @@ fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
     result
 }
 
-/// x87 float→uint8: multiply by 255, fistp (round to nearest even)
+/// x87 float→uint8: multiply by 255, floor (truncation).
+/// Matches the original's FUN_679070 + FUN_681c10 which uses floor, NOT round-to-nearest.
 #[inline(never)]
 fn x87_float_to_u8(val: f32) -> u8 {
     let scale: f32 = 255.0;
     let mut result: i32 = 0;
-    let cw: u16 = 0x037F;
+    let cw_ext: u16 = 0x037F;   // 80-bit precision, round-to-nearest
+    let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation
     unsafe {
         std::arch::asm!(
-            "fldcw word ptr [{cw}]",
+            "fldcw word ptr [{cw_ext}]",
             "fld dword ptr [{val}]",
             "fmul dword ptr [{scale}]",
+            "fldcw word ptr [{cw_trunc}]",
             "fistp dword ptr [{out}]",
-            cw = in(reg) &cw,
+            "fldcw word ptr [{cw_ext}]",
+            cw_ext = in(reg) &cw_ext,
+            cw_trunc = in(reg) &cw_trunc,
             val = in(reg) &val,
             scale = in(reg) &scale,
             out = in(reg) &mut result,
@@ -819,14 +890,17 @@ fn generate_mip_from_linear(
         }
     }
 
-    // De-linearize to uint8 for encoding: pow(val, 1/2.2) * 255
+    // De-linearize to uint8: pow(val, 1/2.2) * 255.0, floor.
+    // Uses x87 for the full chain at 80-bit precision (matching FUN_679220).
     let inv_gamma: f32 = 1.0f32 / 2.2f32;
+    let scale: f32 = 255.0;
     let mut dst_u8 = vec![[0u8; 4]; new_w * new_h];
     for i in 0..new_w * new_h {
         for c in 0..3 {
-            let srgb = x87_powf(dst_lin[i][c], inv_gamma);
-            dst_u8[i][c] = (srgb * 255.0).max(0.0).min(255.0) as u8;
+            let v = x87_pow_scale_floor(dst_lin[i][c], inv_gamma, scale);
+            dst_u8[i][c] = v.clamp(0, 255) as u8;
         }
+        // Alpha: no gamma, just scale and floor
         dst_u8[i][3] = (dst_lin[i][3] * 255.0).max(0.0).min(255.0) as u8;
     }
 
@@ -849,25 +923,31 @@ fn generate_mip_from_linear(
 }
 
 /// x87 box filter: sum 4 f32 values at 80-bit precision, multiply by 0.25 * 255,
-/// and convert to u8 via fistp (round-to-nearest-even).
-/// Matches the original's FUN_677FE0 + FUN_679070 pipeline.
+/// and convert to u8 via floor (truncation).
+/// Matches the original's FUN_677FE0 + FUN_679070 (floor via FUN_681c10) pipeline.
+/// The original uses floor (truncation), NOT fistp round-to-nearest.
 #[inline(never)]
 fn x87_box_filter_u8(f0: f32, f1: f32, f2: f32, f3: f32) -> u8 {
     let quarter: f32 = 0.25;
     let scale: f32 = 255.0;
     let mut result: i32 = 0;
-    let cw: u16 = 0x037F;
+    let cw_ext: u16 = 0x037F;   // 80-bit precision, round-to-nearest
+    let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation (round toward zero)
     unsafe {
         std::arch::asm!(
-            "fldcw word ptr [{cw}]",
+            "fldcw word ptr [{cw_ext}]",
             "fld dword ptr [{f0}]",
             "fadd dword ptr [{f1}]",
             "fadd dword ptr [{f2}]",
             "fadd dword ptr [{f3}]",
             "fmul dword ptr [{quarter}]",
             "fmul dword ptr [{scale}]",
+            // Switch to truncation mode for the floor conversion
+            "fldcw word ptr [{cw_trunc}]",
             "fistp dword ptr [{out}]",
-            cw = in(reg) &cw,
+            "fldcw word ptr [{cw_ext}]",  // restore
+            cw_ext = in(reg) &cw_ext,
+            cw_trunc = in(reg) &cw_trunc,
             f0 = in(reg) &f0,
             f1 = in(reg) &f1,
             f2 = in(reg) &f2,
@@ -2104,82 +2184,223 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     (out, err)
 }
 
-/// Encode 16 RGBA pixels → DXT1 block using range-fit (bounding box endpoints).
+/// Quantize a float RGB channel value [0,255] to 5-bit or 6-bit.
+/// Matches FUN_0067c0b0: val * scale, clamp to [0, max], then trunc(clamped + 0.5).
+/// The original sets x87 to truncation mode (OR 0x0C00) before fistp.
+/// trunc(x + 0.5) for positive x = floor(x + 0.5) = standard round-half-up.
+fn quantize_channel_rf(val: f32, scale: f32, max_val: f32) -> u32 {
+    let scaled = val * scale;
+    let clamped = if scaled < 0.0 { 0.0 } else if scaled > max_val { max_val } else { scaled };
+    (clamped + 0.5) as u32 // trunc for positive = floor = round-half-up
+}
+
+/// Assign DXT1 4-color indices by nearest distance (FUN_0067c260).
+/// Endpoints are dequantized float RGB [0,255].
+fn assign_indices_distance(fpixels: &[[f32; 3]; 16], ep0: &[f32; 3], ep1: &[f32; 3]) -> u32 {
+    // Interpolated palette colors in float space
+    let color2 = [
+        ep0[0] * 0.6666666 + ep1[0] * 0.33333334,
+        ep0[1] * 0.6666666 + ep1[1] * 0.33333334,
+        ep0[2] * 0.6666666 + ep1[2] * 0.33333334,
+    ];
+    let color3 = [
+        ep0[0] * 0.3333333 + ep1[0] * 0.6666667,
+        ep0[1] * 0.3333333 + ep1[1] * 0.6666667,
+        ep0[2] * 0.3333333 + ep1[2] * 0.6666667,
+    ];
+
+    let mut indices = 0u32;
+    for i in 0..16 {
+        let p = &fpixels[i];
+        let d0 = (ep0[0]-p[0])*(ep0[0]-p[0]) + (ep0[1]-p[1])*(ep0[1]-p[1]) + (ep0[2]-p[2])*(ep0[2]-p[2]);
+        let d1 = (ep1[0]-p[0])*(ep1[0]-p[0]) + (ep1[1]-p[1])*(ep1[1]-p[1]) + (ep1[2]-p[2])*(ep1[2]-p[2]);
+        let d2 = (color2[0]-p[0])*(color2[0]-p[0]) + (color2[1]-p[1])*(color2[1]-p[1]) + (color2[2]-p[2])*(color2[2]-p[2]);
+        let d3 = (color3[0]-p[0])*(color3[0]-p[0]) + (color3[1]-p[1])*(color3[1]-p[1]) + (color3[2]-p[2])*(color3[2]-p[2]);
+
+        // Bit-logic matching FUN_0067c260
+        let bit1 = (d2 < d0 && d2 < d1) || (d3 < d1 && d3 < d0);
+        let bit0 = d3 < d2 && d3 < d0;
+        let idx = (bit1 as u32) * 2 | (bit0 as u32);
+        indices |= idx << (i * 2);
+    }
+    indices
+}
+
+/// Quantize an endpoint [R,G,B] to RGB565, return (rgb565, dequantized [R,G,B]).
+/// Matches FUN_0067c0b0.
+fn quantize_endpoint_rf(ep: &[f32; 3]) -> (u16, [f32; 3]) {
+    let r5 = quantize_channel_rf(ep[0], 0.12156863, 31.0); // 31/255
+    let g6 = quantize_channel_rf(ep[1], 0.24705882, 63.0); // 63/255
+    let b5 = quantize_channel_rf(ep[2], 0.12156863, 31.0);
+    let rgb565 = ((r5 << 11) | (g6 << 5) | b5) as u16;
+    let deq = [
+        ((r5 << 3) | (r5 >> 2)) as f32,
+        ((g6 << 2) | (g6 >> 4)) as f32,
+        ((b5 << 3) | (b5 >> 2)) as f32,
+    ];
+    (rgb565, deq)
+}
+
+/// Encode 16 RGBA pixels → DXT1 block using range-fit with inertia extension
+/// and least-squares refinement.
 ///
-/// Matches FUN_0067CF20 in the original: find the RGB bounding box of the 16
-/// pixels, use min/max as endpoints, assign each pixel the nearest palette index.
-/// This is the simple/fast encoder used when param_4[1]==0 in FUN_006550A0.
+/// Matches the original's FUN_0067CF20 pipeline exactly:
+///   FUN_0067b5e0 (pixel extract) → FUN_0067bd60 (bounding box) →
+///   FUN_0067be80 (inertia extension) → FUN_0067bfc0 (inset) →
+///   FUN_0067c0b0 (quantize) → FUN_0067c260 (indices) →
+///   FUN_0067c860 (least-squares refinement)
 fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
-    // Check for solid block first (FUN_0067B5A0 monochrome check)
+    // Step 0: Monochrome check (FUN_0067b5a0)
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
-    let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
-    if all_solid {
+    if pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb) {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    // Find bounding box of RGB values
-    let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
-    let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
-    for p in pixels {
-        min_r = min_r.min(p[0]); min_g = min_g.min(p[1]); min_b = min_b.min(p[2]);
-        max_r = max_r.max(p[0]); max_g = max_g.max(p[1]); max_b = max_b.max(p[2]);
-    }
-
-    // Inset the bounding box by 1/16 of its range (matching squish range-fit)
-    let inset_r = (max_r as i32 - min_r as i32) / 16;
-    let inset_g = (max_g as i32 - min_g as i32) / 16;
-    let inset_b = (max_b as i32 - min_b as i32) / 16;
-    let min_r = (min_r as i32 + inset_r).clamp(0, 255) as u8;
-    let min_g = (min_g as i32 + inset_g).clamp(0, 255) as u8;
-    let min_b = (min_b as i32 + inset_b).clamp(0, 255) as u8;
-    let max_r = (max_r as i32 - inset_r).clamp(0, 255) as u8;
-    let max_g = (max_g as i32 - inset_g).clamp(0, 255) as u8;
-    let max_b = (max_b as i32 - inset_b).clamp(0, 255) as u8;
-
-    // Quantize to RGB565
-    let mut c0 = encode_rgb565(max_r, max_g, max_b);
-    let mut c1 = encode_rgb565(min_r, min_g, min_b);
-
-    // Ensure 4-color mode (c0 > c1)
-    if c0 < c1 { std::mem::swap(&mut c0, &mut c1); }
-    if c0 == c1 {
-        // Nudge to make c0 > c1
-        if c1 > 0 { c1 -= 1; } else { c0 += 1; }
-    }
-
-    // Build 4-color palette
-    let (r0, g0, b0) = decode_rgb565(c0);
-    let (r1, g1, b1) = decode_rgb565(c1);
-    let palette = [
-        [r0 as i32, g0 as i32, b0 as i32],
-        [r1 as i32, g1 as i32, b1 as i32],
-        [((2 * r0 as i32 + r1 as i32) / 3), ((2 * g0 as i32 + g1 as i32) / 3), ((2 * b0 as i32 + b1 as i32) / 3)],
-        [((r0 as i32 + 2 * r1 as i32) / 3), ((g0 as i32 + 2 * g1 as i32) / 3), ((b0 as i32 + 2 * b1 as i32) / 3)],
-    ];
-
-    // Assign each pixel to nearest palette entry
-    let mut indices = 0u32;
+    // Step 1: Convert to float RGB [0,255] (FUN_0067b5e0)
+    // Original extracts from BGRA uint32 as: >>16=R, >>8=G, &0xff=B
+    // Our pixels are RGBA, channels 0=R, 1=G, 2=B — same order.
+    let mut fp = [[0.0f32; 3]; 16];
     for (i, p) in pixels.iter().enumerate() {
-        let pr = p[0] as i32;
-        let pg = p[1] as i32;
-        let pb = p[2] as i32;
-        let mut best_dist = i32::MAX;
-        let mut best_idx = 0u32;
-        for (j, pal) in palette.iter().enumerate() {
-            let dr = pr - pal[0];
-            let dg = pg - pal[1];
-            let db = pb - pal[2];
-            let dist = dr*dr + dg*dg + db*db;
-            if dist < best_dist { best_dist = dist; best_idx = j as u32; }
-        }
-        indices |= best_idx << (i * 2);
+        fp[i] = [p[0] as f32, p[1] as f32, p[2] as f32];
     }
+
+    // Step 2: Find bounding box (FUN_0067bd60)
+    let mut maxc = [0.0f32; 3];   // "max" endpoint
+    let mut minc = [255.0f32; 3]; // "min" endpoint
+    for p in &fp {
+        for c in 0..3 {
+            if p[c] > maxc[c] { maxc[c] = p[c]; }
+            if p[c] < minc[c] { minc[c] = p[c]; }
+        }
+    }
+
+    // Step 3: Inertia extension (FUN_0067be80)
+    // Compute midpoint of bounding box, then cross-correlations
+    let mid = [
+        (minc[0] + maxc[0]) * 0.5,
+        (minc[1] + maxc[1]) * 0.5,
+        (minc[2] + maxc[2]) * 0.5,
+    ];
+    let mut cross_rb = 0.0f32; // sum((R - midR) * (B - midB))
+    let mut cross_bg = 0.0f32; // sum((B - midB) * (G - midG))
+    for p in &fp {
+        let dr = p[0] - mid[0];
+        let dg = p[1] - mid[1];
+        let db = p[2] - mid[2];
+        cross_rb += dr * db;
+        cross_bg += db * dg;
+    }
+    // Swap min/max R if cross_rb < 0, swap min/max G if cross_bg < 0
+    if cross_rb < 0.0 { std::mem::swap(&mut minc[0], &mut maxc[0]); }
+    if cross_bg < 0.0 { std::mem::swap(&mut minc[1], &mut maxc[1]); }
+
+    // Step 4: Inset endpoints (FUN_0067bfc0)
+    // step = (max - min) / 16 - 0.5/255
+    let bias: f32 = 0.0019607844; // ≈ 0.5/255, exact f32 value from binary
+    for c in 0..3 {
+        let step = (maxc[c] - minc[c]) * 0.0625 - bias;
+        maxc[c] -= step;
+        minc[c] += step;
+        // Clamp to [0, 255] (FUN_0067bcb0)
+        maxc[c] = maxc[c].max(0.0).min(255.0);
+        minc[c] = minc[c].max(0.0).min(255.0);
+    }
+
+    // Step 5: Quantize to RGB565 and dequantize (FUN_0067c0b0)
+    let (mut c0, mut ep0) = quantize_endpoint_rf(&maxc);
+    let (mut c1, mut ep1) = quantize_endpoint_rf(&minc);
+
+    // Ensure c0 > c1 for 4-color mode
+    if c0 < c1 {
+        std::mem::swap(&mut c0, &mut c1);
+        std::mem::swap(&mut ep0, &mut ep1);
+    }
+
+    // Step 6: Assign indices by nearest distance (FUN_0067c260)
+    let indices = assign_indices_distance(&fp, &ep0, &ep1);
+
+    // Step 7: Least-squares refinement (FUN_0067c860)
+    // Build 2x2 normal equation from index weights
+    let (c0_final, c1_final, indices_final) = refine_endpoints_lsq(&fp, c0, c1, ep0, ep1, indices);
 
     let mut out = [0u8; 8];
-    out[0..2].copy_from_slice(&c0.to_le_bytes());
-    out[2..4].copy_from_slice(&c1.to_le_bytes());
-    out[4..8].copy_from_slice(&indices.to_le_bytes());
+    out[0..2].copy_from_slice(&c0_final.to_le_bytes());
+    out[2..4].copy_from_slice(&c1_final.to_le_bytes());
+    out[4..8].copy_from_slice(&indices_final.to_le_bytes());
     out
+}
+
+/// Least-squares endpoint refinement (FUN_0067c860).
+/// From current indices, solve the 2x2 linear system for optimal endpoints,
+/// then re-quantize and re-assign indices.
+fn refine_endpoints_lsq(
+    fp: &[[f32; 3]; 16],
+    c0_in: u16, c1_in: u16,
+    ep0_in: [f32; 3], ep1_in: [f32; 3],
+    indices_in: u32,
+) -> (u16, u16, u32) {
+    // Compute alpha/beta weights from indices
+    // Index 0 → alpha=1, beta=0
+    // Index 1 → alpha=0, beta=1
+    // Index 2 → alpha=2/3, beta=1/3
+    // Index 3 → alpha=1/3, beta=2/3
+    let mut aa = 0.0f32;
+    let mut bb = 0.0f32;
+    let mut ab = 0.0f32;
+    let mut a_pixel = [0.0f32; 3];
+    let mut b_pixel = [0.0f32; 3];
+
+    for i in 0..16 {
+        let idx = (indices_in >> (i * 2)) & 3;
+        let beta = match idx {
+            0 => 0.0f32,
+            1 => 1.0f32,
+            2 => 0.33333334f32, // (0+1)/3
+            3 => 0.66666666f32, // (1+1)/3  -- matching original: (bit0+1)*0.33333334
+            _ => unreachable!(),
+        };
+        let alpha = 1.0 - beta;
+
+        aa += alpha * alpha;
+        bb += beta * beta;
+        ab += alpha * beta;
+
+        for c in 0..3 {
+            a_pixel[c] += alpha * fp[i][c];
+            b_pixel[c] += beta * fp[i][c];
+        }
+    }
+
+    let det = aa * bb - ab * ab;
+    if det.abs() < 0.0001 {
+        // Singular — keep original endpoints
+        return (c0_in, c1_in, indices_in);
+    }
+
+    let inv_det = 1.0 / det;
+
+    // Solve for new endpoints
+    let mut new_ep0 = [0.0f32; 3];
+    let mut new_ep1 = [0.0f32; 3];
+    for c in 0..3 {
+        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0);
+        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0);
+    }
+
+    // Quantize refined endpoints
+    let (mut c0, mut ep0) = quantize_endpoint_rf(&new_ep0);
+    let (mut c1, mut ep1) = quantize_endpoint_rf(&new_ep1);
+
+    // Ensure c0 > c1
+    if c0 < c1 {
+        std::mem::swap(&mut c0, &mut c1);
+        std::mem::swap(&mut ep0, &mut ep1);
+    }
+
+    // Re-assign indices with refined endpoints
+    let indices = assign_indices_distance(fp, &ep0, &ep1);
+
+    (c0, c1, indices)
 }
 
 /// Encode 16 RGBA pixels → DXT1 block (8 bytes).
@@ -2265,17 +2486,21 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool, for_mip: bool)
 
     // ── All opaque: existing path ──
 
-    // Solid-color fast path: matches the original's monochrome check (FUN_0067b5a0)
-    // which tests if all 16 pixels have identical RGB. When true, uses the solid pack
-    // encoder (FUN_006807f0) which produces c0=c1 with all-zero indices.
+    // For mip generation, the original uses range-fit with inertia extension
+    // and least-squares refinement (FUN_0067cf20), NOT ClusterFit.
+    // ClusterFit (FUN_0067e280/Compress4) is only used for DXT5 (format 6).
+    if for_mip {
+        return encode_dxt1_range_fit(pixels);
+    }
+
+    // Non-mip path: ClusterFit (for initial DXT1 encoding)
     let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
     let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
     if all_solid {
         return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
-    let dedup = !for_mip;
-    let (block_4, _) = cluster_fit_4color(pixels, dedup);
+    let (block_4, _) = cluster_fit_4color(pixels, true);
     block_4
 }
 
@@ -3573,6 +3798,50 @@ mod tests {
                                 nonsolid_diff_endpoints += 1;
                             }
                         }
+                    }
+                }
+
+                // Diagnostic: for ID 19767 mip1, show first 5 mismatched non-solid blocks
+                if id == 19767 && mip_idx == 1 {
+                    let nbx = (new_w / 4).max(1);
+                    let mut diag_count = 0;
+                    for b in 0..num_blocks {
+                        if diag_count >= 5 { break; }
+                        let ref_block = &ref_mip[b*block_size..(b+1)*block_size];
+                        let our_block = &our_mip[b*block_size..(b+1)*block_size];
+                        let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                        let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                        if rc0 == rc1 || ref_block == our_block { continue; }
+                        diag_count += 1;
+                        let oc0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+                        let oc1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+                        let bx = b % nbx; let by = b / nbx;
+                        // Show pixel values for this block
+                        let mut pixels = [[0u8;4];16];
+                        for py in 0..4 { for px in 0..4 {
+                            let x = (bx*4+px).min(new_w-1);
+                            let y = (by*4+py).min(new_h-1);
+                            pixels[py*4+px] = new_pix[y*new_w+x];
+                        }}
+                        let (rr0,rg0,rb0) = decode_rgb565(rc0);
+                        let (rr1,rg1,rb1) = decode_rgb565(rc1);
+                        let (or0,og0,ob0) = decode_rgb565(oc0);
+                        let (or1,og1,ob1) = decode_rgb565(oc1);
+                        eprintln!("  DIAG block ({},{}) ref c0={:04X}({},{},{}) c1={:04X}({},{},{}) idx={:08X}",
+                            bx, by, rc0, rr0, rg0, rb0, rc1, rr1, rg1, rb1,
+                            u32::from_le_bytes([ref_block[4],ref_block[5],ref_block[6],ref_block[7]]));
+                        eprintln!("              ours c0={:04X}({},{},{}) c1={:04X}({},{},{}) idx={:08X}",
+                            oc0, or0, og0, ob0, oc1, or1, og1, ob1,
+                            u32::from_le_bytes([our_block[4],our_block[5],our_block[6],our_block[7]]));
+                        // Show pixel bounding box and a few pixel values
+                        let mut pmin = [255u8;3]; let mut pmax = [0u8;3];
+                        for p in &pixels { for c in 0..3 {
+                            pmin[c] = pmin[c].min(p[c]); pmax[c] = pmax[c].max(p[c]);
+                        }}
+                        eprintln!("              bbox min=({},{},{}) max=({},{},{})  px[0]=({},{},{}) px[15]=({},{},{})",
+                            pmin[0],pmin[1],pmin[2], pmax[0],pmax[1],pmax[2],
+                            pixels[0][0],pixels[0][1],pixels[0][2],
+                            pixels[15][0],pixels[15][1],pixels[15][2]);
                     }
                 }
 
