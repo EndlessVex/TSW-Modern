@@ -3437,6 +3437,76 @@ mod tests {
             (matching_blocks as f64 / total_blocks as f64) * 100.0);
 
         // === GAMMA-CORRECT pipeline comparison ===
+        // === FLOAT CASCADING (no gamma, float precision between mips) ===
+        eprintln!("\n  === Float cascading (no gamma) ===");
+        {
+            let mut float_total = 0usize;
+            let mut float_match = 0usize;
+            for &(id, width, height) in test_textures {
+                let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+                let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let ref_data = {
+                    let mut file = std::fs::File::open(&ref_path).unwrap();
+                    file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                    let mut buf = vec![0u8; entry.length as usize];
+                    file.read_exact(&mut buf).unwrap();
+                    buf
+                };
+                let mut ms = Vec::new();
+                let (mut w, mut h) = (width, height);
+                loop { ms.push(((w+3)/4)*((h+3)/4)*block_size); if w<=1&&h<=1{break;} w=(w/2).max(1); h=(h/2).max(1); }
+                let mc = ms.len();
+                let mut rm: Vec<&[u8]> = Vec::new();
+                let mut off = fctx_header_size;
+                for i in (0..mc).rev() { rm.push(&ref_data[off..off+ms[i]]); off+=ms[i]; }
+                rm.reverse();
+
+                let (mut cw, mut ch) = (width, height);
+                let (pbx, pby) = ((cw/4).max(1), (ch/4).max(1));
+                let mut decoded = vec![[0u8;4]; cw*ch];
+                for by in 0..pby { for bx in 0..pbx {
+                    let o2 = (by*pbx+bx)*block_size;
+                    if o2+block_size > rm[0].len() { continue; }
+                    let px = decode_dxt1_block(&rm[0][o2..o2+block_size]);
+                    for py in 0..4 { for ppx in 0..4 {
+                        let (xx,yy) = (bx*4+ppx, by*4+py);
+                        if xx<cw && yy<ch { decoded[yy*cw+xx] = px[py*4+ppx]; }
+                    }}
+                }}
+                let r255: f32 = 1.0/255.0;
+                let mut cur_f: Vec<[f32;4]> = decoded.iter().map(|p| {
+                    [p[0] as f32 * r255, p[1] as f32 * r255,
+                     p[2] as f32 * r255, p[3] as f32 * r255]
+                }).collect();
+
+                for mi in 1..mc {
+                    let (nw, nh) = ((cw/2).max(1), (ch/2).max(1));
+                    let mut new_f = vec![[0.0f32;4]; nw*nh];
+                    for y in 0..nh { for x in 0..nw {
+                        let (x0,y0) = ((x*2).min(cw-1), (y*2).min(ch-1));
+                        let (x1,y1) = ((x*2+1).min(cw-1), (y*2+1).min(ch-1));
+                        for c in 0..4 { new_f[y*nw+x][c] = (cur_f[y0*cw+x0][c]+cur_f[y0*cw+x1][c]+cur_f[y1*cw+x0][c]+cur_f[y1*cw+x1][c])*0.25; }
+                    }}
+                    let mut dst_u8 = vec![[0u8;4]; nw*nh];
+                    for i in 0..nw*nh { for c in 0..4 { dst_u8[i][c] = (new_f[i][c]*255.0).max(0.0).min(255.0) as u8; }}
+                    let nbx=(nw/4).max(1); let nby=(nh/4).max(1);
+                    let mut mip = Vec::with_capacity(nbx*nby*block_size);
+                    for by2 in 0..nby { for bx2 in 0..nbx {
+                        let mut bp=[[0u8;4];16];
+                        for py in 0..4{for px in 0..4{bp[py*4+px]=dst_u8[((by2*4+py).min(nh-1))*nw+(bx2*4+px).min(nw-1)];}}
+                        mip.extend_from_slice(&encode_dxt1_block(&bp,false,true));
+                    }}
+                    let r=rm[mi]; let nb=r.len()/block_size;
+                    let mut mm=0;
+                    for b in 0..nb{if mip[b*8..(b+1)*8]==r[b*8..(b+1)*8]{mm+=1;}}
+                    if id==19767{ eprintln!("  [float] mip{} ({}x{}): {}/{} ({:.1}%)",mi,nw,nh,mm,nb,mm as f64/nb as f64*100.0); }
+                    float_total+=nb; float_match+=mm;
+                    cur_f=new_f; cw=nw; ch=nh;
+                }
+            }
+            eprintln!("  [float] OVERALL: {}/{} ({:.2}%)", float_match,float_total,float_match as f64/float_total as f64*100.0);
+        }
+
         eprintln!("\n  === GAMMA 2.2 (linear-space filtering) ===");
         let mut gamma_total = 0usize;
         let mut gamma_match = 0usize;
