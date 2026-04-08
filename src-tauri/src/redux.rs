@@ -277,16 +277,48 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
 
     // ── 6. Generate all mips, then write SMALLEST-FIRST ────────────
     // The FCTX format stores mips smallest-first (1x1 at start, full mip0 at end).
+    //
+    // CRITICAL: The original cascades resizes in uncompressed pixel space.
+    // It decodes mip0 ONCE, then repeatedly box-filters the pixel buffer
+    // for each mip level, encoding only at output time. It does NOT
+    // re-decode the DXT1 blocks between mip levels.
     let mut all_mips: Vec<Vec<u8>> = vec![mip0_data[..mip_sizes[0]].to_vec()];
     let mut current_w = stream1.width;
     let mut current_h = stream1.height;
+
+    // Decode mip0 to pixel buffer ONCE for cascaded resize
+    let block_size = codec.block_size();
+    let prev_bx = (current_w / 4).max(1);
+    let prev_by = (current_h / 4).max(1);
+    let mut current_pixels: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
+    for by in 0..prev_by {
+        for bx in 0..prev_bx {
+            let block_off = (by * prev_bx + bx) * block_size;
+            if block_off + block_size > mip_sizes[0] { continue; }
+            let block = &mip0_data[block_off..block_off + block_size];
+            let block_pixels = match codec {
+                TextureCodec::Dxt1 => decode_dxt1_block(block),
+                TextureCodec::Dxt5 => decode_dxt5_block(block),
+                TextureCodec::Ati2 => decode_ati2_block(block),
+            };
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = bx * 4 + px;
+                    let y = by * 4 + py;
+                    if x < current_w && y < current_h {
+                        current_pixels[y * current_w + x] = block_pixels[py * 4 + px];
+                    }
+                }
+            }
+        }
+    }
 
     for mip_idx in 1..mip_count {
         let new_w = (current_w / 2).max(4);
         let new_h = (current_h / 2).max(4);
 
-        let mip_data = generate_mip(
-            &all_mips[mip_idx - 1], current_w, current_h, new_w, new_h, codec,
+        let (mip_data, new_pixels) = generate_mip_from_pixels(
+            &current_pixels, current_w, current_h, new_w, new_h, codec,
             has_binary_alpha,
         );
 
@@ -300,6 +332,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         }
 
         all_mips.push(mip_data);
+        current_pixels = new_pixels;
         current_w = new_w;
         current_h = new_h;
     }
@@ -546,10 +579,7 @@ fn generate_mip(
         }
     }
 
-    // Step 2: Box-filter — float averaging with truncation (no +0.5 rounding).
-    // Testing showed truncating division matches the original better than
-    // rounding. The original likely uses float averaging with truncating
-    // conversion back to u8.
+    // Step 2: Box-filter with truncating integer division.
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -596,7 +626,81 @@ fn generate_mip(
 }
 
 /// Generate a downsampled BC4 mip level from BC4 block data.
+/// Generate a mip level from an UNCOMPRESSED pixel buffer.
 ///
+/// Matches the original's pipeline: the resize operates on uncompressed pixels
+/// (not re-decoded DXT1). Returns (encoded_blocks, filtered_pixels) so the
+/// filtered pixels can be passed to the next mip level without re-encoding.
+fn generate_mip_from_pixels(
+    src_pixels: &[[u8; 4]],
+    prev_w: usize,
+    prev_h: usize,
+    new_w: usize,
+    new_h: usize,
+    codec: TextureCodec,
+    force_3color: bool,
+) -> (Vec<u8>, Vec<[u8; 4]>) {
+    let block_size = codec.block_size();
+    let new_bx = (new_w / 4).max(1);
+    let new_by = (new_h / 4).max(1);
+
+    // Box-filter matching the original's float pipeline (FUN_677FE0):
+    // The original converts to float (val * 1/255), averages 4 pixels (* 0.25),
+    // then converts back (val * 255.0, truncate to int, clamp 0-255).
+    // For most values this equals integer truncation, but the float path
+    // produces `floor((a+b+c+d) / 4.0)` which can differ by 1 from
+    // integer `(a+b+c+d) / 4` when the division is exact for floats but
+    // truncates differently for integers.
+    let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
+    let recip255: f32 = 1.0 / 255.0;
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let sx = x * 2;
+            let sy = y * 2;
+            let x0 = sx.min(prev_w - 1);
+            let y0 = sy.min(prev_h - 1);
+            let x1 = (sx + 1).min(prev_w - 1);
+            let y1 = (sy + 1).min(prev_h - 1);
+
+            let p00 = src_pixels[y0 * prev_w + x0];
+            let p10 = src_pixels[y0 * prev_w + x1];
+            let p01 = src_pixels[y1 * prev_w + x0];
+            let p11 = src_pixels[y1 * prev_w + x1];
+
+            for c in 0..4 {
+                let f0 = p00[c] as f32 * recip255;
+                let f1 = p10[c] as f32 * recip255;
+                let f2 = p01[c] as f32 * recip255;
+                let f3 = p11[c] as f32 * recip255;
+                let avg = (f0 + f1 + f2 + f3) * 0.25;
+                dst_pixels[y * new_w + x][c] = (avg * 255.0).max(0.0).min(255.0) as u8;
+            }
+        }
+    }
+
+    // Encode block by block from filtered image
+    let mut result = Vec::with_capacity(new_bx * new_by * block_size);
+    for by in 0..new_by {
+        for bx in 0..new_bx {
+            let mut block_pixels = [[0u8; 4]; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = (bx * 4 + px).min(new_w - 1);
+                    let y = (by * 4 + py).min(new_h - 1);
+                    block_pixels[py * 4 + px] = dst_pixels[y * new_w + x];
+                }
+            }
+            match codec {
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&block_pixels, force_3color, true)),
+                TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&block_pixels)),
+                TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&block_pixels)),
+            }
+        }
+    }
+
+    (result, dst_pixels)
+}
+
 /// Same float pipeline as generate_mip but for single-channel BC4.
 fn generate_mip_bc4(prev: &[u8], prev_w: usize, prev_h: usize, new_w: usize, new_h: usize) -> Vec<u8> {
     let prev_bx = (prev_w / 4).max(1);
@@ -1839,16 +1943,13 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool, for_mip: bool)
 
     // ── All opaque: existing path ──
 
-    if !for_mip {
-        // Solid-color fast path (non-mip encoding only).
-        // For mip generation, the original sends ALL blocks through ClusterFit
-        // (even solid ones) because the monochrome check rarely triggers after
-        // box filtering. ClusterFit naturally produces c0=c1 for uniform blocks.
-        let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
-        let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
-        if all_solid {
-            return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
-        }
+    // Solid-color fast path: matches the original's monochrome check (FUN_0067b5a0)
+    // which tests if all 16 pixels have identical RGB. When true, uses the solid pack
+    // encoder (FUN_006807f0) which produces c0=c1 with all-zero indices.
+    let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
+    let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
+    if all_solid {
+        return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
     }
 
     let dedup = !for_mip;
@@ -2943,10 +3044,31 @@ mod tests {
             // mip0 from the reference (CDN source, should be identical)
             let mip0 = ref_mips[0];
 
-            // Regenerate mips 1..N using our encoder
-            let mut current_data = mip0.to_vec();
+            // Regenerate mips 1..N using cascaded pixel buffers
+            // (matching the original which keeps uncompressed pixels between levels)
             let mut current_w = width;
             let mut current_h = height;
+
+            // Decode mip0 to pixel buffer
+            let prev_bx = (current_w / 4).max(1);
+            let prev_by = (current_h / 4).max(1);
+            let mut current_pixels: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
+            for by in 0..prev_by {
+                for bx in 0..prev_bx {
+                    let off = (by * prev_bx + bx) * block_size;
+                    if off + block_size > mip0.len() { continue; }
+                    let pixels = decode_dxt1_block(&mip0[off..off + block_size]);
+                    for py in 0..4 {
+                        for px in 0..4 {
+                            let x = bx * 4 + px;
+                            let y = by * 4 + py;
+                            if x < current_w && y < current_h {
+                                current_pixels[y * current_w + x] = pixels[py * 4 + px];
+                            }
+                        }
+                    }
+                }
+            }
 
             let mut tex_total = 0usize;
             let mut tex_match = 0usize;
@@ -2955,8 +3077,8 @@ mod tests {
                 let new_w = (current_w / 2).max(4);
                 let new_h = (current_h / 2).max(4);
 
-                let our_mip = generate_mip(
-                    &current_data, current_w, current_h, new_w, new_h,
+                let (our_mip, new_pixels) = generate_mip_from_pixels(
+                    &current_pixels, current_w, current_h, new_w, new_h,
                     TextureCodec::Dxt1, false,
                 );
 
@@ -2982,9 +3104,8 @@ mod tests {
                 tex_total += num_blocks;
                 tex_match += mip_match;
 
-                // Use OUR generated mip as input for next level
-                // (matching what the pipeline does -- each mip is generated from the previous)
-                current_data = our_mip;
+                // Keep uncompressed pixels for next level (NOT re-decoded DXT1)
+                current_pixels = new_pixels;
                 current_w = new_w;
                 current_h = new_h;
             }
@@ -3036,17 +3157,35 @@ mod tests {
             }
             ref_mips.reverse(); // ref_mips[0] = mip0
 
-            // Regenerate mips and compare, tracking solid vs non-solid
-            let mut current_data = ref_mips[0].to_vec();
+            // Regenerate mips using cascaded pixel buffers, tracking solid vs non-solid
             let mut current_w = width;
             let mut current_h = height;
+
+            // Decode mip0 to pixel buffer
+            let pbx = (current_w / 4).max(1);
+            let pby = (current_h / 4).max(1);
+            let mut cur_pix: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
+            for by in 0..pby {
+                for bx in 0..pbx {
+                    let off = (by * pbx + bx) * block_size;
+                    if off + block_size > ref_mips[0].len() { continue; }
+                    let pixels = decode_dxt1_block(&ref_mips[0][off..off + block_size]);
+                    for py in 0..4 { for px in 0..4 {
+                        let x = bx * 4 + px;
+                        let y = by * 4 + py;
+                        if x < current_w && y < current_h {
+                            cur_pix[y * current_w + x] = pixels[py * 4 + px];
+                        }
+                    }}
+                }
+            }
 
             for mip_idx in 1..mip_count {
                 let new_w = (current_w / 2).max(4);
                 let new_h = (current_h / 2).max(4);
 
-                let our_mip = generate_mip(
-                    &current_data, current_w, current_h, new_w, new_h,
+                let (our_mip, new_pix) = generate_mip_from_pixels(
+                    &cur_pix, current_w, current_h, new_w, new_h,
                     TextureCodec::Dxt1, false,
                 );
 
@@ -3077,7 +3216,7 @@ mod tests {
                     }
                 }
 
-                current_data = our_mip;
+                cur_pix = new_pix;
                 current_w = new_w;
                 current_h = new_h;
             }
@@ -4356,6 +4495,686 @@ mod tests {
             if direct_nonsolid_total > 0 { direct_nonsolid_match as f64 / direct_nonsolid_total as f64 * 100.0 } else { 0.0 });
         eprintln!("  Sequential (mip0→mip1→mip2):");
         eprintln!("    Total: {}/1024 ({:.1}%)", seq_match, seq_match as f64 / 1024.0 * 100.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn encoder_replication_filter_search() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip0_size = 128 * 128 * 8;
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+        let mip1_size = 64 * 64 * 8;
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // Decode mip0 to 512x512 pixels
+        let mut src = vec![[0u8; 4]; 512 * 512];
+        for by in 0..128 {
+            for bx in 0..128 {
+                let off = (by * 128 + bx) * 8;
+                let pixels = decode_dxt1_block(&ref_mip0[off..off + 8]);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        src[(by * 4 + py) * 512 + bx * 4 + px] = pixels[py * 4 + px];
+                    }
+                }
+            }
+        }
+
+        // Collect solid block reference pixels from mip1
+        struct SolidRef {
+            bx: usize,
+            by: usize,
+            r: u8, g: u8, b: u8,
+        }
+        let mut solid_refs = Vec::new();
+        for b in 0..(64 * 64) {
+            let block = &ref_mip1[b * 8..(b + 1) * 8];
+            let c0 = u16::from_le_bytes([block[0], block[1]]);
+            let c1 = u16::from_le_bytes([block[2], block[3]]);
+            if c0 != c1 { continue; }
+            let (r, g, b_val) = decode_rgb565(c0);
+            solid_refs.push(SolidRef { bx: b % 64, by: b / 64, r, g, b: b_val });
+        }
+        eprintln!("  Solid blocks in ref mip1: {}", solid_refs.len());
+
+        // Helper: apply a filter to produce 256x256 from 512x512, return match count
+        let test_filter = |name: &str, filter: &dyn Fn(&Vec<[u8;4]>, usize, usize) -> [u8;4]| {
+            // For solid blocks, all 16 pixels should be identical after filtering.
+            // Check top-left pixel of each solid block.
+            let mut exact = 0u32;
+            let mut off1 = 0u32;
+            let mut off2plus = 0u32;
+            let mut max_diff = 0i32;
+            let mut total_ch_diff = [0i64; 3];
+            for sr in &solid_refs {
+                let x = sr.bx * 4;
+                let y = sr.by * 4;
+                let p = filter(&src, x, y);
+                let dr = (p[0] as i32 - sr.r as i32).abs();
+                let dg = (p[1] as i32 - sr.g as i32).abs();
+                let db = (p[2] as i32 - sr.b as i32).abs();
+                total_ch_diff[0] += p[0] as i64 - sr.r as i64;
+                total_ch_diff[1] += p[1] as i64 - sr.g as i64;
+                total_ch_diff[2] += p[2] as i64 - sr.b as i64;
+                let m = dr.max(dg).max(db);
+                max_diff = max_diff.max(m);
+                if m == 0 { exact += 1; }
+                else if m == 1 { off1 += 1; }
+                else { off2plus += 1; }
+            }
+            let n = solid_refs.len() as f64;
+            eprintln!("  {}: exact={}/{} ({:.1}%) off1={} off2+={} max={} bias=({:.2},{:.2},{:.2})",
+                name, exact, solid_refs.len(), exact as f64/n*100.0, off1, off2plus, max_diff,
+                total_ch_diff[0] as f64/n, total_ch_diff[1] as f64/n, total_ch_diff[2] as f64/n);
+            exact
+        };
+
+        // Note: src is stack-allocated slice, but we pass by ref
+        // We need to work around the array size in closure signatures
+        let sw = 512usize;
+
+        // Filter 1: Box filter (truncating)
+        test_filter("box_trunc", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = (sum / 4) as u8;
+            }
+            out
+        });
+
+        // Filter 2: Box filter (rounding +2)
+        test_filter("box_round", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = ((sum + 2) / 4) as u8;
+            }
+            out
+        });
+
+        // Filter 3: Box filter (float, truncate to u8)
+        test_filter("box_float_trunc", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as f32 + src[sy*sw+sx+1][c] as f32
+                    + src[(sy+1)*sw+sx][c] as f32 + src[(sy+1)*sw+sx+1][c] as f32;
+                out[c] = (sum * 0.25) as u8;
+            }
+            out
+        });
+
+        // Filter 4: Box filter using pmulhuw-style fixed-point (>> 8 rounding)
+        // pmulhuw(a, b) = (a * b) >> 16. If weight = 0x4000 (= 0.25 in Q16), then
+        // result = (pixel * 0x4000) >> 16 = pixel >> 2
+        // But with 4 pixels summed first... let's try the SSE2 approach:
+        // sum all 4 as u16, then pmulhuw with 0x4000
+        test_filter("box_pmulhuw", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                // pmulhuw: (sum * 0x4000) >> 16 = sum >> 2
+                let result = ((sum as u64 * 0x4000) >> 16) as u8;
+                out[c] = result;
+            }
+            out
+        });
+
+        // Filter 5: sRGB-aware (gamma correct): convert to linear, average, back to sRGB
+        test_filter("srgb_linear", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            let to_linear = |v: u8| -> f32 { (v as f32 / 255.0).powf(2.2) };
+            let to_srgb = |v: f32| -> u8 { (v.powf(1.0/2.2) * 255.0 + 0.5).clamp(0.0, 255.0) as u8 };
+            for c in 0..3 {
+                let sum = to_linear(src[sy*sw+sx][c]) + to_linear(src[sy*sw+sx+1][c])
+                    + to_linear(src[(sy+1)*sw+sx][c]) + to_linear(src[(sy+1)*sw+sx+1][c]);
+                out[c] = to_srgb(sum * 0.25);
+            }
+            out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
+                + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
+            out
+        });
+
+        // Filter 6: Nearest neighbor (top-left pixel)
+        test_filter("nearest_tl", &|src, x, y| {
+            src[y*2*sw + x*2]
+        });
+
+        // Filter 7: Nearest neighbor (center = bottom-right of top-left)
+        test_filter("nearest_br", &|src, x, y| {
+            src[(y*2+1)*sw + x*2+1]
+        });
+
+        // Filter 8: Box filter with +1 bias (matches some HW implementations)
+        test_filter("box_plus1", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = ((sum + 1) / 4) as u8;
+            }
+            out
+        });
+
+        // Filter 9: Average as u16 fixed-point (multiply by 16384 = 0x4000, then >>16)
+        // This simulates pmulhuw rounding behavior
+        test_filter("avg_u16_fixed", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                // Each pixel is extended to u16 via punpcklbw (zero-extend)
+                // Then we add bias of 1 (paddw with 0x0001)
+                // Then sum pairs via pmulhuw blend
+                let p00 = src[sy*sw+sx][c] as u16;
+                let p10 = src[sy*sw+sx+1][c] as u16;
+                let p01 = src[(sy+1)*sw+sx][c] as u16;
+                let p11 = src[(sy+1)*sw+sx+1][c] as u16;
+                // Horizontal blend: avg(p00, p10) via (p00 + p10 + 1) >> 1
+                let h0 = (p00 + p10 + 1) >> 1;
+                let h1 = (p01 + p11 + 1) >> 1;
+                // Vertical blend: avg(h0, h1) via (h0 + h1 + 1) >> 1
+                let v = (h0 + h1 + 1) >> 1;
+                out[c] = v as u8;
+            }
+            out
+        });
+
+        // Filter 10: Separable H-then-V with truncation
+        test_filter("sep_h_then_v_trunc", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let h0 = (src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32) / 2;
+                let h1 = (src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32) / 2;
+                out[c] = ((h0 + h1) / 2) as u8;
+            }
+            out
+        });
+
+        // Filter 11: Separable V-then-H with truncation
+        test_filter("sep_v_then_h_trunc", &|src, x, y| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let v0 = (src[sy*sw+sx][c] as u32 + src[(sy+1)*sw+sx][c] as u32) / 2;
+                let v1 = (src[sy*sw+sx+1][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32) / 2;
+                out[c] = ((v0 + v1) / 2) as u8;
+            }
+            out
+        });
+
+        // Now test full pipeline match rates with top filter candidates
+        eprintln!("\n  === Full pipeline match rates (filter -> encode -> compare) ===");
+
+        // Helper to run full pipeline with a given filter function
+        let test_pipeline = |name: &str, filter_fn: &dyn Fn(&Vec<[u8;4]>, usize, usize, usize, usize) -> [u8;4]| {
+            let mut dst = vec![[0u8; 4]; 256 * 256];
+            for y in 0..256usize {
+                for x in 0..256usize {
+                    dst[y * 256 + x] = filter_fn(&src, x, y, 512, 256);
+                }
+            }
+            // Encode and compare
+            let mut match_count = 0u32;
+            let mut solid_match = 0u32;
+            let mut solid_total = 0u32;
+            let mut nonsolid_match = 0u32;
+            let mut nonsolid_total = 0u32;
+            for by in 0..64 {
+                for bx in 0..64 {
+                    let mut block_pixels = [[0u8; 4]; 16];
+                    for py in 0..4 { for px in 0..4 {
+                        let x = (bx * 4 + px).min(255);
+                        let y = (by * 4 + py).min(255);
+                        block_pixels[py * 4 + px] = dst[y * 256 + x];
+                    }}
+                    let our = encode_dxt1_block(&block_pixels, false, true);
+                    let b = by * 64 + bx;
+                    let ref_block = &ref_mip1[b*8..(b+1)*8];
+                    let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                    let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                    let is_solid = rc0 == rc1;
+                    if is_solid { solid_total += 1; } else { nonsolid_total += 1; }
+                    if our == ref_block {
+                        match_count += 1;
+                        if is_solid { solid_match += 1; } else { nonsolid_match += 1; }
+                    }
+                }
+            }
+            let total = 64*64;
+            eprintln!("  {}: {}/{} ({:.1}%) solid={}/{} nonsolid={}/{}",
+                name, match_count, total, match_count as f64/total as f64*100.0,
+                solid_match, solid_total, nonsolid_match, nonsolid_total);
+        };
+
+        test_pipeline("pipe_box_trunc", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = (sum / 4) as u8;
+            }
+            out
+        });
+
+        test_pipeline("pipe_box_round", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = ((sum + 2) / 4) as u8;
+            }
+            out
+        });
+
+        test_pipeline("pipe_srgb_linear", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            let to_lin = |v: u8| -> f32 { (v as f32 / 255.0).powf(2.2) };
+            let to_srgb = |v: f32| -> u8 { (v.powf(1.0/2.2) * 255.0 + 0.5).clamp(0.0, 255.0) as u8 };
+            for c in 0..3 {
+                let sum = to_lin(src[sy*sw+sx][c]) + to_lin(src[sy*sw+sx+1][c])
+                    + to_lin(src[(sy+1)*sw+sx][c]) + to_lin(src[(sy+1)*sw+sx+1][c]);
+                out[c] = to_srgb(sum * 0.25);
+            }
+            out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
+                + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
+            out
+        });
+
+        test_pipeline("pipe_sep_hv_round", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let h0 = (src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32 + 1) / 2;
+                let h1 = (src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32 + 1) / 2;
+                out[c] = ((h0 + h1 + 1) / 2) as u8;
+            }
+            out
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn encoder_replication_pixel_deep_analysis() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let block_size = 8usize;
+
+        // Extract mip0 (512x512) and mip1 (256x256), stored smallest-first
+        let mip0_size = 128 * 128 * block_size; // 131072
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+
+        let mip1_size = 64 * 64 * block_size; // 32768
+        let mip1_offset = mip0_offset - mip1_size;
+        let ref_mip1 = &ref_data[mip1_offset..mip1_offset + mip1_size];
+
+        // ── Step 1: Decode reference mip0 (512x512) to pixels ──
+        let mut mip0_pixels = vec![[0u8; 4]; 512 * 512];
+        for by in 0..128usize {
+            for bx in 0..128usize {
+                let off = (by * 128 + bx) * block_size;
+                let block = &ref_mip0[off..off + block_size];
+                let decoded = decode_dxt1_block(block);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        mip0_pixels[(by * 4 + py) * 512 + bx * 4 + px] = decoded[py * 4 + px];
+                    }
+                }
+            }
+        }
+
+        // ── Step 2: Box-filter (truncating integer division) to 256x256 ──
+        let mut our_pixels = vec![[0u8; 4]; 256 * 256];
+        for y in 0..256usize {
+            for x in 0..256usize {
+                let p00 = mip0_pixels[(y * 2) * 512 + x * 2];
+                let p10 = mip0_pixels[(y * 2) * 512 + x * 2 + 1];
+                let p01 = mip0_pixels[(y * 2 + 1) * 512 + x * 2];
+                let p11 = mip0_pixels[(y * 2 + 1) * 512 + x * 2 + 1];
+                for c in 0..4 {
+                    let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
+                    our_pixels[y * 256 + x][c] = (sum / 4) as u8;
+                }
+            }
+        }
+
+        // ── Step 3: Decode reference mip1 (256x256) to pixels ──
+        let mut ref_pixels = vec![[0u8; 4]; 256 * 256];
+        // Also store per-pixel palette info: which block, which palette index
+        let mut ref_palette_idx = vec![0u8; 256 * 256];
+        // Store DXT1 block palette for each block
+        let mut ref_block_palettes: Vec<[[u8; 4]; 4]> = Vec::with_capacity(64 * 64);
+        for by in 0..64usize {
+            for bx in 0..64usize {
+                let b = by * 64 + bx;
+                let off = b * block_size;
+                let block = &ref_mip1[off..off + block_size];
+                let c0 = u16::from_le_bytes([block[0], block[1]]);
+                let c1 = u16::from_le_bytes([block[2], block[3]]);
+                let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+                let (r0, g0, b0) = decode_rgb565(c0);
+                let (r1, g1, b1) = decode_rgb565(c1);
+                let palette: [[u8; 4]; 4] = if c0 > c1 {
+                    [
+                        [r0, g0, b0, 255],
+                        [r1, g1, b1, 255],
+                        [
+                            ((2 * r0 as u16 + r1 as u16) / 3) as u8,
+                            ((2 * g0 as u16 + g1 as u16) / 3) as u8,
+                            ((2 * b0 as u16 + b1 as u16) / 3) as u8,
+                            255,
+                        ],
+                        [
+                            ((r0 as u16 + 2 * r1 as u16) / 3) as u8,
+                            ((g0 as u16 + 2 * g1 as u16) / 3) as u8,
+                            ((b0 as u16 + 2 * b1 as u16) / 3) as u8,
+                            255,
+                        ],
+                    ]
+                } else {
+                    [
+                        [r0, g0, b0, 255],
+                        [r1, g1, b1, 255],
+                        [
+                            ((r0 as u16 + r1 as u16) / 2) as u8,
+                            ((g0 as u16 + g1 as u16) / 2) as u8,
+                            ((b0 as u16 + b1 as u16) / 2) as u8,
+                            255,
+                        ],
+                        [0, 0, 0, 0],
+                    ]
+                };
+                ref_block_palettes.push(palette);
+
+                for py in 0..4 {
+                    for px in 0..4 {
+                        let i = py * 4 + px;
+                        let sel = ((indices >> (i * 2)) & 3) as usize;
+                        ref_pixels[(by * 4 + py) * 256 + bx * 4 + px] = palette[sel];
+                        ref_palette_idx[(by * 4 + py) * 256 + bx * 4 + px] = sel as u8;
+                    }
+                }
+            }
+        }
+
+        // ── Step 4: Pixel-by-pixel comparison ──
+        let total_pixels = 256 * 256;
+        let mut exact_match_count = 0u64;
+
+        // Absolute difference histogram (per pixel max channel diff)
+        let mut abs_diff_hist = [0u64; 256];
+
+        // Per-channel signed difference histograms: index = diff + 255 (range 0..511)
+        let mut r_diff_hist = vec![0u64; 511];
+        let mut g_diff_hist = vec![0u64; 511];
+        let mut b_diff_hist = vec![0u64; 511];
+
+        // Per-channel squared error sums for RMSE
+        let mut r_sq_err = 0.0f64;
+        let mut g_sq_err = 0.0f64;
+        let mut b_sq_err = 0.0f64;
+
+        // Position-within-block correlation: [py][px] -> (mismatch_count, total_abs_diff)
+        let mut block_pos_mismatch = [[0u64; 4]; 4];
+        let mut block_pos_total_diff = [[0u64; 4]; 4];
+
+        // Edge vs center correlation
+        // Edge = first/last 16 pixels in each dimension
+        let edge_margin = 16usize;
+        let mut edge_mismatch = 0u64;
+        let mut edge_total = 0u64;
+        let mut center_mismatch = 0u64;
+        let mut center_total = 0u64;
+
+        // Palette membership check: is every ref pixel one of the 4 palette colors?
+        let mut palette_member_yes = 0u64;
+        let mut palette_member_no = 0u64;
+
+        // Track first 10 mismatched pixels for detailed output
+        struct MismatchDetail {
+            x: usize,
+            y: usize,
+            our: [u8; 4],
+            reference: [u8; 4],
+            sources: [[u8; 4]; 4],
+        }
+        let mut mismatch_details: Vec<MismatchDetail> = Vec::new();
+
+        for y in 0..256usize {
+            for x in 0..256usize {
+                let idx = y * 256 + x;
+                let ours = our_pixels[idx];
+                let refs = ref_pixels[idx];
+
+                // Per-channel signed diffs (ours - ref)
+                let dr = ours[0] as i32 - refs[0] as i32;
+                let dg = ours[1] as i32 - refs[1] as i32;
+                let db = ours[2] as i32 - refs[2] as i32;
+
+                r_diff_hist[(dr + 255) as usize] += 1;
+                g_diff_hist[(dg + 255) as usize] += 1;
+                b_diff_hist[(db + 255) as usize] += 1;
+
+                r_sq_err += (dr * dr) as f64;
+                g_sq_err += (dg * dg) as f64;
+                b_sq_err += (db * db) as f64;
+
+                let abs_max = dr.abs().max(dg.abs()).max(db.abs()) as usize;
+                abs_diff_hist[abs_max] += 1;
+
+                if abs_max == 0 {
+                    exact_match_count += 1;
+                }
+
+                // Position within 4x4 block
+                let px_in_block = x % 4;
+                let py_in_block = y % 4;
+                if abs_max > 0 {
+                    block_pos_mismatch[py_in_block][px_in_block] += 1;
+                    block_pos_total_diff[py_in_block][px_in_block] += abs_max as u64;
+                }
+
+                // Edge vs center
+                let is_edge = x < edge_margin || x >= 256 - edge_margin
+                    || y < edge_margin || y >= 256 - edge_margin;
+                if is_edge {
+                    edge_total += 1;
+                    if abs_max > 0 { edge_mismatch += 1; }
+                } else {
+                    center_total += 1;
+                    if abs_max > 0 { center_mismatch += 1; }
+                }
+
+                // Palette membership check
+                let blk_x = x / 4;
+                let blk_y = y / 4;
+                let blk_idx = blk_y * 64 + blk_x;
+                let palette = &ref_block_palettes[blk_idx];
+                let is_palette_member = palette.iter().any(|p| p[0] == refs[0] && p[1] == refs[1] && p[2] == refs[2]);
+                if is_palette_member {
+                    palette_member_yes += 1;
+                } else {
+                    palette_member_no += 1;
+                }
+
+                // Collect first 10 mismatched pixels with source detail
+                if abs_max > 0 && mismatch_details.len() < 10 {
+                    let sy = y * 2;
+                    let sx = x * 2;
+                    let sources = [
+                        mip0_pixels[sy * 512 + sx],
+                        mip0_pixels[sy * 512 + sx + 1],
+                        mip0_pixels[(sy + 1) * 512 + sx],
+                        mip0_pixels[(sy + 1) * 512 + sx + 1],
+                    ];
+                    mismatch_details.push(MismatchDetail {
+                        x, y,
+                        our: ours,
+                        reference: refs,
+                        sources,
+                    });
+                }
+            }
+        }
+
+        // ── Output results ──
+
+        eprintln!("\n  === DEEP PIXEL ANALYSIS: texture 19767 mip0->mip1 ===");
+        eprintln!("  Total pixels: {}", total_pixels);
+        eprintln!("  Exact matches: {} ({:.2}%)", exact_match_count,
+            exact_match_count as f64 / total_pixels as f64 * 100.0);
+
+        // Absolute difference histogram
+        eprintln!("\n  Absolute max-channel difference histogram:");
+        for d in 0..=20 {
+            if abs_diff_hist[d] > 0 {
+                eprintln!("    diff={:3}: {:7} pixels ({:.2}%)", d, abs_diff_hist[d],
+                    abs_diff_hist[d] as f64 / total_pixels as f64 * 100.0);
+            }
+        }
+        // Any larger diffs
+        let large_diff: u64 = abs_diff_hist[21..].iter().sum();
+        if large_diff > 0 {
+            let max_nonzero = abs_diff_hist.iter().rposition(|&v| v > 0).unwrap_or(0);
+            eprintln!("    diff>20:  {:7} pixels (max diff={})", large_diff, max_nonzero);
+        }
+
+        // Per-channel signed difference histograms (show non-zero entries near zero)
+        eprintln!("\n  Per-channel signed difference histograms (ours - ref):");
+        for (name, hist) in [("R", &r_diff_hist), ("G", &g_diff_hist), ("B", &b_diff_hist)] {
+            eprint!("    {}: ", name);
+            for d in -15i32..=15 {
+                let count = hist[(d + 255) as usize];
+                if count > 0 {
+                    eprint!("[{:+}]={} ", d, count);
+                }
+            }
+            // Check for anything outside [-15,+15]
+            let outside: u64 = hist[..240].iter().sum::<u64>() + hist[271..].iter().sum::<u64>();
+            if outside > 0 {
+                eprint!("[|d|>15]={}", outside);
+            }
+            eprintln!();
+        }
+
+        // RMSE per channel
+        let n = total_pixels as f64;
+        eprintln!("\n  RMSE per channel:");
+        eprintln!("    R: {:.4}", (r_sq_err / n).sqrt());
+        eprintln!("    G: {:.4}", (g_sq_err / n).sqrt());
+        eprintln!("    B: {:.4}", (b_sq_err / n).sqrt());
+        eprintln!("    Combined: {:.4}", ((r_sq_err + g_sq_err + b_sq_err) / (3.0 * n)).sqrt());
+
+        // Position-within-block correlation
+        eprintln!("\n  Mismatch count by position within 4x4 block:");
+        for py in 0..4 {
+            eprintln!("    row {}: {:6} {:6} {:6} {:6}",
+                py,
+                block_pos_mismatch[py][0], block_pos_mismatch[py][1],
+                block_pos_mismatch[py][2], block_pos_mismatch[py][3]);
+        }
+        eprintln!("  Avg abs diff by position within 4x4 block:");
+        for py in 0..4 {
+            let row: Vec<String> = (0..4).map(|px| {
+                if block_pos_mismatch[py][px] > 0 {
+                    format!("{:.2}", block_pos_total_diff[py][px] as f64 / block_pos_mismatch[py][px] as f64)
+                } else {
+                    "  n/a".to_string()
+                }
+            }).collect();
+            eprintln!("    row {}: {:>6} {:>6} {:>6} {:>6}", py, row[0], row[1], row[2], row[3]);
+        }
+
+        // Edge vs center
+        eprintln!("\n  Edge vs center mismatch (edge margin = {} px):", edge_margin);
+        eprintln!("    Edge:   {}/{} mismatch ({:.2}%)", edge_mismatch, edge_total,
+            if edge_total > 0 { edge_mismatch as f64 / edge_total as f64 * 100.0 } else { 0.0 });
+        eprintln!("    Center: {}/{} mismatch ({:.2}%)", center_mismatch, center_total,
+            if center_total > 0 { center_mismatch as f64 / center_total as f64 * 100.0 } else { 0.0 });
+
+        // Palette membership verification
+        eprintln!("\n  Palette membership verification:");
+        eprintln!("    Ref pixel IS a palette color: {} ({:.2}%)", palette_member_yes,
+            palette_member_yes as f64 / total_pixels as f64 * 100.0);
+        eprintln!("    Ref pixel NOT a palette color: {} ({:.2}%)", palette_member_no,
+            palette_member_no as f64 / total_pixels as f64 * 100.0);
+
+        // First 10 mismatched pixels detail
+        eprintln!("\n  First {} mismatched pixels detail:", mismatch_details.len());
+        for (i, d) in mismatch_details.iter().enumerate() {
+            eprintln!("    #{}: pixel ({},{}) in block ({},{})", i, d.x, d.y, d.x / 4, d.y / 4);
+            eprintln!("       Source pixels: {:?} {:?} {:?} {:?}", d.sources[0], d.sources[1], d.sources[2], d.sources[3]);
+            let sum_r = d.sources.iter().map(|s| s[0] as u32).sum::<u32>();
+            let sum_g = d.sources.iter().map(|s| s[1] as u32).sum::<u32>();
+            let sum_b = d.sources.iter().map(|s| s[2] as u32).sum::<u32>();
+            eprintln!("       Sum R={} G={} B={}, trunc avg=({},{},{}), round avg=({},{},{})",
+                sum_r, sum_g, sum_b,
+                sum_r / 4, sum_g / 4, sum_b / 4,
+                (sum_r + 2) / 4, (sum_g + 2) / 4, (sum_b + 2) / 4);
+            eprintln!("       Our filtered: ({},{},{})  Ref decoded: ({},{},{})",
+                d.our[0], d.our[1], d.our[2], d.reference[0], d.reference[1], d.reference[2]);
+            eprintln!("       Diff: R={:+} G={:+} B={:+}",
+                d.our[0] as i32 - d.reference[0] as i32,
+                d.our[1] as i32 - d.reference[1] as i32,
+                d.our[2] as i32 - d.reference[2] as i32);
+        }
+
+        // Summary: this is a pre-encoder analysis. The key insight is whether the
+        // filtered pixels match the reference decoded pixels closely enough that
+        // the encoder is the bottleneck, or if filtering itself introduces the gap.
+        let mismatch_pct = (total_pixels as u64 - exact_match_count) as f64 / total_pixels as f64 * 100.0;
+        eprintln!("\n  SUMMARY: {:.2}% of filtered pixels differ from reference decoded pixels.", mismatch_pct);
+        eprintln!("  If this is high, the problem is likely in the filter or decode, not the encoder.");
+        eprintln!("  If this is low, the encoder is the bottleneck.");
     }
 
 }
