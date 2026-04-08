@@ -864,13 +864,15 @@ fn generate_mip(
 /// Matches the original's pipeline: the resize operates on uncompressed pixels
 /// (not re-decoded DXT1). Returns (encoded_blocks, filtered_pixels) so the
 /// filtered pixels can be passed to the next mip level without re-encoding.
-/// x87 box filter for float cascading: sum 4 f32 values at 80-bit,
-/// multiply by 0.25, store result as f32 (NOT as uint8).
+/// x87 box filter for float cascading: sum 4 f32 values at 53-bit precision
+/// (MSVC default CW=0x027F), multiply by 0.25, store result as f32.
+/// Matches the original's FUN_677FE0 which is MSVC-compiled code running
+/// at the default control word, NOT 80-bit extended precision.
 #[inline(never)]
 fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
     let quarter: f32 = 0.25;
     let mut result: f32 = 0.0;
-    let cw: u16 = 0x037F;
+    let cw: u16 = 0x027F; // 53-bit precision (MSVC default), NOT 0x037F
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw}]",
