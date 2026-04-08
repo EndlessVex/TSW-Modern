@@ -933,7 +933,7 @@ fn generate_mip_from_linear(
     let new_bx = (new_w / 4).max(1);
     let new_by = (new_h / 4).max(1);
 
-    // Box filter in linear float space
+    // Box filter in linear float space — x87 80-bit precision matching FUN_677FE0
     let mut dst_lin = vec![[0.0f32; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -942,9 +942,10 @@ fn generate_mip_from_linear(
             let x1 = (x * 2 + 1).min(prev_w - 1);
             let y1 = (y * 2 + 1).min(prev_h - 1);
             for c in 0..4 {
-                dst_lin[y * new_w + x][c] =
-                    (src[y0*prev_w+x0][c] + src[y0*prev_w+x1][c]
-                   + src[y1*prev_w+x0][c] + src[y1*prev_w+x1][c]) * 0.25;
+                dst_lin[y * new_w + x][c] = x87_box_filter_f32(
+                    src[y0*prev_w+x0][c], src[y0*prev_w+x1][c],
+                    src[y1*prev_w+x0][c], src[y1*prev_w+x1][c],
+                );
             }
         }
     }
