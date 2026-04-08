@@ -255,6 +255,14 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     let mip0_data = &stream1.dds_data[DDS_HEADER_SIZE..];
     let mip_sizes = &stream1.mip_sizes;
 
+    // Check DDS mip count: if dwMipMapCount > 1, the DDS contains pre-generated
+    // mips that might be used verbatim instead of regenerating.
+    let dds_mip_count = if stream1.dds_data.len() >= 32 {
+        u32::from_le_bytes(stream1.dds_data[28..32].try_into().unwrap())
+    } else { 0 };
+    let dds_payload_size = mip0_data.len();
+    let _dds_has_extra_mips = dds_payload_size > mip_sizes[0];
+
     if mip_sizes.is_empty() {
         return Err("No mip levels defined".into());
     }
@@ -264,6 +272,37 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
             mip0_data.len(),
             mip_sizes[0]
         ));
+    }
+
+    // If the DDS contains multiple mip levels (dwMipMapCount > 1 and payload > mip0),
+    // use the pre-generated mips from the DDS instead of regenerating.
+    if dds_mip_count as usize > 1 && dds_payload_size > mip_sizes[0] {
+        // DDS has pre-generated mips — use them directly
+        let mut all_mips: Vec<Vec<u8>> = Vec::with_capacity(mip_count);
+        let mut dds_off = 0;
+        for idx in 0..mip_count {
+            let sz = mip_sizes[idx];
+            if dds_off + sz <= dds_payload_size {
+                all_mips.push(mip0_data[dds_off..dds_off + sz].to_vec());
+                dds_off += sz;
+            } else {
+                // DDS ran out of mip data — generate remaining from last available
+                break;
+            }
+        }
+        // If we got all mips from the DDS, write them out
+        if all_mips.len() == mip_count {
+            let mut output = Vec::with_capacity(decomp_size);
+            output.extend_from_slice(fctx_hdr);
+            for mip in all_mips.iter().rev() {
+                output.extend_from_slice(mip);
+            }
+            if output.len() < decomp_size {
+                output.resize(decomp_size, 0);
+            }
+            return Ok(output);
+        }
+        // Otherwise fall through to mip generation
     }
 
     // ── 5. binaryAlpha flag ──────────────────────────────────────────
