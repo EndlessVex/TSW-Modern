@@ -400,8 +400,8 @@ fn decompress_mixd(
         let mut cw = width;
         let mut ch = height;
         for mip_idx in 1..mip_count {
-            let nw = (cw / 2).max(4);
-            let nh = (ch / 2).max(4);
+            let nw = (cw / 2).max(1);
+            let nh = (ch / 2).max(1);
             let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2, false);
             ati2_mips.push(mip);
             cw = nw;
@@ -447,8 +447,8 @@ fn decompress_mixd(
     let mut cw = width;
     let mut ch = height;
     for mip_idx in 1..mip_count {
-        let nw = (cw / 2).max(4);
-        let nh = (ch / 2).max(4);
+        let nw = (cw / 2).max(1);
+        let nh = (ch / 2).max(1);
         let mip = generate_mip(&ati2_mips[mip_idx - 1], cw, ch, nw, nh, TextureCodec::Ati2, false);
         ati2_mips.push(mip);
         cw = nw;
@@ -466,8 +466,8 @@ fn decompress_mixd(
     let mut cw = width;
     let mut ch = height;
     for mip_idx in 1..mip_count {
-        let nw = (cw / 2).max(4);
-        let nh = (ch / 2).max(4);
+        let nw = (cw / 2).max(1);
+        let nh = (ch / 2).max(1);
         let mip = generate_mip_bc4(&bc4_mips[mip_idx - 1], cw, ch, nw, nh);
         bc4_mips.push(mip);
         cw = nw;
@@ -3328,7 +3328,7 @@ mod tests {
             loop {
                 ms.push(((w+3)/4) * ((h+3)/4) * block_size);
                 if w <= 4 && h <= 4 { break; }
-                w = (w/2).max(4); h = (h/2).max(4);
+                w = (w/2).max(1); h = (h/2).max(1);
             }
             let mut rm: Vec<&[u8]> = Vec::new();
             let mut off = fctx_header_size;
@@ -3349,7 +3349,7 @@ mod tests {
             }}
 
             for mi in 1..ms.len() {
-                let nw = (cw/2).max(4); let nh = (ch/2).max(4);
+                let nw = (cw/2).max(1); let nh = (ch/2).max(1);
                 let (om, np) = generate_mip_from_pixels(&cp, cw, ch, nw, nh, TextureCodec::Dxt1, false);
                 let rr = rm[mi];
                 let nb = rr.len() / block_size;
@@ -3407,8 +3407,8 @@ mod tests {
             let bh = (h + 3) / 4;
             mip_sizes.push(bw * bh * block_size);
             if w <= 4 && h <= 4 { break; }
-            w = (w / 2).max(4);
-            h = (h / 2).max(4);
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
         }
 
         // Extract mip0 and mip1 from reference (stored smallest-first)
@@ -3563,7 +3563,7 @@ mod tests {
         loop {
             mip_sizes.push(((w+3)/4) * ((h+3)/4) * block_size);
             if w <= 4 && h <= 4 { break; }
-            w = (w/2).max(4); h = (h/2).max(4);
+            w = (w/2).max(1); h = (h/2).max(1);
         }
         let mut offsets = vec![0usize; mip_sizes.len()];
         let mut off = fctx_hdr;
