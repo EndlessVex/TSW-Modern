@@ -209,6 +209,65 @@ pub fn is_iog1(data: &[u8]) -> bool {
     data.len() >= 4 && &data[0..4] == IOG1_MAGIC
 }
 
+/// DDS header information extracted from IOg1 data.
+#[derive(Debug)]
+pub struct DdsInfo {
+    pub mip_map_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: [u8; 4],
+    pub payload_size: usize,
+    pub mip0_size: usize,
+    pub iog1_fmt_tag: [u8; 4],
+    pub iog1_mip_count: usize,
+    pub iog1_mip_sizes: Vec<usize>,
+}
+
+/// Inspect the DDS header inside IOg1 data without generating mips.
+pub fn inspect_iog1_dds(data: &[u8]) -> Result<DdsInfo, String> {
+    if data.len() < 20 {
+        return Err("IOg1 data too short".into());
+    }
+    if &data[0..4] != IOG1_MAGIC || &data[4..8] != RDX1_MAGIC {
+        return Err("Not IOg1/RDX1 data".into());
+    }
+    let fctx_hdr_size = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+    let pos = 20 + fctx_hdr_size;
+
+    let stream = parse_stream(data, pos)?;
+    let dds = &stream.dds_data;
+
+    if dds.len() < DDS_HEADER_SIZE {
+        return Err("DDS too short for header".into());
+    }
+
+    let mip_map_count = u32::from_le_bytes(dds[28..32].try_into().unwrap());
+    let height = u32::from_le_bytes(dds[12..16].try_into().unwrap());
+    let width = u32::from_le_bytes(dds[16..20].try_into().unwrap());
+    let mut fourcc = [0u8; 4];
+    fourcc.copy_from_slice(&dds[84..88]);
+
+    let payload_size = dds.len() - DDS_HEADER_SIZE;
+
+    let block_size = match &fourcc {
+        b"DXT1" => 8,
+        b"DXT5" | b"ATI2" => 16,
+        _ => 0,
+    };
+    let mip0_size = if block_size > 0 {
+        ((width as usize + 3) / 4) * ((height as usize + 3) / 4) * block_size
+    } else {
+        0
+    };
+
+    Ok(DdsInfo {
+        mip_map_count, width, height, fourcc, payload_size, mip0_size,
+        iog1_fmt_tag: stream.fmt_tag,
+        iog1_mip_count: stream.mip_sizes.len(),
+        iog1_mip_sizes: stream.mip_sizes,
+    })
+}
+
 /// Decompress IOg1/RDX1 texture data → FCTX output.
 ///
 /// Input: raw IOg1 data (after IOz1 decompression).
