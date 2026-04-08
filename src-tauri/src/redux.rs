@@ -812,20 +812,27 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
     #[cfg(target_arch = "x86_64")]
     let saved_cw = unsafe { x87_set_extended_precision() };
 
-    // Weighted covariance matrix [rr, rg, rb, gg, gb, bb]
-    // Each element is accumulated via x87: w*dr*dr stays at 80-bit, stored to f32
+    // Weighted covariance matrix with METRIC WEIGHTS applied to deviations.
+    // The original's FUN_00680fe0 applies metric_r/g/b roots to the
+    // deviations BEFORE computing the covariance:
+    //   dr_w = (color_r - mean_r) * metric_r
+    //   cov[rr] += w * dr_w * dr_w
+    // With uniform metric (1,1,1) this is the same as without.
+    // The metric weights come from FUN_0067d200 param_2/3/4 stored at
+    // offsets 0x118/0x11c/0x120 of the encoder object.
+    // TODO: determine actual metric values from the caller
+    let metric = [1.0f32, 1.0, 1.0]; // metric weight roots
     let mut cov = [0.0f32; 6];
     for (c, &w) in colors.iter().zip(weights.iter()) {
-        let dr = c[0] - centroid[0];
-        let dg = c[1] - centroid[1];
-        let db = c[2] - centroid[2];
-        // x87 fma: w*dr*dr at 80-bit, then add to accumulator
-        cov[0] += x87_fma_f32(dr, dr, 0.0) * w;
-        cov[1] += x87_fma_f32(dr, dg, 0.0) * w;
-        cov[2] += x87_fma_f32(dr, db, 0.0) * w;
-        cov[3] += x87_fma_f32(dg, dg, 0.0) * w;
-        cov[4] += x87_fma_f32(dg, db, 0.0) * w;
-        cov[5] += x87_fma_f32(db, db, 0.0) * w;
+        let dr = (c[0] - centroid[0]) * metric[0];
+        let dg = (c[1] - centroid[1]) * metric[1];
+        let db = (c[2] - centroid[2]) * metric[2];
+        cov[0] += w * dr * dr;
+        cov[1] += w * dr * dg;
+        cov[2] += w * dr * db;
+        cov[3] += w * dg * dg;
+        cov[4] += w * dg * db;
+        cov[5] += w * db * db;
     }
 
     // Power iteration — 8 iterations, seed = max-magnitude row
@@ -4156,6 +4163,104 @@ mod tests {
         eprintln!("    Snapped ep_a: ({:.8}, {:.8}, {:.8})", best_ep_a[0], best_ep_a[1], best_ep_a[2]);
         eprintln!("    Snapped ep_b: ({:.8}, {:.8}, {:.8})", best_ep_b[0], best_ep_b[1], best_ep_b[2]);
         eprintln!("    Best err: {:.10}", best_err);
+    }
+
+    #[test]
+    #[ignore]
+    fn encoder_replication_direct_mip() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let mip0_size = 128 * 128 * 8;
+        let mip0_offset = ref_data.len() - mip0_size;
+        let ref_mip0 = &ref_data[mip0_offset..];
+        let mip2_size = 32 * 32 * 8;
+        let mip2_offset = mip0_offset - (64*64*8) - mip2_size;
+        let ref_mip2 = &ref_data[mip2_offset..mip2_offset + mip2_size];
+
+        // Decode mip0 to 512x512 pixels
+        let mut src = vec![[0u8; 4]; 512 * 512];
+        for by in 0..128 {
+            for bx in 0..128 {
+                let off = (by * 128 + bx) * 8;
+                let pixels = decode_dxt1_block(&ref_mip0[off..off+8]);
+                for py in 0..4 { for px in 0..4 {
+                    src[(by*4+py)*512 + bx*4+px] = pixels[py*4+px];
+                }}
+            }
+        }
+
+        // === Direct path: mip0 512x512 → 128x128 (4x downscale, 4x4 average) ===
+        let mut direct_128 = vec![[0u8; 4]; 128 * 128];
+        for y in 0..128 {
+            for x in 0..128 {
+                for c in 0..4 {
+                    let mut sum = 0u32;
+                    for dy in 0..4 { for dx in 0..4 {
+                        sum += src[(y*4+dy)*512 + x*4+dx][c] as u32;
+                    }}
+                    direct_128[y*128+x][c] = (sum / 16) as u8;
+                }
+            }
+        }
+
+        // Encode direct 128x128 to DXT1 and compare
+        let mut direct_match = 0;
+        let mut direct_solid_match = 0;
+        let mut direct_solid_total = 0;
+        let mut direct_nonsolid_match = 0;
+        let mut direct_nonsolid_total = 0;
+        for by in 0..32 {
+            for bx in 0..32 {
+                let mut block_pixels = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    block_pixels[py*4+px] = direct_128[(by*4+py)*128 + bx*4+px];
+                }}
+                let our = encode_dxt1_block(&block_pixels, false, true);
+                let b = by * 32 + bx;
+                let ref_block = &ref_mip2[b*8..(b+1)*8];
+                let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                let is_solid = rc0 == rc1;
+                if our == ref_block {
+                    direct_match += 1;
+                    if is_solid { direct_solid_match += 1; } else { direct_nonsolid_match += 1; }
+                }
+                if is_solid { direct_solid_total += 1; } else { direct_nonsolid_total += 1; }
+            }
+        }
+
+        // === Sequential path: mip0 → mip1 → mip2 ===
+        let our_mip1 = generate_mip(ref_mip0, 512, 512, 256, 256, TextureCodec::Dxt1, false);
+        let our_mip2 = generate_mip(&our_mip1, 256, 256, 128, 128, TextureCodec::Dxt1, false);
+        let mut seq_match = 0;
+        for b in 0..1024 {
+            if our_mip2[b*8..(b+1)*8] == ref_mip2[b*8..(b+1)*8] { seq_match += 1; }
+        }
+
+        eprintln!("  Direct (mip0→mip2, 4x4 avg):");
+        eprintln!("    Total: {}/1024 ({:.1}%)", direct_match, direct_match as f64 / 1024.0 * 100.0);
+        eprintln!("    Solid: {}/{} ({:.1}%)", direct_solid_match, direct_solid_total,
+            if direct_solid_total > 0 { direct_solid_match as f64 / direct_solid_total as f64 * 100.0 } else { 0.0 });
+        eprintln!("    Non-solid: {}/{} ({:.1}%)", direct_nonsolid_match, direct_nonsolid_total,
+            if direct_nonsolid_total > 0 { direct_nonsolid_match as f64 / direct_nonsolid_total as f64 * 100.0 } else { 0.0 });
+        eprintln!("  Sequential (mip0→mip1→mip2):");
+        eprintln!("    Total: {}/1024 ({:.1}%)", seq_match, seq_match as f64 / 1024.0 * 100.0);
     }
 
 }
