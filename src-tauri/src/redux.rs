@@ -537,6 +537,23 @@ fn linear_to_srgb(l: f32) -> u8 {
 /// Generate a downsampled mip level from DXT block data.
 ///
 /// Matches the game's mip generation pipeline:
+/// x87-precision pow(base, exp) matching the original's FUN_682EE0.
+///
+/// Uses the standard x87 sequence: pow(x, y) = 2^(y * log2(x))
+/// via FYL2X + FRNDINT + F2XM1 + FSCALE, all at 80-bit precision.
+/// The result is stored as f32 to match the original's fstp dword.
+fn x87_powf(base: f32, exp: f32) -> f32 {
+    // For base <= 0, return 0 (gamma only applies to positive pixel values)
+    if base <= 0.0 {
+        return 0.0;
+    }
+    // Use f64 pow as approximation of x87 80-bit precision.
+    // f64 has 53-bit mantissa vs x87's 64-bit, but for gamma correction
+    // of u8 pixel values, the difference from f32 (23-bit) is what matters.
+    let result = (base as f64).powf(exp as f64);
+    result as f32
+}
+
 /// 1. Decode entire source mip to full pixel buffer
 /// 2. Box-filter in float space (2x2 average with rounding)
 /// 3. Re-encode block by block from filtered image
@@ -631,6 +648,64 @@ fn generate_mip(
 /// Matches the original's pipeline: the resize operates on uncompressed pixels
 /// (not re-decoded DXT1). Returns (encoded_blocks, filtered_pixels) so the
 /// filtered pixels can be passed to the next mip level without re-encoding.
+/// Generate a mip from LINEAR float pixel data (gamma-correct pipeline).
+/// Box-filters in linear space, de-linearizes to uint8 for encoding,
+/// returns linear float data for cascading to next mip level.
+fn generate_mip_from_linear(
+    src: &[[f32; 4]],
+    prev_w: usize, prev_h: usize,
+    new_w: usize, new_h: usize,
+    codec: TextureCodec, force_3color: bool,
+) -> (Vec<u8>, Vec<[f32; 4]>) {
+    let block_size = codec.block_size();
+    let new_bx = (new_w / 4).max(1);
+    let new_by = (new_h / 4).max(1);
+
+    // Box filter in linear float space
+    let mut dst_lin = vec![[0.0f32; 4]; new_w * new_h];
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let x0 = (x * 2).min(prev_w - 1);
+            let y0 = (y * 2).min(prev_h - 1);
+            let x1 = (x * 2 + 1).min(prev_w - 1);
+            let y1 = (y * 2 + 1).min(prev_h - 1);
+            for c in 0..4 {
+                dst_lin[y * new_w + x][c] =
+                    (src[y0*prev_w+x0][c] + src[y0*prev_w+x1][c]
+                   + src[y1*prev_w+x0][c] + src[y1*prev_w+x1][c]) * 0.25;
+            }
+        }
+    }
+
+    // De-linearize to uint8 for encoding: pow(val, 1/2.2) * 255
+    let inv_gamma: f32 = 1.0f32 / 2.2f32;
+    let mut dst_u8 = vec![[0u8; 4]; new_w * new_h];
+    for i in 0..new_w * new_h {
+        for c in 0..3 {
+            let srgb = x87_powf(dst_lin[i][c], inv_gamma);
+            dst_u8[i][c] = (srgb * 255.0).max(0.0).min(255.0) as u8;
+        }
+        dst_u8[i][3] = (dst_lin[i][3] * 255.0).max(0.0).min(255.0) as u8;
+    }
+
+    // Encode
+    let mut result = Vec::with_capacity(new_bx * new_by * block_size);
+    for by in 0..new_by {
+        for bx in 0..new_bx {
+            let mut bp = [[0u8; 4]; 16];
+            for py in 0..4 { for px in 0..4 {
+                bp[py*4+px] = dst_u8[((by*4+py).min(new_h-1))*new_w + (bx*4+px).min(new_w-1)];
+            }}
+            match codec {
+                TextureCodec::Dxt1 => result.extend_from_slice(&encode_dxt1_block(&bp, force_3color, true)),
+                TextureCodec::Dxt5 => result.extend_from_slice(&encode_dxt5_block(&bp)),
+                TextureCodec::Ati2 => result.extend_from_slice(&encode_ati2_block(&bp)),
+            }
+        }
+    }
+    (result, dst_lin)
+}
+
 fn generate_mip_from_pixels(
     src_pixels: &[[u8; 4]],
     prev_w: usize,
@@ -644,15 +719,10 @@ fn generate_mip_from_pixels(
     let new_bx = (new_w / 4).max(1);
     let new_by = (new_h / 4).max(1);
 
-    // Box-filter matching the original's float pipeline (FUN_677FE0):
-    // The original converts to float (val * 1/255), averages 4 pixels (* 0.25),
-    // then converts back (val * 255.0, truncate to int, clamp 0-255).
-    // For most values this equals integer truncation, but the float path
-    // produces `floor((a+b+c+d) / 4.0)` which can differ by 1 from
-    // integer `(a+b+c+d) / 4` when the division is exact for floats but
-    // truncates differently for integers.
+    // Box-filter with truncating integer division.
+    // Gamma correction (linearize/delinearize) is handled at the pipeline
+    // level (in decompress_iog1), not per-mip.
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
-    let recip255: f32 = 1.0 / 255.0;
     for y in 0..new_h {
         for x in 0..new_w {
             let sx = x * 2;
@@ -668,12 +738,8 @@ fn generate_mip_from_pixels(
             let p11 = src_pixels[y1 * prev_w + x1];
 
             for c in 0..4 {
-                let f0 = p00[c] as f32 * recip255;
-                let f1 = p10[c] as f32 * recip255;
-                let f2 = p01[c] as f32 * recip255;
-                let f3 = p11[c] as f32 * recip255;
-                let avg = (f0 + f1 + f2 + f3) * 0.25;
-                dst_pixels[y * new_w + x][c] = (avg * 255.0).max(0.0).min(255.0) as u8;
+                let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
+                dst_pixels[y * new_w + x][c] = (sum / 4) as u8;
             }
         }
     }
@@ -3369,6 +3435,77 @@ mod tests {
         eprintln!("  OVERALL: {}/{} blocks match ({:.2}%)",
             matching_blocks, total_blocks,
             (matching_blocks as f64 / total_blocks as f64) * 100.0);
+
+        // === GAMMA-CORRECT pipeline comparison ===
+        eprintln!("\n  === GAMMA 2.2 (linear-space filtering) ===");
+        let mut gamma_total = 0usize;
+        let mut gamma_match = 0usize;
+        let recip255g: f32 = 1.0 / 255.0;
+        let gamma_val: f32 = 2.2;
+
+        for &(id, width, height) in test_textures {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+            let mut ms = Vec::new();
+            let (mut w, mut h) = (width, height);
+            loop { ms.push(((w+3)/4)*((h+3)/4)*block_size); if w<=1&&h<=1{break;} w=(w/2).max(1); h=(h/2).max(1); }
+            let mc = ms.len();
+            let mut rm: Vec<&[u8]> = Vec::new();
+            let mut off = fctx_header_size;
+            for i in (0..mc).rev() { rm.push(&ref_data[off..off+ms[i]]); off+=ms[i]; }
+            rm.reverse();
+
+            // Decode mip0 → uint8 → float → linearize
+            let (mut cw, mut ch) = (width, height);
+            let (pbx, pby) = ((cw/4).max(1), (ch/4).max(1));
+            let mut decoded = vec![[0u8;4]; cw*ch];
+            for by in 0..pby { for bx in 0..pbx {
+                let o2 = (by*pbx+bx)*block_size;
+                if o2+block_size > rm[0].len() { continue; }
+                let px = decode_dxt1_block(&rm[0][o2..o2+block_size]);
+                for py in 0..4 { for ppx in 0..4 {
+                    let (xx,yy) = (bx*4+ppx, by*4+py);
+                    if xx<cw && yy<ch { decoded[yy*cw+xx] = px[py*4+ppx]; }
+                }}
+            }}
+            // Convert to linear float
+            let mut cur_lin: Vec<[f32;4]> = decoded.iter().map(|p| {
+                [x87_powf(p[0] as f32 * recip255g, gamma_val),
+                 x87_powf(p[1] as f32 * recip255g, gamma_val),
+                 x87_powf(p[2] as f32 * recip255g, gamma_val),
+                 p[3] as f32 * recip255g]
+            }).collect();
+
+            let mut t_total = 0usize;
+            let mut t_match = 0usize;
+            for mi in 1..mc {
+                let (nw, nh) = ((cw/2).max(1), (ch/2).max(1));
+                let (mip, new_lin) = generate_mip_from_linear(
+                    &cur_lin, cw, ch, nw, nh, TextureCodec::Dxt1, false);
+                let r = rm[mi];
+                let nb = r.len() / block_size;
+                let mut mm = 0;
+                for b in 0..nb {
+                    if mip[b*8..(b+1)*8] == r[b*8..(b+1)*8] { mm += 1; }
+                }
+                if id == 19767 {
+                    eprintln!("  [gamma] ID {} mip{} ({}x{}): {}/{} ({:.1}%)",
+                        id, mi, nw, nh, mm, nb, mm as f64/nb as f64*100.0);
+                }
+                t_total += nb; t_match += mm;
+                cur_lin = new_lin; cw = nw; ch = nh;
+            }
+            gamma_total += t_total; gamma_match += t_match;
+        }
+        eprintln!("  [gamma] OVERALL: {}/{} ({:.2}%)",
+            gamma_match, gamma_total, gamma_match as f64/gamma_total as f64*100.0);
     }
 
     #[test]
@@ -4936,6 +5073,75 @@ mod tests {
                 let sum = to_lin(src[sy*sw+sx][c]) + to_lin(src[sy*sw+sx+1][c])
                     + to_lin(src[(sy+1)*sw+sx][c]) + to_lin(src[(sy+1)*sw+sx+1][c]);
                 out[c] = to_srgb(sum * 0.25);
+            }
+            out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
+                + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
+            out
+        });
+
+        // sRGB-linear with TRUNCATION (not +0.5 rounding) and f64 pow for x87 precision
+        test_pipeline("pipe_srgb_trunc_f64", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            let to_lin = |v: u8| -> f64 { (v as f64 / 255.0).powf(2.2) };
+            let to_srgb = |v: f64| -> u8 { (v.powf(1.0/2.2) * 255.0).clamp(0.0, 255.0) as u8 };
+            for c in 0..3 {
+                let sum = to_lin(src[sy*sw+sx][c]) + to_lin(src[sy*sw+sx+1][c])
+                    + to_lin(src[(sy+1)*sw+sx][c]) + to_lin(src[(sy+1)*sw+sx+1][c]);
+                out[c] = to_srgb(sum * 0.25);
+            }
+            out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
+                + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
+            out
+        });
+
+        // sRGB-linear with f32 values converted to f64 for pow (matching x87 precision better)
+        test_pipeline("pipe_srgb_f32_trunc", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            let recip255 = 1.0f32 / 255.0;
+            for c in 0..3 {
+                // Match original: val * (1/255f) as f32, then pow as f64, store back as f32
+                let f0 = (src[sy*sw+sx][c] as f32 * recip255) as f64;
+                let f1 = (src[sy*sw+sx+1][c] as f32 * recip255) as f64;
+                let f2 = (src[(sy+1)*sw+sx][c] as f32 * recip255) as f64;
+                let f3 = (src[(sy+1)*sw+sx+1][c] as f32 * recip255) as f64;
+                let l0 = f0.powf(2.2) as f32;
+                let l1 = f1.powf(2.2) as f32;
+                let l2 = f2.powf(2.2) as f32;
+                let l3 = f3.powf(2.2) as f32;
+                let avg = (l0 + l1 + l2 + l3) as f32 * 0.25f32;
+                // De-linearize: pow(f32_avg, 1/2.2) with f64 precision, truncate to f32, then *255
+                let srgb = (avg as f64).powf(1.0/2.2) as f32;
+                out[c] = (srgb * 255.0f32).max(0.0).min(255.0) as u8;
+            }
+            out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
+                + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
+            out
+        });
+
+        // Gamma-correct with x87 pow (matching original's FUN_682EE0 precision)
+        test_pipeline("pipe_gamma_x87", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            let recip255: f32 = 1.0 / 255.0;
+            let gamma: f32 = 2.2;
+            let inv_gamma: f32 = 1.0 / gamma; // computed at f32 precision
+            for c in 0..3 {
+                // Linearize each pixel with x87 pow
+                let f0 = src[sy*sw+sx][c] as f32 * recip255;
+                let f1 = src[sy*sw+sx+1][c] as f32 * recip255;
+                let f2 = src[(sy+1)*sw+sx][c] as f32 * recip255;
+                let f3 = src[(sy+1)*sw+sx+1][c] as f32 * recip255;
+                let l0 = x87_powf(f0, gamma);
+                let l1 = x87_powf(f1, gamma);
+                let l2 = x87_powf(f2, gamma);
+                let l3 = x87_powf(f3, gamma);
+                // Box filter in linear space
+                let avg = (l0 + l1 + l2 + l3) * 0.25;
+                // De-linearize with x87 pow
+                let srgb = x87_powf(avg, inv_gamma);
+                out[c] = (srgb * 255.0).max(0.0).min(255.0) as u8;
             }
             out[3] = ((src[sy*sw+sx][3] as u32 + src[sy*sw+sx+1][3] as u32
                 + src[(sy+1)*sw+sx][3] as u32 + src[(sy+1)*sw+sx+1][3] as u32) / 4) as u8;
