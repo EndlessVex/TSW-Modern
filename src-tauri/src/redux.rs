@@ -6211,4 +6211,105 @@ mod tests {
         eprintln!("  If this is low, the encoder is the bottleneck.");
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test inspect_cdn_dds -- --ignored --nocapture
+    fn inspect_cdn_dds() {
+        use crate::rdb::{cdn_url_from_hash, parse_le_index};
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+
+        let le_idx = parse_le_index(&ref_dir.join("le.idx"))
+            .expect("Failed to parse le.idx");
+
+        let test_ids: &[u32] = &[19767, 27137, 30186];
+        let cdn_base = "https://update.secretworld.com/tswupm";
+
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("")
+            .build()
+            .expect("build HTTP client");
+
+        for &tex_id in test_ids {
+            let entry = le_idx.entries.iter()
+                .find(|e| e.id == tex_id && e.rdb_type == 1010004)
+                .unwrap_or_else(|| panic!("Texture {} not found in le.idx", tex_id));
+
+            let url = cdn_url_from_hash(cdn_base, &entry.hash);
+            eprintln!("\n=== Texture {} ===", tex_id);
+            eprintln!("  CDN URL: {}", url);
+
+            let resp = client.get(&url).send()
+                .unwrap_or_else(|e| panic!("Download failed for {}: {}", tex_id, e));
+
+            if !resp.status().is_success() {
+                eprintln!("  HTTP {}: skipping", resp.status());
+                continue;
+            }
+
+            let raw_bytes = resp.bytes()
+                .unwrap_or_else(|e| panic!("Read body failed: {}", e));
+            eprintln!("  Downloaded: {} bytes", raw_bytes.len());
+            eprintln!("  First 4 bytes: {:?}", &raw_bytes[..4.min(raw_bytes.len())]);
+
+            let iog1_data = crate::verify::decompress_ioz1(&raw_bytes)
+                .expect("IOz1 decompression failed");
+
+            eprintln!("  After IOz1: {} bytes, magic: {:?}",
+                iog1_data.len(),
+                std::str::from_utf8(&iog1_data[..4.min(iog1_data.len())]).unwrap_or("???"));
+
+            if !is_iog1(&iog1_data) {
+                eprintln!("  NOT IOg1 data — skipping DDS inspection");
+                continue;
+            }
+
+            let info = inspect_iog1_dds(&iog1_data)
+                .expect("DDS inspection failed");
+
+            eprintln!("  DDS dimensions: {}x{}", info.width, info.height);
+            eprintln!("  DDS FourCC: {:?}", std::str::from_utf8(&info.fourcc).unwrap_or("???"));
+            eprintln!("  DDS dwMipMapCount: {}", info.mip_map_count);
+            eprintln!("  DDS payload size: {} bytes", info.payload_size);
+            eprintln!("  Expected mip0 size: {} bytes", info.mip0_size);
+            eprintln!("  Extra payload beyond mip0: {} bytes", info.payload_size.saturating_sub(info.mip0_size));
+            eprintln!("  IOg1 format tag: {:?}", std::str::from_utf8(&info.iog1_fmt_tag).unwrap_or("???"));
+            eprintln!("  IOg1 mip count: {}", info.iog1_mip_count);
+            eprintln!("  IOg1 mip sizes: {:?}", info.iog1_mip_sizes);
+
+            if info.mip_map_count > 1 && info.payload_size > info.mip0_size {
+                eprintln!("  >>> DDS HAS PRE-GENERATED MIPS! <<<");
+
+                let our_fctx = decompress_iog1(&iog1_data)
+                    .expect("decompress_iog1 failed");
+
+                let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let mut file = std::fs::File::open(&ref_path).expect("open rdbdata");
+                file.seek(SeekFrom::Start(entry.offset as u64)).expect("seek");
+                let mut ref_data = vec![0u8; entry.length as usize];
+                file.read_exact(&mut ref_data).expect("read ref");
+
+                if our_fctx == ref_data {
+                    eprintln!("  >>> BYTE-IDENTICAL MATCH WITH REFERENCE! <<<");
+                } else {
+                    let matching = our_fctx.iter().zip(ref_data.iter())
+                        .filter(|(a, b)| a == b).count();
+                    eprintln!("  Byte match: {}/{} ({:.1}%)",
+                        matching, ref_data.len().min(our_fctx.len()),
+                        matching as f64 / ref_data.len().min(our_fctx.len()) as f64 * 100.0);
+                    for (i, (a, b)) in our_fctx.iter().zip(ref_data.iter()).enumerate() {
+                        if a != b {
+                            eprintln!("  First diff at byte {}: ours={:02X} ref={:02X}", i, a, b);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                eprintln!("  DDS has mip0 only — patcher must generate mips");
+            }
+        }
+    }
+
 }
