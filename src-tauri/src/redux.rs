@@ -6313,4 +6313,203 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test pixel_gamma_diagnostic -- --ignored --nocapture
+    fn pixel_gamma_diagnostic() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx"))
+            .expect("Failed to parse le.idx");
+        let block_size = 8usize; // DXT1
+        let fctx_header_size = 24usize;
+
+        let (id, width, height) = (19767u32, 512usize, 512usize);
+        let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+        let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+        let ref_data = {
+            let mut file = std::fs::File::open(&ref_path).unwrap();
+            file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        // Extract reference mip levels
+        let mut mip_sizes = Vec::new();
+        let (mut w, mut h) = (width, height);
+        loop {
+            mip_sizes.push(((w + 3) / 4) * ((h + 3) / 4) * block_size);
+            if w <= 1 && h <= 1 { break; }
+            w = (w / 2).max(1); h = (h / 2).max(1);
+        }
+        let mut ref_mips: Vec<&[u8]> = Vec::new();
+        let mut off = fctx_header_size;
+        for i in (0..mip_sizes.len()).rev() {
+            ref_mips.push(&ref_data[off..off + mip_sizes[i]]);
+            off += mip_sizes[i];
+        }
+        ref_mips.reverse();
+
+        // Decode mip0 to pixel buffer
+        let (mip0_w, mip0_h) = (width, height);
+        let pbx = (mip0_w / 4).max(1);
+        let pby = (mip0_h / 4).max(1);
+        let mut mip0_pixels = vec![[0u8; 4]; mip0_w * mip0_h];
+        for by in 0..pby {
+            for bx in 0..pbx {
+                let o = (by * pbx + bx) * block_size;
+                if o + block_size > ref_mips[0].len() { continue; }
+                let px = decode_dxt1_block(&ref_mips[0][o..o + block_size]);
+                for py in 0..4 {
+                    for ppx in 0..4 {
+                        let (xx, yy) = (bx * 4 + ppx, by * 4 + py);
+                        if xx < mip0_w && yy < mip0_h {
+                            mip0_pixels[yy * mip0_w + xx] = px[py * 4 + ppx];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mip1 dimensions
+        let (mip1_w, mip1_h) = (width / 2, height / 2);
+        let mip1_bx = (mip1_w / 4).max(1);
+        let mip1_by = (mip1_h / 4).max(1);
+        let ref_mip1 = ref_mips[1];
+
+        // Precompute ALL mip1 pixels via both pipelines
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let inv_gamma: f32 = 1.0 / 2.2;
+        let scale255: f32 = 255.0;
+
+        let mut nogamma_pixels = vec![[0u8; 4]; mip1_w * mip1_h];
+        let mut gamma_pixels = vec![[0u8; 4]; mip1_w * mip1_h];
+
+        for y in 0..mip1_h {
+            for x in 0..mip1_w {
+                let sx = x * 2;
+                let sy = y * 2;
+                let x0 = sx.min(mip0_w - 1);
+                let y0 = sy.min(mip0_h - 1);
+                let x1 = (sx + 1).min(mip0_w - 1);
+                let y1 = (sy + 1).min(mip0_h - 1);
+
+                let p00 = mip0_pixels[y0 * mip0_w + x0];
+                let p10 = mip0_pixels[y0 * mip0_w + x1];
+                let p01 = mip0_pixels[y1 * mip0_w + x0];
+                let p11 = mip0_pixels[y1 * mip0_w + x1];
+
+                for c in 0..4 {
+                    // No-gamma: u8→float, x87 box filter, x87 float→u8 (floor)
+                    let f0 = p00[c] as f32 * recip255;
+                    let f1 = p10[c] as f32 * recip255;
+                    let f2 = p01[c] as f32 * recip255;
+                    let f3 = p11[c] as f32 * recip255;
+                    let avg = x87_box_filter_f32(f0, f1, f2, f3);
+                    nogamma_pixels[y * mip1_w + x][c] = x87_float_to_u8(avg);
+
+                    // Gamma: u8→float→linearize→x87 box filter→degamma→u8
+                    if c < 3 {
+                        let lin0 = x87_powf(f0, gamma);
+                        let lin1 = x87_powf(f1, gamma);
+                        let lin2 = x87_powf(f2, gamma);
+                        let lin3 = x87_powf(f3, gamma);
+                        let avg_lin = x87_box_filter_f32(lin0, lin1, lin2, lin3);
+                        let v = x87_pow_scale_floor(avg_lin, inv_gamma, scale255);
+                        gamma_pixels[y * mip1_w + x][c] = v.clamp(0, 255) as u8;
+                    } else {
+                        // Alpha: no gamma, same as no-gamma path
+                        gamma_pixels[y * mip1_w + x][c] = x87_float_to_u8(avg);
+                    }
+                }
+            }
+        }
+
+        // Compare solid blocks
+        let mut total_solid = 0usize;
+        let mut match_nogamma = 0usize;
+        let mut match_gamma = 0usize;
+        let mut match_neither = 0usize;
+        let mut match_both = 0usize;
+        let mut printed = 0usize;
+
+        for by in 0..mip1_by {
+            for bx in 0..mip1_bx {
+                let b = by * mip1_bx + bx;
+                let rb = &ref_mip1[b * 8..(b + 1) * 8];
+                let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+                let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+                if rc0 != rc1 { continue; } // not a solid block in reference
+                total_solid += 1;
+
+                // Get our pixel values for this block from both pipelines
+                let mut ng_block = [[0u8; 4]; 16];
+                let mut gm_block = [[0u8; 4]; 16];
+                for py in 0..4 {
+                    for px in 0..4 {
+                        let mx = (bx * 4 + px).min(mip1_w - 1);
+                        let my = (by * 4 + py).min(mip1_h - 1);
+                        ng_block[py * 4 + px] = nogamma_pixels[my * mip1_w + mx];
+                        gm_block[py * 4 + px] = gamma_pixels[my * mip1_w + mx];
+                    }
+                }
+
+                // Encode both via the same encoder path
+                let ng_encoded = encode_dxt1_block(&ng_block, false, true);
+                let gm_encoded = encode_dxt1_block(&gm_block, false, true);
+
+                let ng_match = ng_encoded == rb;
+                let gm_match = gm_encoded == rb;
+
+                if ng_match && gm_match { match_both += 1; }
+                else if ng_match { match_nogamma += 1; }
+                else if gm_match { match_gamma += 1; }
+                else { match_neither += 1; }
+
+                // Print details for first 20 mismatched blocks
+                if !ng_match && printed < 20 {
+                    printed += 1;
+                    let ng_c0 = u16::from_le_bytes([ng_encoded[0], ng_encoded[1]]);
+                    let gm_c0 = u16::from_le_bytes([gm_encoded[0], gm_encoded[1]]);
+                    // Show one representative pixel (top-left of block)
+                    let mx = bx * 4;
+                    let my = by * 4;
+                    let ng_px = nogamma_pixels[my * mip1_w + mx];
+                    let gm_px = gamma_pixels[my * mip1_w + mx];
+                    // Show source mip0 pixels for that position
+                    let sx = mx * 2; let sy = my * 2;
+                    let s00 = mip0_pixels[sy * mip0_w + sx];
+                    let s10 = mip0_pixels[sy * mip0_w + sx + 1];
+                    let s01 = mip0_pixels[(sy + 1) * mip0_w + sx];
+                    let s11 = mip0_pixels[(sy + 1) * mip0_w + sx + 1];
+                    eprintln!("  block ({},{}) ref_c0={:04X} ng_c0={:04X}{} gm_c0={:04X}{}",
+                        bx, by, rc0,
+                        ng_c0, if ng_match { " MATCH" } else { "" },
+                        gm_c0, if gm_match { " MATCH" } else { "" });
+                    eprintln!("    src: ({},{},{}) ({},{},{}) ({},{},{}) ({},{},{})",
+                        s00[0],s00[1],s00[2], s10[0],s10[1],s10[2],
+                        s01[0],s01[1],s01[2], s11[0],s11[1],s11[2]);
+                    eprintln!("    nogamma=({},{},{}) gamma=({},{},{})",
+                        ng_px[0],ng_px[1],ng_px[2], gm_px[0],gm_px[1],gm_px[2]);
+                }
+            }
+        }
+
+        eprintln!("\n=== Pixel-Level Gamma Diagnostic: Texture {} mip1 ===", id);
+        eprintln!("  Total solid blocks in reference: {}", total_solid);
+        eprintln!("  Match with no-gamma only: {}", match_nogamma);
+        eprintln!("  Match with gamma only:    {}", match_gamma);
+        eprintln!("  Match with BOTH:          {}", match_both);
+        eprintln!("  Match with NEITHER:       {}", match_neither);
+        eprintln!("  No-gamma total match: {} ({:.1}%)", match_both + match_nogamma,
+            (match_both + match_nogamma) as f64 / total_solid as f64 * 100.0);
+        eprintln!("  Gamma total match:    {} ({:.1}%)", match_both + match_gamma,
+            (match_both + match_gamma) as f64 / total_solid as f64 * 100.0);
+    }
+
 }
