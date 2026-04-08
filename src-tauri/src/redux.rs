@@ -3674,17 +3674,29 @@ mod tests {
                 // Compare block by block
                 let num_blocks = our_mip.len() / block_size;
                 let mut mip_match = 0usize;
+                let mut mip_solid_match = 0usize;
+                let mut mip_solid_total = 0usize;
+                let mut mip_nonsolid_match = 0usize;
                 for b in 0..num_blocks {
                     let our_block = &our_mip[b * block_size..(b + 1) * block_size];
                     let ref_block = &ref_mip[b * block_size..(b + 1) * block_size];
-                    if our_block == ref_block {
-                        mip_match += 1;
+                    let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                    let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                    let is_solid = rc0 == rc1;
+                    let matched = our_block == ref_block;
+                    if matched { mip_match += 1; }
+                    if is_solid {
+                        mip_solid_total += 1;
+                        if matched { mip_solid_match += 1; }
+                    } else if matched {
+                        mip_nonsolid_match += 1;
                     }
                 }
 
-                eprintln!("  ID {} mip{} ({}x{}): {}/{} blocks match ({:.1}%)",
+                eprintln!("  ID {} mip{} ({}x{}): {}/{} blocks match ({:.1}%) [solid {}/{}, nonsolid {}]",
                     id, mip_idx, new_w, new_h, mip_match, num_blocks,
-                    (mip_match as f64 / num_blocks as f64) * 100.0);
+                    (mip_match as f64 / num_blocks as f64) * 100.0,
+                    mip_solid_match, mip_solid_total, mip_nonsolid_match);
 
                 tex_total += num_blocks;
                 tex_match += mip_match;
@@ -3699,6 +3711,57 @@ mod tests {
                 id, tex_match, tex_total, (tex_match as f64 / tex_total as f64) * 100.0);
             total_blocks += tex_total;
             matching_blocks += tex_match;
+        }
+
+        // === REF-CASCADED TEST: decode ref mipN, generate mipN+1, compare vs ref mipN+1 ===
+        // This tests whether reference mips are cascaded (each derived from previous)
+        // or independently generated (pre-generated from DDS)
+        eprintln!("\n  === Ref-cascaded test (decode ref mipN → generate mipN+1) ===");
+        for &(id, width, height) in &[(19767u32, 512usize, 512usize)] {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+            let mut ms = Vec::new(); let mut w = width; let mut h = height;
+            loop { ms.push(((w+3)/4)*((h+3)/4)*block_size); if w<=1&&h<=1{break;} w=(w/2).max(1); h=(h/2).max(1); }
+            let mc = ms.len();
+            let mut rm: Vec<&[u8]> = Vec::new();
+            let mut off = fctx_header_size;
+            for i in (0..mc).rev() { rm.push(&ref_data[off..off+ms[i]]); off+=ms[i]; }
+            rm.reverse();
+
+            let mut cw = width; let mut ch = height;
+            for mi in 1..mc.min(5) {
+                let nw = (cw/2).max(1); let nh = (ch/2).max(1);
+                // Decode ref mip[mi-1] → pixels
+                let pbx = (cw/4).max(1); let pby = (ch/4).max(1);
+                let mut pix = vec![[0u8;4]; cw*ch];
+                for by in 0..pby { for bx in 0..pbx {
+                    let o = (by*pbx+bx)*block_size;
+                    if o+block_size > rm[mi-1].len() { continue; }
+                    let px = decode_dxt1_block(&rm[mi-1][o..o+block_size]);
+                    for py in 0..4 { for ppx in 0..4 {
+                        let (xx,yy) = (bx*4+ppx, by*4+py);
+                        if xx<cw && yy<ch { pix[yy*cw+xx] = px[py*4+ppx]; }
+                    }}
+                }}
+                // Generate mipN+1 from decoded ref mipN
+                let (gen, _) = generate_mip_from_pixels(&pix, cw, ch, nw, nh, TextureCodec::Dxt1, false);
+                let r = rm[mi];
+                let nb = r.len() / block_size;
+                let mut mm = 0;
+                for b in 0..nb {
+                    if gen[b*8..(b+1)*8] == r[b*8..(b+1)*8] { mm += 1; }
+                }
+                eprintln!("  [ref-cascade] ID {} mip{} from ref-mip{}: {}/{} ({:.1}%)",
+                    id, mi, mi-1, mm, nb, mm as f64/nb as f64*100.0);
+                cw = nw; ch = nh;
+            }
         }
 
         // Separate scan: count solid vs non-solid block matches across all textures
