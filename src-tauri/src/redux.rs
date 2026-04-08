@@ -1860,6 +1860,84 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     (out, err)
 }
 
+/// Encode 16 RGBA pixels → DXT1 block using range-fit (bounding box endpoints).
+///
+/// Matches FUN_0067CF20 in the original: find the RGB bounding box of the 16
+/// pixels, use min/max as endpoints, assign each pixel the nearest palette index.
+/// This is the simple/fast encoder used when param_4[1]==0 in FUN_006550A0.
+fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
+    // Check for solid block first (FUN_0067B5A0 monochrome check)
+    let first_rgb = (pixels[0][0], pixels[0][1], pixels[0][2]);
+    let all_solid = pixels.iter().all(|p| (p[0], p[1], p[2]) == first_rgb);
+    if all_solid {
+        return encode_dxt1_solid(first_rgb.0, first_rgb.1, first_rgb.2);
+    }
+
+    // Find bounding box of RGB values
+    let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
+    let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
+    for p in pixels {
+        min_r = min_r.min(p[0]); min_g = min_g.min(p[1]); min_b = min_b.min(p[2]);
+        max_r = max_r.max(p[0]); max_g = max_g.max(p[1]); max_b = max_b.max(p[2]);
+    }
+
+    // Inset the bounding box by 1/16 of its range (matching squish range-fit)
+    let inset_r = (max_r as i32 - min_r as i32) / 16;
+    let inset_g = (max_g as i32 - min_g as i32) / 16;
+    let inset_b = (max_b as i32 - min_b as i32) / 16;
+    let min_r = (min_r as i32 + inset_r).clamp(0, 255) as u8;
+    let min_g = (min_g as i32 + inset_g).clamp(0, 255) as u8;
+    let min_b = (min_b as i32 + inset_b).clamp(0, 255) as u8;
+    let max_r = (max_r as i32 - inset_r).clamp(0, 255) as u8;
+    let max_g = (max_g as i32 - inset_g).clamp(0, 255) as u8;
+    let max_b = (max_b as i32 - inset_b).clamp(0, 255) as u8;
+
+    // Quantize to RGB565
+    let mut c0 = encode_rgb565(max_r, max_g, max_b);
+    let mut c1 = encode_rgb565(min_r, min_g, min_b);
+
+    // Ensure 4-color mode (c0 > c1)
+    if c0 < c1 { std::mem::swap(&mut c0, &mut c1); }
+    if c0 == c1 {
+        // Nudge to make c0 > c1
+        if c1 > 0 { c1 -= 1; } else { c0 += 1; }
+    }
+
+    // Build 4-color palette
+    let (r0, g0, b0) = decode_rgb565(c0);
+    let (r1, g1, b1) = decode_rgb565(c1);
+    let palette = [
+        [r0 as i32, g0 as i32, b0 as i32],
+        [r1 as i32, g1 as i32, b1 as i32],
+        [((2 * r0 as i32 + r1 as i32) / 3), ((2 * g0 as i32 + g1 as i32) / 3), ((2 * b0 as i32 + b1 as i32) / 3)],
+        [((r0 as i32 + 2 * r1 as i32) / 3), ((g0 as i32 + 2 * g1 as i32) / 3), ((b0 as i32 + 2 * b1 as i32) / 3)],
+    ];
+
+    // Assign each pixel to nearest palette entry
+    let mut indices = 0u32;
+    for (i, p) in pixels.iter().enumerate() {
+        let pr = p[0] as i32;
+        let pg = p[1] as i32;
+        let pb = p[2] as i32;
+        let mut best_dist = i32::MAX;
+        let mut best_idx = 0u32;
+        for (j, pal) in palette.iter().enumerate() {
+            let dr = pr - pal[0];
+            let dg = pg - pal[1];
+            let db = pb - pal[2];
+            let dist = dr*dr + dg*dg + db*db;
+            if dist < best_dist { best_dist = dist; best_idx = j as u32; }
+        }
+        indices |= best_idx << (i * 2);
+    }
+
+    let mut out = [0u8; 8];
+    out[0..2].copy_from_slice(&c0.to_le_bytes());
+    out[2..4].copy_from_slice(&c1.to_le_bytes());
+    out[4..8].copy_from_slice(&indices.to_le_bytes());
+    out
+}
+
 /// Encode 16 RGBA pixels → DXT1 block (8 bytes).
 ///
 /// Uses WeightedClusterFit matching the game's encoder. When `force_3color`
@@ -3235,6 +3313,65 @@ mod tests {
             nonsolid_same_endpoints, nonsolid_mismatch);
         eprintln!("    Different endpoints: {}/{}",
             nonsolid_diff_endpoints, nonsolid_mismatch);
+
+        // Count 3-color mode blocks in reference (c0 < c1)
+        // If the reference has 3-color blocks but we only produce 4-color,
+        // that explains some mismatches
+        let mut ref_3color = 0usize;
+        let mut our_3color = 0usize;
+        // Re-scan to check
+        for &(id, width, height) in test_textures {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+            let mut ms = Vec::new();
+            let mut w = width; let mut h = height;
+            loop {
+                ms.push(((w+3)/4) * ((h+3)/4) * block_size);
+                if w <= 4 && h <= 4 { break; }
+                w = (w/2).max(4); h = (h/2).max(4);
+            }
+            let mut rm: Vec<&[u8]> = Vec::new();
+            let mut off = fctx_header_size;
+            for i in (0..ms.len()).rev() { rm.push(&ref_data[off..off+ms[i]]); off += ms[i]; }
+            rm.reverse();
+
+            let mut cw = width; let mut ch = height;
+            let pbx2 = (cw/4).max(1); let pby2 = (ch/4).max(1);
+            let mut cp: Vec<[u8;4]> = vec![[0u8;4]; cw*ch];
+            for by in 0..pby2 { for bx in 0..pbx2 {
+                let o = (by*pbx2+bx)*block_size;
+                if o+block_size > rm[0].len() { continue; }
+                let px = decode_dxt1_block(&rm[0][o..o+block_size]);
+                for py in 0..4 { for ppx in 0..4 {
+                    let xx = bx*4+ppx; let yy = by*4+py;
+                    if xx < cw && yy < ch { cp[yy*cw+xx] = px[py*4+ppx]; }
+                }}
+            }}
+
+            for mi in 1..ms.len() {
+                let nw = (cw/2).max(4); let nh = (ch/2).max(4);
+                let (om, np) = generate_mip_from_pixels(&cp, cw, ch, nw, nh, TextureCodec::Dxt1, false);
+                let rr = rm[mi];
+                let nb = rr.len() / block_size;
+                for b in 0..nb {
+                    let rc0 = u16::from_le_bytes([rr[b*8], rr[b*8+1]]);
+                    let rc1 = u16::from_le_bytes([rr[b*8+2], rr[b*8+3]]);
+                    if rc0 != rc1 && rc0 < rc1 { ref_3color += 1; }
+                    let oc0 = u16::from_le_bytes([om[b*8], om[b*8+1]]);
+                    let oc1 = u16::from_le_bytes([om[b*8+2], om[b*8+3]]);
+                    if oc0 != oc1 && oc0 < oc1 { our_3color += 1; }
+                }
+                cp = np; cw = nw; ch = nh;
+            }
+        }
+        eprintln!("  3-color mode blocks: ref={} ours={}", ref_3color, our_3color);
 
         eprintln!("  OVERALL: {}/{} blocks match ({:.2}%)",
             matching_blocks, total_blocks,
@@ -4820,6 +4957,20 @@ mod tests {
                 let h1 = (src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32 + 1) / 2;
                 out[c] = ((h0 + h1 + 1) / 2) as u8;
             }
+            out
+        });
+
+        // Test with R/B swap: original stores BGRA, might have R↔B swap in float conversion
+        test_pipeline("pipe_rb_swap", &|src, x, y, sw, _dw| {
+            let sx = x * 2; let sy = y * 2;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let sum = src[sy*sw+sx][c] as u32 + src[sy*sw+sx+1][c] as u32
+                    + src[(sy+1)*sw+sx][c] as u32 + src[(sy+1)*sw+sx+1][c] as u32;
+                out[c] = (sum / 4) as u8;
+            }
+            // Swap R and B
+            out.swap(0, 2);
             out
         });
     }
