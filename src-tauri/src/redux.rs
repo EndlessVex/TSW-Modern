@@ -314,8 +314,8 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     for mip_idx in 1..mip_count {
-        let new_w = (current_w / 2).max(4);
-        let new_h = (current_h / 2).max(4);
+        let new_w = (current_w / 2).max(1);
+        let new_h = (current_h / 2).max(1);
 
         let (mip_data, new_pixels) = generate_mip_from_pixels(
             &current_pixels, current_w, current_h, new_w, new_h, codec,
@@ -3032,7 +3032,7 @@ mod tests {
             (117998, 512, 512),
         ];
 
-        let fctx_header_size = 40usize;
+        let fctx_header_size = 24usize;
         let block_size = 8usize; // DXT1
 
         let mut total_blocks = 0usize;
@@ -3090,9 +3090,9 @@ mod tests {
                 let blocks_w = (w + 3) / 4;
                 let blocks_h = (h + 3) / 4;
                 mip_sizes.push(blocks_w * blocks_h * block_size);
-                if w <= 4 && h <= 4 { break; }
-                w = (w / 2).max(4);
-                h = (h / 2).max(4);
+                if w <= 1 && h <= 1 { break; }
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
             }
             let mip_count = mip_sizes.len();
 
@@ -3145,8 +3145,8 @@ mod tests {
             let mut tex_match = 0usize;
 
             for mip_idx in 1..mip_count {
-                let new_w = (current_w / 2).max(4);
-                let new_h = (current_h / 2).max(4);
+                let new_w = (current_w / 2).max(1);
+                let new_h = (current_h / 2).max(1);
 
                 let (our_mip, new_pixels) = generate_mip_from_pixels(
                     &current_pixels, current_w, current_h, new_w, new_h,
@@ -3213,9 +3213,9 @@ mod tests {
                 let bw = (w + 3) / 4;
                 let bh = (h + 3) / 4;
                 mip_sizes.push(bw * bh * block_size);
-                if w <= 4 && h <= 4 { break; }
-                w = (w / 2).max(4);
-                h = (h / 2).max(4);
+                if w <= 1 && h <= 1 { break; }
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
             }
             let mip_count = mip_sizes.len();
 
@@ -3252,8 +3252,8 @@ mod tests {
             }
 
             for mip_idx in 1..mip_count {
-                let new_w = (current_w / 2).max(4);
-                let new_h = (current_h / 2).max(4);
+                let new_w = (current_w / 2).max(1);
+                let new_h = (current_h / 2).max(1);
 
                 let (our_mip, new_pix) = generate_mip_from_pixels(
                     &cur_pix, current_w, current_h, new_w, new_h,
