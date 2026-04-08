@@ -648,6 +648,57 @@ fn generate_mip(
 /// Matches the original's pipeline: the resize operates on uncompressed pixels
 /// (not re-decoded DXT1). Returns (encoded_blocks, filtered_pixels) so the
 /// filtered pixels can be passed to the next mip level without re-encoding.
+/// x87 box filter for float cascading: sum 4 f32 values at 80-bit,
+/// multiply by 0.25, store result as f32 (NOT as uint8).
+#[inline(never)]
+fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
+    let quarter: f32 = 0.25;
+    let mut result: f32 = 0.0;
+    let cw: u16 = 0x037F;
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{f0}]",
+            "fadd dword ptr [{f1}]",
+            "fadd dword ptr [{f2}]",
+            "fadd dword ptr [{f3}]",
+            "fmul dword ptr [{quarter}]",
+            "fstp dword ptr [{out}]",
+            cw = in(reg) &cw,
+            f0 = in(reg) &f0,
+            f1 = in(reg) &f1,
+            f2 = in(reg) &f2,
+            f3 = in(reg) &f3,
+            quarter = in(reg) &quarter,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// x87 float→uint8: multiply by 255, fistp (round to nearest even)
+#[inline(never)]
+fn x87_float_to_u8(val: f32) -> u8 {
+    let scale: f32 = 255.0;
+    let mut result: i32 = 0;
+    let cw: u16 = 0x037F;
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{val}]",
+            "fmul dword ptr [{scale}]",
+            "fistp dword ptr [{out}]",
+            cw = in(reg) &cw,
+            val = in(reg) &val,
+            scale = in(reg) &scale,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result.clamp(0, 255) as u8
+}
+
 /// Generate a mip from LINEAR float pixel data (gamma-correct pipeline).
 /// Box-filters in linear space, de-linearizes to uint8 for encoding,
 /// returns linear float data for cascading to next mip level.
@@ -706,6 +757,39 @@ fn generate_mip_from_linear(
     (result, dst_lin)
 }
 
+/// x87 box filter: sum 4 f32 values at 80-bit precision, multiply by 0.25 * 255,
+/// and convert to u8 via fistp (round-to-nearest-even).
+/// Matches the original's FUN_677FE0 + FUN_679070 pipeline.
+#[inline(never)]
+fn x87_box_filter_u8(f0: f32, f1: f32, f2: f32, f3: f32) -> u8 {
+    let quarter: f32 = 0.25;
+    let scale: f32 = 255.0;
+    let mut result: i32 = 0;
+    let cw: u16 = 0x037F;
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{f0}]",
+            "fadd dword ptr [{f1}]",
+            "fadd dword ptr [{f2}]",
+            "fadd dword ptr [{f3}]",
+            "fmul dword ptr [{quarter}]",
+            "fmul dword ptr [{scale}]",
+            "fistp dword ptr [{out}]",
+            cw = in(reg) &cw,
+            f0 = in(reg) &f0,
+            f1 = in(reg) &f1,
+            f2 = in(reg) &f2,
+            f3 = in(reg) &f3,
+            quarter = in(reg) &quarter,
+            scale = in(reg) &scale,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result.clamp(0, 255) as u8
+}
+
 fn generate_mip_from_pixels(
     src_pixels: &[[u8; 4]],
     prev_w: usize,
@@ -719,9 +803,14 @@ fn generate_mip_from_pixels(
     let new_bx = (new_w / 4).max(1);
     let new_by = (new_h / 4).max(1);
 
-    // Box-filter with truncating integer division.
-    // Gamma correction (linearize/delinearize) is handled at the pipeline
-    // level (in decompress_iog1), not per-mip.
+    // Box-filter matching the original's x87 FPU pipeline:
+    // The original uses x87 80-bit extended precision for intermediate sums
+    // and fistp (round-to-nearest-even) for float→uint8 conversion.
+    // This produces slightly different results from f32/integer arithmetic
+    // for ~25% of pixel values near the 0.5 boundary.
+    let recip255: f32 = 1.0 / 255.0;
+    let quarter: f32 = 0.25;
+    let scale255: f32 = 255.0;
     let mut dst_pixels = vec![[0u8; 4]; new_w * new_h];
     for y in 0..new_h {
         for x in 0..new_w {
@@ -738,8 +827,13 @@ fn generate_mip_from_pixels(
             let p11 = src_pixels[y1 * prev_w + x1];
 
             for c in 0..4 {
-                let sum = p00[c] as u32 + p10[c] as u32 + p01[c] as u32 + p11[c] as u32;
-                dst_pixels[y * new_w + x][c] = (sum / 4) as u8;
+                // Match x87 pipeline exactly: fld f32 values, fadd at 80-bit,
+                // fmul 0.25, fmul 255.0, fistp (round to nearest even)
+                let f0 = p00[c] as f32 * recip255;
+                let f1 = p10[c] as f32 * recip255;
+                let f2 = p01[c] as f32 * recip255;
+                let f3 = p11[c] as f32 * recip255;
+                dst_pixels[y * new_w + x][c] = x87_box_filter_u8(f0, f1, f2, f3);
             }
         }
     }
@@ -3485,10 +3579,10 @@ mod tests {
                     for y in 0..nh { for x in 0..nw {
                         let (x0,y0) = ((x*2).min(cw-1), (y*2).min(ch-1));
                         let (x1,y1) = ((x*2+1).min(cw-1), (y*2+1).min(ch-1));
-                        for c in 0..4 { new_f[y*nw+x][c] = (cur_f[y0*cw+x0][c]+cur_f[y0*cw+x1][c]+cur_f[y1*cw+x0][c]+cur_f[y1*cw+x1][c])*0.25; }
+                        for c in 0..4 { new_f[y*nw+x][c] = x87_box_filter_f32(cur_f[y0*cw+x0][c],cur_f[y0*cw+x1][c],cur_f[y1*cw+x0][c],cur_f[y1*cw+x1][c]); }
                     }}
                     let mut dst_u8 = vec![[0u8;4]; nw*nh];
-                    for i in 0..nw*nh { for c in 0..4 { dst_u8[i][c] = (new_f[i][c]*255.0).max(0.0).min(255.0) as u8; }}
+                    for i in 0..nw*nh { for c in 0..4 { dst_u8[i][c] = x87_float_to_u8(new_f[i][c]); }}
                     let nbx=(nw/4).max(1); let nby=(nh/4).max(1);
                     let mut mip = Vec::with_capacity(nbx*nby*block_size);
                     for by2 in 0..nby { for bx2 in 0..nbx {
