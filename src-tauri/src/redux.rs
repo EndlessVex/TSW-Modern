@@ -286,11 +286,14 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut current_w = stream1.width;
     let mut current_h = stream1.height;
 
-    // Decode mip0 to pixel buffer ONCE for cascaded resize
+    // Decode mip0 to pixel buffer, convert to f32 for x87 float cascading.
+    // The original keeps an f32 planar buffer across mip levels, using x87
+    // 80-bit precision for the box filter (fadd chain), and only converts
+    // to uint8 (via fistp round-to-nearest-even) at the encoding step.
     let block_size = codec.block_size();
     let prev_bx = (current_w / 4).max(1);
     let prev_by = (current_h / 4).max(1);
-    let mut current_pixels: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
+    let mut decoded_u8: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
     for by in 0..prev_by {
         for bx in 0..prev_bx {
             let block_off = (by * prev_bx + bx) * block_size;
@@ -306,21 +309,70 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
                     let x = bx * 4 + px;
                     let y = by * 4 + py;
                     if x < current_w && y < current_h {
-                        current_pixels[y * current_w + x] = block_pixels[py * 4 + px];
+                        decoded_u8[y * current_w + x] = block_pixels[py * 4 + px];
                     }
                 }
             }
         }
     }
 
+    // Convert to f32 [0,1] (matching FUN_678F40: val * (1/255))
+    let recip255: f32 = 1.0 / 255.0;
+    let mut current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+        [p[0] as f32 * recip255, p[1] as f32 * recip255,
+         p[2] as f32 * recip255, p[3] as f32 * recip255]
+    }).collect();
+
     for mip_idx in 1..mip_count {
         let new_w = (current_w / 2).max(1);
         let new_h = (current_h / 2).max(1);
 
-        let (mip_data, new_pixels) = generate_mip_from_pixels(
-            &current_pixels, current_w, current_h, new_w, new_h, codec,
-            has_binary_alpha,
-        );
+        // x87 box filter in float space (keeps f32 for cascading)
+        let mut new_float = vec![[0.0f32; 4]; new_w * new_h];
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let x0 = (x * 2).min(current_w - 1);
+                let y0 = (y * 2).min(current_h - 1);
+                let x1 = (x * 2 + 1).min(current_w - 1);
+                let y1 = (y * 2 + 1).min(current_h - 1);
+                for c in 0..4 {
+                    new_float[y * new_w + x][c] = x87_box_filter_f32(
+                        current_float[y0 * current_w + x0][c],
+                        current_float[y0 * current_w + x1][c],
+                        current_float[y1 * current_w + x0][c],
+                        current_float[y1 * current_w + x1][c],
+                    );
+                }
+            }
+        }
+
+        // Convert to uint8 for encoding (fistp round-to-nearest-even)
+        let new_bx = (new_w / 4).max(1);
+        let new_by = (new_h / 4).max(1);
+        let mut mip_data = Vec::with_capacity(new_bx * new_by * block_size);
+        for by in 0..new_by {
+            for bx in 0..new_bx {
+                let mut block_pixels = [[0u8; 4]; 16];
+                for py in 0..4 {
+                    for px in 0..4 {
+                        let fx = (bx * 4 + px).min(new_w - 1);
+                        let fy = (by * 4 + py).min(new_h - 1);
+                        let fv = &new_float[fy * new_w + fx];
+                        block_pixels[py * 4 + px] = [
+                            x87_float_to_u8(fv[0]),
+                            x87_float_to_u8(fv[1]),
+                            x87_float_to_u8(fv[2]),
+                            x87_float_to_u8(fv[3]),
+                        ];
+                    }
+                }
+                match codec {
+                    TextureCodec::Dxt1 => mip_data.extend_from_slice(&encode_dxt1_block(&block_pixels, has_binary_alpha, true)),
+                    TextureCodec::Dxt5 => mip_data.extend_from_slice(&encode_dxt5_block(&block_pixels)),
+                    TextureCodec::Ati2 => mip_data.extend_from_slice(&encode_ati2_block(&block_pixels)),
+                }
+            }
+        }
 
         if mip_data.len() != mip_sizes[mip_idx] {
             return Err(format!(
@@ -332,7 +384,7 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         }
 
         all_mips.push(mip_data);
-        current_pixels = new_pixels;
+        current_float = new_float;
         current_w = new_w;
         current_h = new_h;
     }
@@ -3275,15 +3327,16 @@ mod tests {
             // mip0 from the reference (CDN source, should be identical)
             let mip0 = ref_mips[0];
 
-            // Regenerate mips 1..N using cascaded pixel buffers
-            // (matching the original which keeps uncompressed pixels between levels)
+            // Regenerate mips using x87 float cascading
+            // (matching the original: f32 float buffer across mips, x87 80-bit box
+            // filter, fistp round-to-nearest for encoding)
             let mut current_w = width;
             let mut current_h = height;
 
-            // Decode mip0 to pixel buffer
+            // Decode mip0 to pixel buffer → convert to f32
             let prev_bx = (current_w / 4).max(1);
             let prev_by = (current_h / 4).max(1);
-            let mut current_pixels: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
+            let mut decoded_u8: Vec<[u8; 4]> = vec![[0u8; 4]; current_w * current_h];
             for by in 0..prev_by {
                 for bx in 0..prev_bx {
                     let off = (by * prev_bx + bx) * block_size;
@@ -3294,12 +3347,17 @@ mod tests {
                             let x = bx * 4 + px;
                             let y = by * 4 + py;
                             if x < current_w && y < current_h {
-                                current_pixels[y * current_w + x] = pixels[py * 4 + px];
+                                decoded_u8[y * current_w + x] = pixels[py * 4 + px];
                             }
                         }
                     }
                 }
             }
+            let r255: f32 = 1.0 / 255.0;
+            let mut cur_f: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [p[0] as f32 * r255, p[1] as f32 * r255,
+                 p[2] as f32 * r255, p[3] as f32 * r255]
+            }).collect();
 
             let mut tex_total = 0usize;
             let mut tex_match = 0usize;
@@ -3308,10 +3366,42 @@ mod tests {
                 let new_w = (current_w / 2).max(1);
                 let new_h = (current_h / 2).max(1);
 
-                let (our_mip, new_pixels) = generate_mip_from_pixels(
-                    &current_pixels, current_w, current_h, new_w, new_h,
-                    TextureCodec::Dxt1, false,
-                );
+                // x87 box filter in float space
+                let mut new_f = vec![[0.0f32; 4]; new_w * new_h];
+                for y in 0..new_h {
+                    for x in 0..new_w {
+                        let x0 = (x*2).min(current_w-1);
+                        let y0 = (y*2).min(current_h-1);
+                        let x1 = (x*2+1).min(current_w-1);
+                        let y1 = (y*2+1).min(current_h-1);
+                        for c in 0..4 {
+                            new_f[y*new_w+x][c] = x87_box_filter_f32(
+                                cur_f[y0*current_w+x0][c], cur_f[y0*current_w+x1][c],
+                                cur_f[y1*current_w+x0][c], cur_f[y1*current_w+x1][c],
+                            );
+                        }
+                    }
+                }
+
+                // Encode: convert to uint8 via fistp, then encode blocks
+                let nbx = (new_w/4).max(1);
+                let nby = (new_h/4).max(1);
+                let mut our_mip = Vec::with_capacity(nbx * nby * block_size);
+                for by in 0..nby {
+                    for bx in 0..nbx {
+                        let mut bp = [[0u8; 4]; 16];
+                        for py in 0..4 { for px in 0..4 {
+                            let fx = (bx*4+px).min(new_w-1);
+                            let fy = (by*4+py).min(new_h-1);
+                            let fv = &new_f[fy*new_w+fx];
+                            bp[py*4+px] = [
+                                x87_float_to_u8(fv[0]), x87_float_to_u8(fv[1]),
+                                x87_float_to_u8(fv[2]), x87_float_to_u8(fv[3]),
+                            ];
+                        }}
+                        our_mip.extend_from_slice(&encode_dxt1_block(&bp, false, true));
+                    }
+                }
 
                 let ref_mip = ref_mips[mip_idx];
                 assert_eq!(our_mip.len(), ref_mip.len(),
@@ -3335,8 +3425,8 @@ mod tests {
                 tex_total += num_blocks;
                 tex_match += mip_match;
 
-                // Keep uncompressed pixels for next level (NOT re-decoded DXT1)
-                current_pixels = new_pixels;
+                // Keep float buffer for next level (matching original's float cascade)
+                cur_f = new_f;
                 current_w = new_w;
                 current_h = new_h;
             }
