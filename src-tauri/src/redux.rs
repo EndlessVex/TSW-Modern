@@ -2746,9 +2746,9 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool, for_mip: bool)
 
     // ── All opaque: existing path ──
 
-    // For mip generation, the original uses range-fit with inertia extension
-    // and least-squares refinement (FUN_0067cf20), NOT ClusterFit.
-    // ClusterFit (FUN_0067e280/Compress4) is only used for DXT5 (format 6).
+    // Range-fit encoder (FUN_0067cf20) = param_4[1]==0 = Quality_Fastest.
+    // Tested alternatives: ClusterFit dedup=false (10.72%), ClusterFit dedup=true (11.22%).
+    // Range-fit gives best results (13.10%).
     if for_mip {
         return encode_dxt1_range_fit(pixels);
     }
