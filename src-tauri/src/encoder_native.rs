@@ -140,6 +140,7 @@ mod inner {
     }
 
     fn do_init() -> bool {
+        eprintln!("[encoder_native] do_init starting...");
         // Locate the PE file
         let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
             Ok(d) => d,
@@ -165,9 +166,10 @@ mod inner {
             .join("The Secret World")
             .join("ClientPatcher.exe");
 
+        eprintln!("[encoder_native] PE path: {:?} exists={}", pe_path, pe_path.exists());
         let pe_data = match std::fs::read(&pe_path) {
-            Ok(d) => d,
-            Err(_) => return false,
+            Ok(d) => { eprintln!("[encoder_native] PE loaded: {} bytes", d.len()); d },
+            Err(e) => { eprintln!("[encoder_native] PE read failed: {}", e); return false; },
         };
 
         let sections = match parse_pe_sections(&pe_data) {
@@ -184,6 +186,7 @@ mod inner {
                 PAGE_EXECUTE_READWRITE,
             );
             if text_ptr.is_null() || text_ptr as usize != TEXT_ALLOC_ADDR {
+                eprintln!("[encoder_native] .text VirtualAlloc at 0x{:08X} failed (got {:?})", TEXT_ALLOC_ADDR, text_ptr);
                 return false;
             }
 
@@ -195,6 +198,7 @@ mod inner {
                 text_ptr,
                 TEXT_ALLOC_SIZE,
             ) {
+                eprintln!("[encoder_native] .text copy_from_pe failed");
                 return false;
             }
 
@@ -206,6 +210,7 @@ mod inner {
                 PAGE_READWRITE,
             );
             if rdata_ptr.is_null() || rdata_ptr as usize != RDATA_ALLOC_ADDR {
+                eprintln!("[encoder_native] .rdata VirtualAlloc at 0x{:08X} size 0x{:X} failed (got {:?})", RDATA_ALLOC_ADDR, RDATA_ALLOC_SIZE, rdata_ptr);
                 return false;
             }
 
@@ -220,20 +225,15 @@ mod inner {
                 return false;
             }
 
-            // Allocate .data page for the single constant
-            let data_ptr = VirtualAlloc(
-                DATA_PAGE_ADDR,
-                DATA_PAGE_SIZE,
-                MEM_COMMIT_RESERVE,
-                PAGE_READWRITE,
-            );
-            if data_ptr.is_null() || data_ptr as usize != DATA_PAGE_ADDR {
-                return false;
+            // The constant at 0x8BF734 is within the .rdata mapped range
+            // (0x84A000 to 0x8C0000), so it's already covered by copy_from_pe.
+            // Verify it was copied correctly.
+            let const_ptr = RDATA_ALLOC_ADDR + (0x8BF734 - RDATA_ALLOC_ADDR);
+            let const_val = *(const_ptr as *const u32);
+            if const_val != DATA_CONST_VALUE {
+                // Fallback: write it manually (might be outside raw PE data)
+                *(const_ptr as *mut u32) = DATA_CONST_VALUE;
             }
-
-            // Write the f32 constant at offset 0x734
-            let const_ptr = data_ptr.add(DATA_CONST_OFFSET) as *mut u32;
-            const_ptr.write(DATA_CONST_VALUE);
         }
 
         true
