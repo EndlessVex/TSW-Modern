@@ -2816,13 +2816,13 @@ fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
     out
 }
 
-/// Least-squares endpoint refinement (FUN_0067c860).
-/// The original uses x87 at CW=0x027F (53-bit) but stores accumulators as f32
-/// stack variables between the 2 loop iterations (8 pixels per iteration).
-/// The x87 chain within each iteration computes 8 products and adds them to
-/// the accumulator at 53-bit precision, then stores the result as f32.
-/// Using f64 for the full 16-pixel accumulation gives different results because
-/// f32 truncation between iterations is skipped.
+/// Least-squares endpoint refinement matching the native encoder's x87 accumulation.
+/// The native keeps aa/bb/ab on the x87 register stack at 53-bit precision
+/// (CW=0x027F) across all 16 pixels and through the det and matrix solve — they
+/// are never stored to f32. The a_pixel/b_pixel arrays store to f32 after every
+/// pixel. We replicate this by using f64 for aa/bb/ab (same 53-bit mantissa as
+/// x87 double-precision mode) and feeding them into the matrix solve via
+/// fld qword ptr to avoid any f32 truncation of the accumulators.
 fn refine_endpoints_lsq(
     fp: &[[f32; 3]; 16],
     c0_in: u16, c1_in: u16,
@@ -2831,39 +2831,44 @@ fn refine_endpoints_lsq(
 ) -> (u16, u16, u32) {
     let one_third: f32 = f32::from_bits(0x3EAAAAAB);
 
-    // Accumulate at f32. The original uses x87 at CW=0x027F (53-bit) with an
-    // 8-pixel unrolled loop, storing accumulators as f32 between iterations.
-    // Matching the exact x87 instruction ordering is impractical; f32 gives
-    // correct results for ~90% of non-solid blocks, with the remaining ~10%
-    // differing by 1 quantization level due to x87 vs SSE rounding.
-    let mut aa = 0.0f32;
-    let mut bb = 0.0f32;
-    let mut ab = 0.0f32;
+    // aa/bb/ab accumulate at f64 (53-bit mantissa, matching x87 CW=0x027F)
+    // across all 16 pixels. The native never stores these to f32 until
+    // the matrix solve after the loop.
+    let mut aa_hi = 0.0f64;
+    let mut bb_hi = 0.0f64;
+    let mut ab_hi = 0.0f64;
+    // a_pixel/b_pixel store to f32 after each pixel (matching native's fstp)
     let mut a_pixel = [0.0f32; 3];
     let mut b_pixel = [0.0f32; 3];
 
-    for i in 0..16 {
-        let idx = (indices_in >> (i * 2)) & 3;
+    for i in 0..16usize {
+        let idx = (indices_in >> (i as u32 * 2)) & 3;
         let bit0 = (idx & 1) as f32;
         let beta = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
         let alpha = 1.0 - beta;
 
-        aa += alpha * alpha;
-        bb += beta * beta;
-        ab += alpha * beta;
+        // Accumulate aa/bb/ab at f64 precision (matches x87 53-bit on-stack)
+        let alpha_d = alpha as f64;
+        let beta_d = beta as f64;
+        aa_hi += alpha_d * alpha_d;
+        bb_hi += beta_d * beta_d;
+        ab_hi += alpha_d * beta_d;
 
+        // a_pixel/b_pixel: multiply at f64 (matching x87 53-bit fmul), add at
+        // f64 (matching x87 fadd), then store to f32 (matching native fstp dword)
         for c in 0..3 {
-            a_pixel[c] += alpha * fp[i][c];
-            b_pixel[c] += beta * fp[i][c];
+            let pc = fp[i][c] as f64;
+            a_pixel[c] = (a_pixel[c] as f64 + alpha_d * pc) as f32;
+            b_pixel[c] = (b_pixel[c] as f64 + beta_d * pc) as f32;
         }
     }
 
-    // Matrix solve using x87 inline asm for real hardware precision.
-    // The original computes det, inv_det, and endpoint values at x87 53-bit
-    // precision (CW=0x027F). Unicorn softfloat differs from real x87 for
-    // values near quantization boundaries, causing ~1-bit endpoint differences.
-    let det: f32 = aa * bb - ab * ab;
-    if det.abs() < 0.0001 {
+    // The native computes det and the matrix solve directly from the x87
+    // accumulators (never truncated to f32). We keep aa/bb/ab as f64 and
+    // load them via fld qword ptr in the asm to preserve 53-bit precision
+    // through the entire solve.
+    let det_hi: f64 = aa_hi * bb_hi - ab_hi * ab_hi;
+    if (det_hi as f32).abs() < 0.0001 {
         return (c0_in, c1_in, indices_in);
     }
 
@@ -2873,34 +2878,35 @@ fn refine_endpoints_lsq(
     for c in 0..3 {
         // Compute (bb * a_pixel[c] - ab * b_pixel[c]) / det at x87 precision
         // and (aa * b_pixel[c] - ab * a_pixel[c]) / det at x87 precision
+        // All loads from f64 to match native's x87-register-resident accumulators.
         let mut ep0_val: f32 = 0.0;
         let mut ep1_val: f32 = 0.0;
         unsafe {
             std::arch::asm!(
                 "fldcw word ptr [{cw}]",
                 // ep0 = (bb * a_pix - ab * b_pix) / det
-                "fld dword ptr [{bb}]",
+                "fld qword ptr [{bb}]",
                 "fmul dword ptr [{a_pix}]",
-                "fld dword ptr [{ab}]",
+                "fld qword ptr [{ab}]",
                 "fmul dword ptr [{b_pix}]",
                 "fsubp st(1), st(0)",   // st(0) = bb*a_pix - ab*b_pix
-                "fdiv dword ptr [{det}]",
+                "fdiv qword ptr [{det}]",
                 "fstp dword ptr [{ep0}]",
                 // ep1 = (aa * b_pix - ab * a_pix) / det
-                "fld dword ptr [{aa_v}]",
+                "fld qword ptr [{aa_v}]",
                 "fmul dword ptr [{b_pix}]",
-                "fld dword ptr [{ab}]",
+                "fld qword ptr [{ab}]",
                 "fmul dword ptr [{a_pix}]",
                 "fsubp st(1), st(0)",   // st(0) = aa*b_pix - ab*a_pix
-                "fdiv dword ptr [{det}]",
+                "fdiv qword ptr [{det}]",
                 "fstp dword ptr [{ep1}]",
                 cw = in(reg) &cw,
-                bb = in(reg) &bb,
-                aa_v = in(reg) &aa,
-                ab = in(reg) &ab,
+                bb = in(reg) &bb_hi,
+                aa_v = in(reg) &aa_hi,
+                ab = in(reg) &ab_hi,
                 a_pix = in(reg) &a_pixel[c],
                 b_pix = in(reg) &b_pixel[c],
-                det = in(reg) &det,
+                det = in(reg) &det_hi,
                 ep0 = in(reg) &mut ep0_val,
                 ep1 = in(reg) &mut ep1_val,
                 options(nostack),
@@ -9524,6 +9530,762 @@ mod tests {
         }
 
         eprintln!("  No mismatching non-solid blocks found in any 1024x1024 texture");
+    }
+
+    /// Compare SSE `N as f32 * recip255` vs x87 `fild; fmul dword [recip]; fstp` for all 256 u8 values.
+    /// Our Rust pipeline uses SSE (compiler default), but the native uses x87 at 53-bit precision.
+    /// Double-rounding (53-bit mantissa -> f32 store) could produce different f32 results.
+    ///
+    /// Run with: cargo test test_u8_to_float_sse_vs_x87 -- --nocapture
+    #[test]
+    fn test_u8_to_float_sse_vs_x87() {
+        let recip255: f32 = 1.0 / 255.0;
+        let mut diffs = 0;
+        for n in 0u8..=255 {
+            let sse_result = n as f32 * recip255;
+            let mut x87_result: f32 = 0.0;
+            let n_i32 = n as i32;
+            let cw: u16 = 0x027F; // 53-bit precision (MSVC default)
+            unsafe {
+                core::arch::asm!(
+                    "fldcw word ptr [{cw}]",
+                    "fild dword ptr [{n}]",
+                    "fmul dword ptr [{recip}]",
+                    "fstp dword ptr [{out}]",
+                    cw = in(reg) &cw,
+                    n = in(reg) &n_i32,
+                    recip = in(reg) &recip255,
+                    out = in(reg) &mut x87_result,
+                    options(nostack),
+                );
+            }
+            if sse_result.to_bits() != x87_result.to_bits() {
+                diffs += 1;
+                eprintln!("  DIFF n={}: SSE={:08X} x87={:08X} (SSE={} x87={})",
+                    n, sse_result.to_bits(), x87_result.to_bits(), sse_result, x87_result);
+            }
+        }
+        eprintln!("  u8->f32 SSE vs x87: {}/256 differ", diffs);
+        if diffs > 0 {
+            eprintln!("  WARNING: SSE and x87 produce different u8->f32 conversions!");
+            eprintln!("  This means our pipeline computes different linear values than the native.");
+        }
+    }
+
+    /// Extended test: for values that differ in u8->f32 conversion, trace the FULL pipeline
+    /// (gamma, box filter, degamma) to see if the difference propagates to different mip1 u8 output.
+    ///
+    /// Run with: cargo test test_u8_to_float_pipeline_propagation -- --nocapture
+    #[test]
+    fn test_u8_to_float_pipeline_propagation() {
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        let mut propagated = 0;
+        for n in 0u8..=255 {
+            let sse_val = n as f32 * recip255;
+            let mut x87_val: f32 = 0.0;
+            let n_i32 = n as i32;
+            let cw: u16 = 0x027F;
+            unsafe {
+                core::arch::asm!(
+                    "fldcw word ptr [{cw}]",
+                    "fild dword ptr [{n}]",
+                    "fmul dword ptr [{recip}]",
+                    "fstp dword ptr [{out}]",
+                    cw = in(reg) &cw,
+                    n = in(reg) &n_i32,
+                    recip = in(reg) &recip255,
+                    out = in(reg) &mut x87_val,
+                    options(nostack),
+                );
+            }
+            if sse_val.to_bits() == x87_val.to_bits() { continue; }
+
+            // Both paths go through x87_powf (which loads from f32), so the input to pow differs
+            let sse_linear = x87_powf(sse_val, gamma);
+            let x87_linear = x87_powf(x87_val, gamma);
+
+            // Solid block: box filter of 4 identical values = same value
+            // Degamma: pow(linear, 1/gamma) * 255 -> floor
+            let sse_out = x87_degamma_scale_floor(sse_linear, gamma, scale);
+            let x87_out = x87_degamma_scale_floor(x87_linear, gamma, scale);
+
+            if sse_out != x87_out {
+                propagated += 1;
+                eprintln!("  PROPAGATED n={}: SSE pipeline->{} x87 pipeline->{}  (SSE_f32={:08X} x87_f32={:08X} SSE_lin={:08X} x87_lin={:08X})",
+                    n, sse_out, x87_out,
+                    sse_val.to_bits(), x87_val.to_bits(),
+                    sse_linear.to_bits(), x87_linear.to_bits());
+            }
+        }
+        eprintln!("  Pipeline propagation: {}/256 values produce different mip1 u8 output", propagated);
+    }
+
+    /// For the specific mismatching block from mismatch_source_pixels.json,
+    /// recompute the pipeline using x87 u8->f32 conversion (fild+fmul+fstp)
+    /// instead of SSE, and check if it changes the encoder output.
+    ///
+    /// Run with: cargo test test_mismatch_block_with_x87_conversion -- --nocapture
+    #[test]
+    fn test_mismatch_block_with_x87_conversion() {
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        // Source pixels from mismatch_source_pixels.json block (38, 59)
+        // The 8x8 mip0 region: rows 0-3 have B=228, rows 4-6 have B=231,
+        // row 7 has (255,0,231), (16,0,16), (156,0,140), (255,0,231) x2...
+        // The key unique u8 values are: 0, 16, 140, 156, 228, 231, 255
+
+        let key_values: Vec<u8> = vec![0, 16, 140, 156, 228, 231, 255];
+        eprintln!("  Checking u8->f32 for key mismatch values:");
+        for &n in &key_values {
+            let sse_val = n as f32 * recip255;
+            let mut x87_val: f32 = 0.0;
+            let n_i32 = n as i32;
+            let cw: u16 = 0x027F;
+            unsafe {
+                core::arch::asm!(
+                    "fldcw word ptr [{cw}]",
+                    "fild dword ptr [{n}]",
+                    "fmul dword ptr [{recip}]",
+                    "fstp dword ptr [{out}]",
+                    cw = in(reg) &cw,
+                    n = in(reg) &n_i32,
+                    recip = in(reg) &recip255,
+                    out = in(reg) &mut x87_val,
+                    options(nostack),
+                );
+            }
+            let sse_lin = x87_powf(sse_val, gamma);
+            let x87_lin = x87_powf(x87_val, gamma);
+            let sse_deg = x87_degamma_scale_floor(sse_lin, gamma, scale);
+            let x87_deg = x87_degamma_scale_floor(x87_lin, gamma, scale);
+            let marker = if sse_val.to_bits() != x87_val.to_bits() { " *** DIFF ***" } else { "" };
+            eprintln!("  n={:3}: SSE_f32={:08X} x87_f32={:08X} SSE_lin={:08X} x87_lin={:08X} SSE_out={:3} x87_out={:3}{}",
+                n, sse_val.to_bits(), x87_val.to_bits(),
+                sse_lin.to_bits(), x87_lin.to_bits(),
+                sse_deg, x87_deg, marker);
+        }
+
+        // Now compute the full 4x4 block with x87 conversion to see if encoder output changes
+        // Pixel (1,3) at mip1 pos (153,239): src = (255,0,231), (16,0,16), (255,0,231), (16,0,16)
+        // This is the most interesting pixel - it has mixed inputs
+
+        // Helper: convert u8 to f32 using x87 fild+fmul+fstp
+        let x87_u8_to_f32 = |n: u8| -> f32 {
+            let mut result: f32 = 0.0;
+            let n_i32 = n as i32;
+            let cw: u16 = 0x027F;
+            unsafe {
+                core::arch::asm!(
+                    "fldcw word ptr [{cw}]",
+                    "fild dword ptr [{n}]",
+                    "fmul dword ptr [{recip}]",
+                    "fstp dword ptr [{out}]",
+                    cw = in(reg) &cw,
+                    n = in(reg) &n_i32,
+                    recip = in(reg) &recip255,
+                    out = in(reg) &mut result,
+                    options(nostack),
+                );
+            }
+            result
+        };
+
+        // Recompute the full block using x87 conversion
+        // 8x8 source pixels from the JSON (RGBA order)
+        let mip0_8x8: [[u8; 4]; 64] = [
+            // Row 0 (all [255,0,228,255])
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            // Row 1
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            // Row 2
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            // Row 3
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            [255,0,228,255],[255,0,228,255],[255,0,228,255],[255,0,228,255],
+            // Row 4 (all [255,0,231,255])
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            // Row 5
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            // Row 6
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            [255,0,231,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+            // Row 7
+            [255,0,231,255],[255,0,231,255],[16,0,16,255],[16,0,16,255],
+            [156,0,140,255],[255,0,231,255],[255,0,231,255],[255,0,231,255],
+        ];
+
+        // Linearize with SSE conversion
+        let sse_linear: Vec<[f32; 4]> = mip0_8x8.iter().map(|p| {
+            [x87_powf(p[0] as f32 * recip255, gamma),
+             x87_powf(p[1] as f32 * recip255, gamma),
+             x87_powf(p[2] as f32 * recip255, gamma),
+             p[3] as f32 * recip255]
+        }).collect();
+
+        // Linearize with x87 conversion
+        let x87_linear: Vec<[f32; 4]> = mip0_8x8.iter().map(|p| {
+            [x87_powf(x87_u8_to_f32(p[0]), gamma),
+             x87_powf(x87_u8_to_f32(p[1]), gamma),
+             x87_powf(x87_u8_to_f32(p[2]), gamma),
+             x87_u8_to_f32(p[3])]
+        }).collect();
+
+        // Check if any linearized values differ
+        let mut lin_diffs = 0;
+        for i in 0..64 {
+            for c in 0..4 {
+                if sse_linear[i][c].to_bits() != x87_linear[i][c].to_bits() {
+                    lin_diffs += 1;
+                    if lin_diffs <= 10 {
+                        let p = mip0_8x8[i];
+                        eprintln!("  Lin diff pixel[{}] ch={}: input_u8={} SSE_lin={:08X} x87_lin={:08X}",
+                            i, c, p[c], sse_linear[i][c].to_bits(), x87_linear[i][c].to_bits());
+                    }
+                }
+            }
+        }
+        eprintln!("  Linearized value diffs: {}/256 (64 pixels * 4 channels)", lin_diffs);
+
+        // Box filter and degamma both paths, compare 4x4 mip1 output
+        let w = 8usize;
+        let nw = 4usize;
+
+        let compute_mip1 = |linear: &Vec<[f32; 4]>| -> [[u8; 4]; 16] {
+            let mut filtered = [[0.0f32; 4]; 16];
+            for y in 0..4usize { for x in 0..4usize {
+                let x0 = x * 2;
+                let y0 = y * 2;
+                let x1 = (x * 2 + 1).min(w - 1);
+                let y1 = (y * 2 + 1).min(w - 1);
+                let pp00 = &linear[y0 * w + x0];
+                let pp10 = &linear[y0 * w + x1];
+                let pp01 = &linear[y1 * w + x0];
+                let pp11 = &linear[y1 * w + x1];
+                // Use the same box_filter_order logic as the export test:
+                // mip1_x = block_bx*4 + px. For block (38, 59), mip1_x = 38*4+px = 152+px
+                // (152+px) % 4 == 1 only for px=1 → p00_first, else p10_first
+                for c in 0..4 {
+                    filtered[y * nw + x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+            let mut pixels = [[0u8; 4]; 16];
+            for i in 0..16 {
+                let fv = &filtered[i];
+                pixels[i] = [
+                    x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0, 255) as u8,
+                    x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0, 255) as u8,
+                    x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0, 255) as u8,
+                    x87_float_to_u8(fv[3]),
+                ];
+            }
+            pixels
+        };
+
+        let sse_pixels = compute_mip1(&sse_linear);
+        let x87_pixels = compute_mip1(&x87_linear);
+
+        eprintln!("\n  4x4 mip1 pixel comparison (SSE vs x87 u8->f32):");
+        let mut pixel_diffs = 0;
+        for py in 0..4 { for px in 0..4 {
+            let i = py * 4 + px;
+            let s = sse_pixels[i];
+            let x = x87_pixels[i];
+            if s != x {
+                pixel_diffs += 1;
+                eprintln!("  ({},{}) SSE=[{},{},{},{}] x87=[{},{},{},{}]",
+                    px, py, s[0], s[1], s[2], s[3], x[0], x[1], x[2], x[3]);
+            }
+        }}
+        eprintln!("  Pixel diffs: {}/16", pixel_diffs);
+
+        // Now encode both and compare to reference
+        let ref_c0: u16 = 63516;
+        let ref_c1: u16 = 34831;
+        let ref_ix: u32 = 603979776;
+
+        let sse_block = encode_dxt1_block(&sse_pixels, false, true);
+        let x87_block = encode_dxt1_block(&x87_pixels, false, true);
+
+        let sse_c0 = u16::from_le_bytes([sse_block[0], sse_block[1]]);
+        let sse_c1 = u16::from_le_bytes([sse_block[2], sse_block[3]]);
+        let sse_ix = u32::from_le_bytes([sse_block[4], sse_block[5], sse_block[6], sse_block[7]]);
+
+        let x87_c0 = u16::from_le_bytes([x87_block[0], x87_block[1]]);
+        let x87_c1 = u16::from_le_bytes([x87_block[2], x87_block[3]]);
+        let x87_ix = u32::from_le_bytes([x87_block[4], x87_block[5], x87_block[6], x87_block[7]]);
+
+        eprintln!("\n  DXT1 encoder output:");
+        eprintln!("  REF:  c0={} c1={} ix={}", ref_c0, ref_c1, ref_ix);
+        eprintln!("  SSE:  c0={} c1={} ix={}", sse_c0, sse_c1, sse_ix);
+        eprintln!("  x87:  c0={} c1={} ix={}", x87_c0, x87_c1, x87_ix);
+
+        let sse_match = sse_c0 == ref_c0 && sse_c1 == ref_c1 && sse_ix == ref_ix;
+        let x87_match = x87_c0 == ref_c0 && x87_c1 == ref_c1 && x87_ix == ref_ix;
+        eprintln!("  SSE matches ref: {}", sse_match);
+        eprintln!("  x87 matches ref: {}", x87_match);
+
+        if x87_match && !sse_match {
+            eprintln!("  *** HYPOTHESIS 3 CONFIRMED: x87 u8->f32 conversion fixes the mismatch! ***");
+        }
+    }
+
+    /// Verify the no-gamma pipeline against normal-full-loggedin reference data
+    /// for texture 6086415 and analyze the remaining mismatches.
+    ///
+    /// Run with: cargo test test_nogamma_mismatch_analysis -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_nogamma_mismatch_analysis() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx_path = ref_dir.join("le.idx");
+        if !ref_idx_path.exists() {
+            eprintln!("  reference install not available, skipping");
+            return;
+        }
+        let ref_idx = parse_le_index(&ref_idx_path).unwrap();
+
+        let entry = ref_idx.entries.iter()
+            .find(|e| e.id == 6086415 && e.file_num != 255)
+            .expect("Texture 6086415 not found");
+
+        let fctx = {
+            let path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut file = std::fs::File::open(&path).unwrap();
+            file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let width = 1usize << (fctx[16] as usize - 1);
+        let height = 1usize << (fctx[17] as usize - 1);
+        let block_size = 8;
+        let mip0_size = (width / 4) * (height / 4) * block_size;
+        let mip1_size = (width / 8) * (height / 8) * block_size;
+        let ref_mip0 = &fctx[fctx.len() - mip0_size..];
+        let ref_mip1 = &fctx[fctx.len() - mip0_size - mip1_size..fctx.len() - mip0_size];
+
+        let bpw = width / 4;
+        let mut decoded_u8 = vec![[0u8; 4]; width * height];
+        for by in 0..(height / 4) {
+            for bx in 0..bpw {
+                let off = (by * bpw + bx) * block_size;
+                let bp = decode_dxt1_block(&ref_mip0[off..off + block_size]);
+                for py in 0..4 { for px in 0..4 {
+                    decoded_u8[(by * 4 + py) * width + bx * 4 + px] = bp[py * 4 + px];
+                }}
+            }
+        }
+
+        let recip255: f32 = 1.0 / 255.0;
+        let scale: f32 = 255.0;
+        let nw = width / 2;
+        let nh = height / 2;
+
+        let nogamma_linear: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+            [p[0] as f32 * recip255,
+             p[1] as f32 * recip255,
+             p[2] as f32 * recip255,
+             p[3] as f32 * recip255]
+        }).collect();
+
+        let mut nogamma_filtered = vec![[0.0f32; 4]; nw * nh];
+        for y in 0..nh { for x in 0..nw {
+            let x0 = (x * 2).min(width - 1);
+            let y0 = (y * 2).min(height - 1);
+            let x1 = (x * 2 + 1).min(width - 1);
+            let y1 = (y * 2 + 1).min(height - 1);
+            let pp00 = &nogamma_linear[y0 * width + x0];
+            let pp10 = &nogamma_linear[y0 * width + x1];
+            let pp01 = &nogamma_linear[y1 * width + x0];
+            let pp11 = &nogamma_linear[y1 * width + x1];
+            for c in 0..4 {
+                nogamma_filtered[y * nw + x][c] = if x % 4 == 1 {
+                    x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                } else {
+                    x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                };
+            }
+        }}
+
+        let nbpw = nw / 4;
+        let nbph = nh / 4;
+        let mut match_count = 0u32;
+        let mut total_count = 0u32;
+        let mut mismatch_solid = 0u32;
+        let mut mismatch_nonsolid = 0u32;
+        let mut mismatch_c0_only = 0u32;
+        let mut mismatch_c1_only = 0u32;
+        let mut mismatch_ix_only = 0u32;
+        let mut mismatch_multi = 0u32;
+
+        for by in 0..nbph { for bx in 0..nbpw {
+            let b = by * nbpw + bx;
+            let rb = &ref_mip1[b * 8..(b + 1) * 8];
+
+            let mut nogamma_pixels = [[0u8; 4]; 16];
+            for py in 0..4 { for px in 0..4 {
+                let fv = &nogamma_filtered[((by * 4 + py).min(nh - 1)) * nw + (bx * 4 + px).min(nw - 1)];
+                nogamma_pixels[py * 4 + px] = [
+                    x87_degamma_scale_floor(fv[0], 1.0, scale).clamp(0, 255) as u8,
+                    x87_degamma_scale_floor(fv[1], 1.0, scale).clamp(0, 255) as u8,
+                    x87_degamma_scale_floor(fv[2], 1.0, scale).clamp(0, 255) as u8,
+                    x87_float_to_u8(fv[3]),
+                ];
+            }}
+
+            let our_block = encode_dxt1_block(&nogamma_pixels, false, true);
+            total_count += 1;
+            if our_block == rb[..8] {
+                match_count += 1;
+            } else {
+                let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+                let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+                let rix = u32::from_le_bytes([rb[4], rb[5], rb[6], rb[7]]);
+                let oc0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+                let oc1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+                let oix = u32::from_le_bytes([our_block[4], our_block[5], our_block[6], our_block[7]]);
+
+                if rc0 == rc1 {
+                    mismatch_solid += 1;
+                } else {
+                    mismatch_nonsolid += 1;
+                }
+
+                let c0_diff = oc0 != rc0;
+                let c1_diff = oc1 != rc1;
+                let ix_diff = oix != rix;
+                if c0_diff && !c1_diff && !ix_diff { mismatch_c0_only += 1; }
+                else if !c0_diff && c1_diff && !ix_diff { mismatch_c1_only += 1; }
+                else if !c0_diff && !c1_diff && ix_diff { mismatch_ix_only += 1; }
+                else { mismatch_multi += 1; }
+
+                // Print first 5 mismatches in detail
+                if mismatch_solid + mismatch_nonsolid <= 5 {
+                    eprintln!("  MISMATCH ({},{}): ref c0={} c1={} ix={:08X}  ours c0={} c1={} ix={:08X}",
+                        bx, by, rc0, rc1, rix, oc0, oc1, oix);
+                }
+            }
+        }}
+
+        eprintln!("\n  Texture 6086415 no-gamma match: {}/{} ({:.2}%)",
+            match_count, total_count, match_count as f64 / total_count as f64 * 100.0);
+        eprintln!("  Mismatching blocks: {} ({} solid, {} non-solid)",
+            total_count - match_count, mismatch_solid, mismatch_nonsolid);
+        eprintln!("  Mismatch breakdown: c0-only={} c1-only={} ix-only={} multi={}",
+            mismatch_c0_only, mismatch_c1_only, mismatch_ix_only, mismatch_multi);
+    }
+
+    /// Diagnostic: list what textures are available in debug-run
+    ///
+    /// Run with: cargo test test_list_debug_textures -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_list_debug_textures() {
+        use crate::rdb::parse_le_index;
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let dbg_dir = base.join("game-installs/debug-run/RDB");
+        let dbg_idx_path = dbg_dir.join("le.idx");
+        if !dbg_idx_path.exists() {
+            eprintln!("  debug-run not available");
+            return;
+        }
+        let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
+
+        // Count by type and size
+        let type_1010004: Vec<_> = dbg_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255)
+            .collect();
+        eprintln!("  Total 1010004 entries: {}", type_1010004.len());
+
+        let mut size_counts = std::collections::HashMap::new();
+        for e in &type_1010004 {
+            *size_counts.entry(e.length).or_insert(0u32) += 1;
+        }
+        let mut sizes: Vec<_> = size_counts.into_iter().collect();
+        sizes.sort_by_key(|&(size, _)| size);
+        for (size, count) in &sizes {
+            eprintln!("    size={}: {} textures", size, count);
+        }
+
+        // Check the specific texture from the mismatch JSON
+        let target_id = 6086415u32;
+        let found = dbg_idx.entries.iter().find(|e| e.id == target_id);
+        match found {
+            Some(e) => eprintln!("  Texture {} found: type={} file={} length={}", target_id, e.rdb_type, e.file_num, e.length),
+            None => eprintln!("  Texture {} NOT found in debug-run index", target_id),
+        }
+    }
+
+    /// Compare gamma vs no-gamma pipeline match rates across real textures.
+    /// The no-gamma pipeline skips pow(val, 2.2) during linearization and
+    /// pow(val, 1/2.2) during degamma — just does linear u8 averaging via float.
+    ///
+    /// Run with: cargo test test_gamma_vs_nogamma_match_rate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_gamma_vs_nogamma_match_rate() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx_path = ref_dir.join("le.idx");
+        if !ref_idx_path.exists() {
+            eprintln!("  reference install not available, skipping");
+            return;
+        }
+        let ref_idx = parse_le_index(&ref_idx_path).unwrap();
+
+        let candidates: Vec<_> = ref_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088)
+            .collect();
+        if candidates.is_empty() {
+            eprintln!("  No suitable textures found");
+            return;
+        }
+
+        let block_size = 8usize;
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        let mut total_gamma_match = 0u64;
+        let mut total_nogamma_match = 0u64;
+        let mut total_both_match = 0u64;
+        let mut total_neither = 0u64;
+        let mut total_blocks = 0u64;
+        let mut textures_checked = 0u32;
+        let mut textures_skipped_pregen = 0u32;
+
+        let max_textures = 30;
+
+        for entry in &candidates {
+            if textures_checked >= max_textures { break; }
+
+            let fctx = {
+                let path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let mut file = std::fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            let width = 1usize << (fctx[16] as usize - 1);
+            let height = 1usize << (fctx[17] as usize - 1);
+            if width != 1024 || height != 1024 { continue; }
+
+            let mip0_size = (width / 4) * (height / 4) * block_size;
+            let mip1_size = (width / 8) * (height / 8) * block_size;
+            let ref_mip0 = &fctx[fctx.len() - mip0_size..];
+            let ref_mip1 = &fctx[fctx.len() - mip0_size - mip1_size..fctx.len() - mip0_size];
+
+            // Decode mip0
+            let bpw = width / 4;
+            let mut decoded_u8 = vec![[0u8; 4]; width * height];
+            for by in 0..(height / 4) {
+                for bx in 0..bpw {
+                    let off = (by * bpw + bx) * block_size;
+                    let bp = decode_dxt1_block(&ref_mip0[off..off + block_size]);
+                    for py in 0..4 { for px in 0..4 {
+                        decoded_u8[(by * 4 + py) * width + bx * 4 + px] = bp[py * 4 + px];
+                    }}
+                }
+            }
+
+            // Pre-generation detection: sample 64 blocks with gamma pipeline
+            {
+                let nbpw_m1 = width / 8;
+                let nbph_m1 = height / 8;
+                let row_step = (nbph_m1 / 8).max(1);
+                let col_step = (nbpw_m1 / 8).max(1);
+                let mut sample_match = 0usize;
+                let mut sample_total = 0usize;
+                for si in (0..nbph_m1).step_by(row_step) {
+                    for sj in (0..nbpw_m1).step_by(col_step) {
+                        let b = si * nbpw_m1 + sj;
+                        let mut bp_s = [[0u8; 4]; 16];
+                        for py in 0..4usize { for px in 0..4usize {
+                            let mx0 = ((sj*4 + px)*2).min(width-1);
+                            let my0 = ((si*4 + py)*2).min(height-1);
+                            let mx1 = (mx0 + 1).min(width-1);
+                            let my1 = (my0 + 1).min(height-1);
+                            let p00 = decoded_u8[my0*width+mx0];
+                            let p10 = decoded_u8[my0*width+mx1];
+                            let p01 = decoded_u8[my1*width+mx0];
+                            let p11 = decoded_u8[my1*width+mx1];
+                            let lin = |v: u8| x87_powf(v as f32 * recip255, gamma);
+                            let sx = (sj*4 + px) % 4;
+                            let mut fv = [0f32; 4];
+                            for c in 0..3usize {
+                                fv[c] = if sx == 1 {
+                                    x87_box_filter_f32(lin(p00[c]), lin(p10[c]), lin(p01[c]), lin(p11[c]))
+                                } else {
+                                    x87_box_filter_f32(lin(p10[c]), lin(p00[c]), lin(p01[c]), lin(p11[c]))
+                                };
+                            }
+                            fv[3] = (p00[3] as f32 + p10[3] as f32 + p01[3] as f32 + p11[3] as f32) * 0.25 * recip255;
+                            bp_s[py*4+px] = [
+                                x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0,255) as u8,
+                                x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0,255) as u8,
+                                x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0,255) as u8,
+                                x87_float_to_u8(fv[3]),
+                            ];
+                        }}
+                        let our_blk = encode_dxt1_block(&bp_s, false, true);
+                        if our_blk == ref_mip1[b*8..(b+1)*8] { sample_match += 1; }
+                        sample_total += 1;
+                    }
+                }
+                let is_pregen = sample_total > 0 && sample_match * 100 / sample_total < 50;
+                if is_pregen {
+                    textures_skipped_pregen += 1;
+                    continue;
+                }
+            }
+
+            // === GAMMA PATH ===
+            let gamma_linear: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [x87_powf(p[0] as f32 * recip255, gamma),
+                 x87_powf(p[1] as f32 * recip255, gamma),
+                 x87_powf(p[2] as f32 * recip255, gamma),
+                 p[3] as f32 * recip255]
+            }).collect();
+
+            let nw = width / 2;
+            let nh = height / 2;
+            let mut gamma_filtered = vec![[0.0f32; 4]; nw * nh];
+            for y in 0..nh { for x in 0..nw {
+                let x0 = (x * 2).min(width - 1);
+                let y0 = (y * 2).min(height - 1);
+                let x1 = (x * 2 + 1).min(width - 1);
+                let y1 = (y * 2 + 1).min(height - 1);
+                let pp00 = &gamma_linear[y0 * width + x0];
+                let pp10 = &gamma_linear[y0 * width + x1];
+                let pp01 = &gamma_linear[y1 * width + x0];
+                let pp11 = &gamma_linear[y1 * width + x1];
+                for c in 0..4 {
+                    gamma_filtered[y * nw + x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+
+            // === NO-GAMMA PATH ===
+            let nogamma_linear: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [p[0] as f32 * recip255,
+                 p[1] as f32 * recip255,
+                 p[2] as f32 * recip255,
+                 p[3] as f32 * recip255]
+            }).collect();
+
+            let mut nogamma_filtered = vec![[0.0f32; 4]; nw * nh];
+            for y in 0..nh { for x in 0..nw {
+                let x0 = (x * 2).min(width - 1);
+                let y0 = (y * 2).min(height - 1);
+                let x1 = (x * 2 + 1).min(width - 1);
+                let y1 = (y * 2 + 1).min(height - 1);
+                let pp00 = &nogamma_linear[y0 * width + x0];
+                let pp10 = &nogamma_linear[y0 * width + x1];
+                let pp01 = &nogamma_linear[y1 * width + x0];
+                let pp11 = &nogamma_linear[y1 * width + x1];
+                for c in 0..4 {
+                    nogamma_filtered[y * nw + x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+
+            // Compare each mip1 block
+            let nbpw = nw / 4;
+            let nbph = nh / 4;
+
+            let mut tex_gamma = 0u32;
+            let mut tex_nogamma = 0u32;
+            let mut tex_total = 0u32;
+
+            for by in 0..nbph { for bx in 0..nbpw {
+                let b = by * nbpw + bx;
+                let rb = &ref_mip1[b * 8..(b + 1) * 8];
+
+                // Gamma-path pixels
+                let mut gamma_pixels = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &gamma_filtered[((by * 4 + py).min(nh - 1)) * nw + (bx * 4 + px).min(nw - 1)];
+                    gamma_pixels[py * 4 + px] = [
+                        x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0, 255) as u8,
+                        x87_float_to_u8(fv[3]),
+                    ];
+                }}
+
+                // No-gamma-path pixels: just scale back to u8
+                let mut nogamma_pixels = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &nogamma_filtered[((by * 4 + py).min(nh - 1)) * nw + (bx * 4 + px).min(nw - 1)];
+                    nogamma_pixels[py * 4 + px] = [
+                        x87_degamma_scale_floor(fv[0], 1.0, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[1], 1.0, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[2], 1.0, scale).clamp(0, 255) as u8,
+                        x87_float_to_u8(fv[3]),
+                    ];
+                }}
+
+                let gamma_block = encode_dxt1_block(&gamma_pixels, false, true);
+                let nogamma_block = encode_dxt1_block(&nogamma_pixels, false, true);
+
+                let gamma_match = gamma_block == rb[..8];
+                let nogamma_match = nogamma_block == rb[..8];
+
+                if gamma_match { tex_gamma += 1; total_gamma_match += 1; }
+                if nogamma_match { tex_nogamma += 1; total_nogamma_match += 1; }
+                if gamma_match && nogamma_match { total_both_match += 1; }
+                if !gamma_match && !nogamma_match { total_neither += 1; }
+                tex_total += 1;
+                total_blocks += 1;
+            }}
+
+            eprintln!("  tex {}: gamma={}/{} ({:.1}%) nogamma={}/{} ({:.1}%)",
+                entry.id,
+                tex_gamma, tex_total, tex_gamma as f64 / tex_total as f64 * 100.0,
+                tex_nogamma, tex_total, tex_nogamma as f64 / tex_total as f64 * 100.0);
+            textures_checked += 1;
+        }
+
+        eprintln!("\n  Skipped {} pre-generated mip textures", textures_skipped_pregen);
+        eprintln!("  AGGREGATE ({} mip-generated textures, {} blocks):", textures_checked, total_blocks);
+        eprintln!("    gamma match:    {}/{} ({:.2}%)", total_gamma_match, total_blocks, total_gamma_match as f64 / total_blocks as f64 * 100.0);
+        eprintln!("    nogamma match:  {}/{} ({:.2}%)", total_nogamma_match, total_blocks, total_nogamma_match as f64 / total_blocks as f64 * 100.0);
+        eprintln!("    both match:     {}/{} ({:.2}%)", total_both_match, total_blocks, total_both_match as f64 / total_blocks as f64 * 100.0);
+        eprintln!("    neither match:  {}/{} ({:.2}%)", total_neither, total_blocks, total_neither as f64 / total_blocks as f64 * 100.0);
     }
 
 }
