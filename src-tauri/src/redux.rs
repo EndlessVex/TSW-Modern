@@ -3773,6 +3773,7 @@ mod tests {
 
         let mut total_blocks = 0usize;
         let mut matching_blocks = 0usize;
+        let mut first_dump = true;
 
         for &(id, width, height) in test_textures {
             let entry = ref_idx.entries.iter().find(|e| e.id == id)
@@ -3883,6 +3884,9 @@ mod tests {
                  p[2] as f32 * r255, p[3] as f32 * r255]
             }).collect();
 
+            let saved_mip0_f = cur_f.clone();
+            let saved_mip0_w = current_w;
+
             let mut tex_total = 0usize;
             let mut tex_match = 0usize;
 
@@ -3950,6 +3954,85 @@ mod tests {
                         if matched { mip_solid_match += 1; }
                     } else if matched {
                         mip_nonsolid_match += 1;
+                    }
+
+                    // For the first non-solid mismatch of texture 19767 mip1:
+                    if id == 19767 && mip_idx == 1 && !matched && !is_solid && first_dump {
+                        first_dump = false;
+                        let bx = b % nbx;
+                        let by = b / nbx;
+                        eprintln!("\n  === PIXEL DIAGNOSTIC: block ({},{}) ===", bx, by);
+
+                        // Our u8 pixels (re-derive from new_f)
+                        let mut bp_dump = [[0u8; 4]; 16];
+                        for py in 0..4 { for px in 0..4 {
+                            let fx = (bx*4+px).min(new_w-1);
+                            let fy = (by*4+py).min(new_h-1);
+                            let fv = &new_f[fy*new_w+fx];
+                            bp_dump[py*4+px] = [
+                                x87_float_to_u8(fv[0]), x87_float_to_u8(fv[1]),
+                                x87_float_to_u8(fv[2]), x87_float_to_u8(fv[3]),
+                            ];
+                            eprintln!("    px[{},{}]: u8=[{:3},{:3},{:3},{:3}]  f32=[{:.6},{:.6},{:.6},{:.6}]",
+                                px, py,
+                                bp_dump[py*4+px][0], bp_dump[py*4+px][1], bp_dump[py*4+px][2], bp_dump[py*4+px][3],
+                                fv[0], fv[1], fv[2], fv[3]);
+                        }}
+
+                        // Reference block
+                        let rc0 = u16::from_le_bytes([ref_block[0], ref_block[1]]);
+                        let rc1 = u16::from_le_bytes([ref_block[2], ref_block[3]]);
+                        let rix = u32::from_le_bytes([ref_block[4], ref_block[5], ref_block[6], ref_block[7]]);
+                        eprintln!("    Ref: c0=0x{:04X} c1=0x{:04X} ix=0x{:08X}", rc0, rc1, rix);
+
+                        let oc0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+                        let oc1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+                        let oix = u32::from_le_bytes([our_block[4], our_block[5], our_block[6], our_block[7]]);
+                        eprintln!("    Ours: c0=0x{:04X} c1=0x{:04X} ix=0x{:08X}", oc0, oc1, oix);
+
+                        // Decode reference and our block to compare pixels
+                        let ref_px = decode_dxt1_block(ref_block);
+                        let our_px = decode_dxt1_block(our_block);
+                        eprintln!("    --- Decoded reference vs our block ---");
+                        for i in 0..16 {
+                            let ppx = i % 4;
+                            let ppy = i / 4;
+                            if ref_px[i] != our_px[i] {
+                                eprintln!("    DIFF [{},{}]: ref=[{:3},{:3},{:3},{:3}] ours=[{:3},{:3},{:3},{:3}] input=[{:3},{:3},{:3},{:3}]",
+                                    ppx, ppy,
+                                    ref_px[i][0], ref_px[i][1], ref_px[i][2], ref_px[i][3],
+                                    our_px[i][0], our_px[i][1], our_px[i][2], our_px[i][3],
+                                    bp_dump[i][0], bp_dump[i][1], bp_dump[i][2], bp_dump[i][3]);
+                            }
+                        }
+
+                        // Dump source mip0 pixels for px(2,2) of this block
+                        let mpx = bx*4+2;
+                        let mpy = by*4+2;
+                        let x0 = (mpx*2).min(saved_mip0_w-1);
+                        let y0 = (mpy*2).min(saved_mip0_w-1);
+                        let x1 = (mpx*2+1).min(saved_mip0_w-1);
+                        let y1 = (mpy*2+1).min(saved_mip0_w-1);
+                        eprintln!("    Source mip0 pixels for px(2,2):");
+                        for &(sx,sy) in &[(x0,y0),(x1,y0),(x0,y1),(x1,y1)] {
+                            let u8px = decoded_u8[sy*saved_mip0_w+sx];
+                            let fpx = saved_mip0_f[sy*saved_mip0_w+sx];
+                            eprintln!("      ({:3},{:3}): u8=[{:3},{:3},{:3},{:3}] f32=[{:.8},{:.8},{:.8},{:.8}]",
+                                sx, sy, u8px[0], u8px[1], u8px[2], u8px[3], fpx[0], fpx[1], fpx[2], fpx[3]);
+                        }
+                        // Box filter computation for each channel
+                        let f00 = saved_mip0_f[y0*saved_mip0_w+x0];
+                        let f10 = saved_mip0_f[y0*saved_mip0_w+x1];
+                        let f01 = saved_mip0_f[y1*saved_mip0_w+x0];
+                        let f11 = saved_mip0_f[y1*saved_mip0_w+x1];
+                        for c in 0..3 {
+                            let bf = x87_box_filter_f32(f00[c], f10[c], f01[c], f11[c]);
+                            let u8val = x87_float_to_u8(bf);
+                            let simple = (f00[c] + f10[c] + f01[c] + f11[c]) * 0.25;
+                            let simple_u8 = (simple * 255.0) as u8;
+                            eprintln!("      ch{}: box_f32={:.8}  u8={}  simple_f32={:.8}  simple_u8={}",
+                                c, bf, u8val, simple, simple_u8);
+                        }
                     }
                 }
 
