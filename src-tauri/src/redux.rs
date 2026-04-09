@@ -7843,4 +7843,19 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn test_native_encoder_basic() {
+        // Test with 16 uniform gray pixels — should produce solid block
+        let pixels = [[128u8, 128, 128, 255]; 16];
+        let result = crate::encoder_native::native_encode_rangefit(&pixels);
+        assert!(result.is_some(), "Native encoder should be available");
+        let block = result.unwrap();
+        let c0 = u16::from_le_bytes([block[0], block[1]]);
+        let c1 = u16::from_le_bytes([block[2], block[3]]);
+        // Solid block: c0 == c1
+        assert_eq!(c0, c1, "Uniform pixels should produce solid block");
+        eprintln!("Native encoder: solid block c0=c1=0x{:04X}", c0);
+    }
+
 }

@@ -2,6 +2,7 @@ pub mod bxml;
 pub mod client_files;
 pub mod config;
 pub mod download;
+pub mod encoder_native;
 pub mod rdb;
 pub mod rdbdata;
 pub mod redux;
