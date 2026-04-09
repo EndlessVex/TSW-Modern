@@ -421,9 +421,15 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     let recip255: f32 = 1.0 / 255.0;
     let gamma: f32 = 2.2;
     let mut current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-        [x87_linearize(p[0] as f32, recip255, gamma),
-         x87_linearize(p[1] as f32, recip255, gamma),
-         x87_linearize(p[2] as f32, recip255, gamma),
+        // Two-step linearization matching the native: FUN_678F40 stores val*recip255
+        // as f32 (via fstp dword), then FUN_677FC0 loads it back (via fld dword) and
+        // applies pow. The f32 truncation between steps is critical — x87_linearize
+        // chains mul+pow at 53-bit precision without truncation, causing 41.5% of
+        // values to differ by 1 ULP. Confirmed via Frida: x87_powf matches native
+        // 100% (0/3960 mismatches), x87_linearize has 1643/3960 mismatches.
+        [x87_powf(p[0] as f32 * recip255, gamma),
+         x87_powf(p[1] as f32 * recip255, gamma),
+         x87_powf(p[2] as f32 * recip255, gamma),
          p[3] as f32 * recip255]
     }).collect();
 
@@ -1570,7 +1576,8 @@ fn decode_dxt1_block(data: &[u8]) -> [[u8; 4]; 16] {
 }
 
 /// Encode a solid-color DXT1 block matching the original game's approach:
-/// both endpoints set to the nearest RGB565 value, all indices = 0.
+/// both endpoints set to the same RGB565 value, all indices = 0.
+/// Fresh patcher output confirms: c0==c1, ix=0x00000000 for solid blocks.
 fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
     // Quantize to nearest RGB565 using round-to-nearest (matching the original's
     // floor(normalized * scale + 0.5) formula from the Compress4 decompilation)
@@ -1578,20 +1585,12 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
     let g6 = ((g as u16 * 63 + 127) / 255) as u16;
     let b5 = ((b as u16 * 31 + 127) / 255) as u16;
     let c0 = (r5 << 11) | (g6 << 5) | b5;
-    // The original uses 4-color mode (c0 > c1) even for solid blocks, with
-    // c0 = quantized value and c1 = c0 - 1. All indices = 0 (select c0).
-    // This differs from our previous c0==c1 encoding.
-    // The original's monochrome encoder (FUN_006807F0) uses bracket lookup
-    // tables that produce c0==c1 with all indices = 0.  However, during mip
-    // generation, the original's precision produces slightly varied pixel values
-    // (not truly monochrome), so the range-fit encoder runs instead, producing
-    // c0=quantized, c1=c0-1, indices=0xAAAAAAAA (all index 2).
-    // We match this by using c0>c1 4-color mode.
-    let c1 = if c0 > 0 { c0 - 1 } else { 0 };
+    // c0 == c1 with ix=0: all pixels select color 0 = c0. This is 3-color mode
+    // (c0 <= c1), but with all indices = 0, no pixel hits the transparent slot.
     let mut block = [0u8; 8];
     block[0..2].copy_from_slice(&c0.to_le_bytes());
-    block[2..4].copy_from_slice(&c1.to_le_bytes());
-    block[4..8].copy_from_slice(&0xAAAAAAAAu32.to_le_bytes());
+    block[2..4].copy_from_slice(&c0.to_le_bytes());
+    // indices = 0x00000000 (all select color 0)
     block
 }
 
@@ -2951,22 +2950,54 @@ fn encode_dxt1_block(pixels: &[[u8; 4]; 16], _force_3color: bool, for_mip: bool)
     let has_transparent = pixels.iter().any(|p| p[3] < 128);
 
     if has_transparent {
-        let opaque_count = pixels.iter().filter(|p| p[3] > 0).count();
+        // Opaque = alpha >= 128 (same threshold as has_transparent check)
+        let opaque_count = pixels.iter().filter(|p| p[3] >= 128).count();
 
         if opaque_count == 0 {
-            // All transparent — 3-color mode, all index 3.
-            // c0=0 < c1=1 guarantees 3-color mode.
+            // All transparent — 3-color mode (c0 <= c1), all index 3.
+            // Most native mip blocks use c0=0, c1=0xFFFF. Some use c0=c1=0.
+            // The c1 value doesn't affect rendering (no pixel uses c0 or c1).
             let mut out = [0u8; 8];
-            out[2] = 1; // c1 = 0x0001
+            out[2] = 0xFF; out[3] = 0xFF; // c1 = 0xFFFF
             out[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
             return out;
         }
 
-        // Mixed: some opaque, some transparent.
-        // Bounding box of opaque pixels for endpoints.
+        // Check if all opaque pixels share the same color (solid-transparent).
+        // The native encoder uses c0=0, c1=quantized_color for this case.
+        let first_opaque = pixels.iter().find(|p| p[3] >= 128).unwrap();
+        let first_rgb = (first_opaque[0], first_opaque[1], first_opaque[2]);
+        let all_opaque_same = pixels.iter()
+            .filter(|p| p[3] >= 128)
+            .all(|p| (p[0], p[1], p[2]) == first_rgb);
+
+        if all_opaque_same {
+            // Solid-transparent: c0=0, c1=quantized_color, opaque→idx 1, transparent→idx 3
+            let c1 = encode_rgb565(first_rgb.0, first_rgb.1, first_rgb.2);
+            let c0 = 0u16;
+            // Ensure 3-color mode: c0 <= c1. c0=0 is always <= c1.
+            // If c1 is also 0 (solid black + transparent), use c0=0, c1=1.
+            let (c0_final, c1_final) = if c1 == 0 { (0u16, 1u16) } else { (c0, c1) };
+            let mut indices = 0u32;
+            for (i, p) in pixels.iter().enumerate() {
+                if p[3] >= 128 {
+                    indices |= 1 << (i * 2); // index 1 = c1
+                } else {
+                    indices |= 3 << (i * 2); // index 3 = transparent
+                }
+            }
+            let mut out = [0u8; 8];
+            out[0..2].copy_from_slice(&c0_final.to_le_bytes());
+            out[2..4].copy_from_slice(&c1_final.to_le_bytes());
+            out[4..8].copy_from_slice(&indices.to_le_bytes());
+            return out;
+        }
+
+        // Mixed: some opaque, some transparent, varying colors.
+        // Bounding box of opaque pixels only (alpha >= 128) for endpoints.
         let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
         let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
-        for p in pixels.iter().filter(|p| p[3] > 0) {
+        for p in pixels.iter().filter(|p| p[3] >= 128) {
             min_r = min_r.min(p[0]); min_g = min_g.min(p[1]); min_b = min_b.min(p[2]);
             max_r = max_r.max(p[0]); max_g = max_g.max(p[1]); max_b = max_b.max(p[2]);
         }
@@ -4171,9 +4202,9 @@ mod tests {
         let recip255: f32 = 1.0 / 255.0;
         let gamma: f32 = 2.2;
         let current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-            [x87_linearize(p[0] as f32, recip255, gamma),
-             x87_linearize(p[1] as f32, recip255, gamma),
-             x87_linearize(p[2] as f32, recip255, gamma),
+            [x87_powf(p[0] as f32 * recip255, gamma),
+             x87_powf(p[1] as f32 * recip255, gamma),
+             x87_powf(p[2] as f32 * recip255, gamma),
              p[3] as f32 * recip255]
         }).collect();
 
@@ -4317,9 +4348,9 @@ mod tests {
 
         // Linearize — use x87_linearize (chains mul+pow without f32 truncation)
         let current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-            [x87_linearize(p[0] as f32, recip255, gamma),
-             x87_linearize(p[1] as f32, recip255, gamma),
-             x87_linearize(p[2] as f32, recip255, gamma),
+            [x87_powf(p[0] as f32 * recip255, gamma),
+             x87_powf(p[1] as f32 * recip255, gamma),
+             x87_powf(p[2] as f32 * recip255, gamma),
              p[3] as f32 * recip255]
         }).collect();
 
@@ -4368,7 +4399,7 @@ mod tests {
             u16::from_le_bytes([ref_mip1[b*8+2], ref_mip1[b*8+3]])
         }).count();
 
-        eprintln!("  Fresh patcher match (texture 6086415, {}x{} DXT1):", width, height);
+        eprintln!("  Fresh patcher match (texture {}, {}x{} DXT1):", entry.id, width, height);
         eprintln!("    {}/{} blocks match ({:.1}%)", matching, total, 100.0*matching as f64/total as f64);
         eprintln!("    Solid: {}/{}", solid, total);
 
@@ -8231,6 +8262,822 @@ mod tests {
         // Solid block: c0 == c1
         assert_eq!(c0, c1, "Uniform pixels should produce solid block");
         eprintln!("Native encoder: solid block c0=c1=0x{:04X}", c0);
+    }
+
+    /// Per-pixel pipeline trace: for the first mismatching non-solid blocks,
+    /// dump ALL intermediate f32/u8 values at each pipeline stage.
+    /// This is the key diagnostic for identifying where the composed pipeline
+    /// diverges from the native binary.
+    ///
+    /// Run with: cargo test perpixel_pipeline_trace -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_perpixel_pipeline_trace() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let dbg_dir = base.join("game-installs/debug-run/RDB");
+        let dbg_idx_path = dbg_dir.join("le.idx");
+        if !dbg_idx_path.exists() {
+            eprintln!("  debug-run not available, skipping");
+            return;
+        }
+        let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
+
+        // Find DXT1 textures (699088 bytes = 1024x1024 DXT1 FCTX)
+        let candidates: Vec<_> = dbg_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088)
+            .collect();
+        if candidates.is_empty() {
+            eprintln!("  No suitable textures in debug-run"); return;
+        }
+
+        let block_size = 8usize; // DXT1
+        let max_traces = 5; // Trace this many mismatching blocks
+        let mut traced = 0;
+
+        for entry in &candidates {
+            if traced >= max_traces { break; }
+
+            let fctx = {
+                let path = dbg_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let mut file = std::fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            let mip_count_w = fctx[16] as usize;
+            let mip_count_h = fctx[17] as usize;
+            let width = 1usize << (mip_count_w - 1);
+            let height = 1usize << (mip_count_h - 1);
+            let mip0_size = (width / 4) * (height / 4) * block_size;
+            let mip1_size = (width / 8) * (height / 8) * block_size;
+
+            let ref_mip0 = &fctx[fctx.len() - mip0_size..];
+            let ref_mip1 = &fctx[fctx.len() - mip0_size - mip1_size..fctx.len() - mip0_size];
+
+            // ── Step 1: Decode mip0 to u8 pixels ──
+            let bpw = width / 4;
+            let mut decoded_u8 = vec![[0u8; 4]; width * height];
+            for by in 0..(height / 4) {
+                for bx in 0..bpw {
+                    let off = (by * bpw + bx) * block_size;
+                    let bp = decode_dxt1_block(&ref_mip0[off..off + block_size]);
+                    for py in 0..4 { for px in 0..4 {
+                        decoded_u8[(by * 4 + py) * width + bx * 4 + px] = bp[py * 4 + px];
+                    }}
+                }
+            }
+
+            // ── Step 2: Linearize (u8 → f32, gamma) ──
+            let recip255: f32 = 1.0 / 255.0;
+            let gamma: f32 = 2.2;
+            let scale: f32 = 255.0;
+            let nw = width / 2;
+            let nh = height / 2;
+
+            let linear_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [x87_linearize(p[0] as f32, recip255, gamma),
+                 x87_linearize(p[1] as f32, recip255, gamma),
+                 x87_linearize(p[2] as f32, recip255, gamma),
+                 p[3] as f32 * recip255]
+            }).collect();
+
+            // ── Step 3: Box filter ──
+            let mut filtered_float = vec![[0.0f32; 4]; nw * nh];
+            for y in 0..nh { for x in 0..nw {
+                let x0 = (x * 2).min(width - 1);
+                let y0 = (y * 2).min(height - 1);
+                let x1 = (x * 2 + 1).min(width - 1);
+                let y1 = (y * 2 + 1).min(height - 1);
+                let pp00 = &linear_float[y0 * width + x0];
+                let pp10 = &linear_float[y0 * width + x1];
+                let pp01 = &linear_float[y1 * width + x0];
+                let pp11 = &linear_float[y1 * width + x1];
+                for c in 0..4 {
+                    filtered_float[y * nw + x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+
+            // ── Step 4: Degamma + encode ──
+            let nbpw = nw / 4;
+            let nbph = nh / 4;
+            let mut our_mip1 = Vec::with_capacity(mip1_size);
+            // Also store the u8 pixels per block for tracing
+            let mut block_u8s: Vec<[[u8; 4]; 16]> = Vec::with_capacity(nbpw * nbph);
+            for by in 0..nbph { for bx in 0..nbpw {
+                let mut bp = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &filtered_float[((by * 4 + py).min(nh - 1)) * nw + (bx * 4 + px).min(nw - 1)];
+                    bp[py * 4 + px] = [
+                        x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0, 255) as u8,
+                        x87_float_to_u8(fv[3]),
+                    ];
+                }}
+                block_u8s.push(bp);
+                our_mip1.extend_from_slice(&encode_dxt1_block(&bp, false, true));
+            }}
+
+            // ── Find mismatching non-solid blocks and trace them ──
+            let total = mip1_size / block_size;
+            for b in 0..total {
+                if traced >= max_traces { break; }
+                let rb = &ref_mip1[b * 8..(b + 1) * 8];
+                let ob = &our_mip1[b * 8..(b + 1) * 8];
+                if rb == ob { continue; }
+                // Skip solid blocks (less interesting)
+                let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+                let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+                if rc0 == rc1 { continue; }
+
+                traced += 1;
+                let bx = b % nbpw;
+                let by = b / nbpw;
+                let oc0 = u16::from_le_bytes([ob[0], ob[1]]);
+                let oc1 = u16::from_le_bytes([ob[2], ob[3]]);
+                let rix = u32::from_le_bytes([rb[4], rb[5], rb[6], rb[7]]);
+                let oix = u32::from_le_bytes([ob[4], ob[5], ob[6], ob[7]]);
+
+                eprintln!("\n{}", "=".repeat(72));
+                eprintln!("TRACE #{} — texture id={} block ({},{}) idx={}",
+                    traced, entry.id, bx, by, b);
+                eprintln!("  REF:  c0={:04X} c1={:04X} ix={:08X}", rc0, rc1, rix);
+                eprintln!("  OURS: c0={:04X} c1={:04X} ix={:08X}", oc0, oc1, oix);
+
+                // ── Source mip0 u8 pixels (8×8 region) ──
+                eprintln!("\n  SOURCE MIP0 u8 (8x8 region at ({}, {})):", bx * 8, by * 8);
+                for sy in 0..8 {
+                    let gy = by * 8 + sy;
+                    eprint!("    row {}: ", sy);
+                    for sx in 0..8 {
+                        let gx = bx * 8 + sx;
+                        if gx < width && gy < height {
+                            let p = &decoded_u8[gy * width + gx];
+                            eprint!("({:3},{:3},{:3}) ", p[0], p[1], p[2]);
+                        }
+                    }
+                    eprintln!();
+                }
+
+                // ── Linearized f32 values (8×8 region, channel 0 only for brevity) ──
+                eprintln!("\n  LINEARIZED f32 ch0 (8x8, pow(val/255, 2.2)):");
+                for sy in 0..8 {
+                    let gy = by * 8 + sy;
+                    eprint!("    row {}: ", sy);
+                    for sx in 0..8 {
+                        let gx = bx * 8 + sx;
+                        if gx < width && gy < height {
+                            eprint!("{:.6} ", linear_float[gy * width + gx][0]);
+                        }
+                    }
+                    eprintln!();
+                }
+
+                // ── Box-filtered f32 values (4×4 block) ──
+                eprintln!("\n  BOX-FILTERED f32 (4x4 block) — ALL channels:");
+                for py in 0..4 {
+                    let fy = by * 4 + py;
+                    for px in 0..4 {
+                        let fx = bx * 4 + px;
+                        let fv = &filtered_float[fy.min(nh - 1) * nw + fx.min(nw - 1)];
+                        eprintln!("    [{},{}] R={:.8} ({:08X}) G={:.8} ({:08X}) B={:.8} ({:08X}) A={:.8}",
+                            px, py,
+                            fv[0], fv[0].to_bits(), fv[1], fv[1].to_bits(),
+                            fv[2], fv[2].to_bits(), fv[3]);
+                    }
+                }
+
+                // ── Degamma'd u8 values (our encoder input) ──
+                eprintln!("\n  OUR DEGAMMA'd u8 (encoder input):");
+                let our_px = &block_u8s[b];
+                for py in 0..4 {
+                    eprint!("    row {}: ", py);
+                    for px in 0..4 {
+                        let p = &our_px[py * 4 + px];
+                        eprint!("({:3},{:3},{:3}) ", p[0], p[1], p[2]);
+                    }
+                    eprintln!();
+                }
+
+                // ── Decoded reference pixels (for visual comparison) ──
+                let ref_decoded = decode_dxt1_block(rb);
+                let our_decoded = decode_dxt1_block(ob);
+                eprintln!("\n  DECODED REFERENCE vs OURS (after DXT1 lossy roundtrip):");
+                for py in 0..4 {
+                    eprint!("    row {}: ", py);
+                    for px in 0..4 {
+                        let rp = &ref_decoded[py * 4 + px];
+                        let op = &our_decoded[py * 4 + px];
+                        let dr = (rp[0] as i32 - op[0] as i32).abs();
+                        let dg = (rp[1] as i32 - op[1] as i32).abs();
+                        let db = (rp[2] as i32 - op[2] as i32).abs();
+                        if dr == 0 && dg == 0 && db == 0 {
+                            eprint!("(=== ) ");
+                        } else {
+                            eprint!("(d{},{},{}) ", dr, dg, db);
+                        }
+                    }
+                    eprintln!();
+                }
+
+                // ── Key diagnostic: what u8 values would make the reference block? ──
+                // Feed our u8 pixels to encoder and show the exact encoder input
+                eprintln!("\n  ENCODER INPUT as BGRA u32 (for Frida comparison):");
+                eprint!("    [");
+                for i in 0..16 {
+                    let p = &our_px[i];
+                    let bgra = 0xFF000000u32 | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32);
+                    if i > 0 { eprint!(", "); }
+                    eprint!("0x{:08X}", bgra);
+                }
+                eprintln!("]");
+
+                // ── Per-pixel degamma detail: show float→u8 for each pixel ──
+                eprintln!("\n  DEGAMMA DETAIL (float → u8) for pixels with largest channel spread:");
+                let mut max_spread_px = 0;
+                let mut max_spread = 0i32;
+                for py in 0..4 { for px in 0..4 {
+                    let fy = by * 4 + py;
+                    let fx = bx * 4 + px;
+                    let fv = &filtered_float[fy.min(nh - 1) * nw + fx.min(nw - 1)];
+                    for c in 0..3 {
+                        let raw = x87_degamma_scale_floor(fv[c], gamma, scale);
+                        let spread = (raw - our_px[py * 4 + px][c] as i32).abs();
+                        if spread > max_spread {
+                            max_spread = spread;
+                            max_spread_px = py * 4 + px;
+                        }
+                    }
+                }}
+                // Show all 16 pixels' degamma detail
+                for py in 0..4 { for px in 0..4 {
+                    let pidx = py * 4 + px;
+                    let fy = by * 4 + py;
+                    let fx = bx * 4 + px;
+                    let fv = &filtered_float[fy.min(nh - 1) * nw + fx.min(nw - 1)];
+                    let u = &our_px[pidx];
+                    // Show the raw degamma i32 values (before clamp)
+                    let raw_r = x87_degamma_scale_floor(fv[0], gamma, scale);
+                    let raw_g = x87_degamma_scale_floor(fv[1], gamma, scale);
+                    let raw_b = x87_degamma_scale_floor(fv[2], gamma, scale);
+                    let marker = if pidx == max_spread_px { " <-- max spread" } else { "" };
+                    eprintln!("    px[{},{}]: lin=({:.6},{:.6},{:.6}) → raw_i32=({},{},{}) → u8=({},{},{}){}",
+                        px, py, fv[0], fv[1], fv[2], raw_r, raw_g, raw_b, u[0], u[1], u[2], marker);
+                }}
+
+                // ── Also try x87_powf path (two-step: store f32, then pow) for comparison ──
+                eprintln!("\n  ALTERNATE PATH (x87_powf instead of x87_linearize):");
+                let mut alt_differs = 0;
+                for sy in 0..2 { for sx in 0..2 {
+                    let gy = by * 8 + sy * 4;
+                    let gx = bx * 8 + sx * 4;
+                    if gx < width && gy < height {
+                        let p = &decoded_u8[gy * width + gx];
+                        for c in 0..3 {
+                            let via_linearize = x87_linearize(p[c] as f32, recip255, gamma);
+                            let base_f32 = p[c] as f32 * recip255;
+                            let via_powf = x87_powf(base_f32, gamma);
+                            if via_linearize.to_bits() != via_powf.to_bits() {
+                                alt_differs += 1;
+                                if alt_differs <= 4 {
+                                    eprintln!("    src({},{}) ch{}: linearize={:.8}({:08X}) powf={:.8}({:08X}) diff={}ULP",
+                                        gx, gy, c, via_linearize, via_linearize.to_bits(),
+                                        via_powf, via_powf.to_bits(),
+                                        (via_linearize.to_bits() as i32).wrapping_sub(via_powf.to_bits() as i32).abs());
+                                }
+                            }
+                        }
+                    }
+                }}
+                if alt_differs == 0 {
+                    eprintln!("    No differences between x87_linearize and x87_powf for corner pixels");
+                } else {
+                    eprintln!("    {} channel values differ between x87_linearize and x87_powf", alt_differs);
+                }
+            }
+        }
+
+        if traced == 0 {
+            eprintln!("  No mismatching non-solid blocks found!");
+        }
+        eprintln!("\n  Traced {} blocks total", traced);
+    }
+
+    /// For each mismatching non-solid mip1 block, call the native encoder
+    /// with our pixel values. If native encoder matches the reference, our
+    /// encoder is wrong. If native matches our encoder, our pixels are wrong.
+    ///
+    /// Run with: cargo test native_encoder_vs_reference -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_native_encoder_vs_reference() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let dbg_dir = base.join("game-installs/debug-run/RDB");
+        let dbg_idx_path = dbg_dir.join("le.idx");
+        if !dbg_idx_path.exists() { eprintln!("  debug-run not available"); return; }
+        let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
+
+        let candidates: Vec<_> = dbg_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088)
+            .collect();
+
+        let block_size = 8usize;
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        let mut native_matches_ref = 0u32;
+        let mut native_matches_ours = 0u32;
+        let mut native_matches_neither = 0u32;
+        let mut total_tested = 0u32;
+        let mut native_unavailable = false;
+
+        for entry in candidates.iter().take(5) { // First 5 textures
+            let fctx = {
+                let path = dbg_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let mut file = std::fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            let width = 1usize << (fctx[16] as usize - 1);
+            let height = 1usize << (fctx[17] as usize - 1);
+            let mip0_size = (width / 4) * (height / 4) * block_size;
+            let mip1_size = (width / 8) * (height / 8) * block_size;
+            let ref_mip0 = &fctx[fctx.len() - mip0_size..];
+            let ref_mip1 = &fctx[fctx.len() - mip0_size - mip1_size..fctx.len() - mip0_size];
+
+            let bpw = width / 4;
+            let mut decoded_u8 = vec![[0u8; 4]; width * height];
+            for by in 0..(height / 4) { for bx in 0..bpw {
+                let off = (by * bpw + bx) * block_size;
+                let bp = decode_dxt1_block(&ref_mip0[off..off + block_size]);
+                for py in 0..4 { for px in 0..4 {
+                    decoded_u8[(by * 4 + py) * width + bx * 4 + px] = bp[py * 4 + px];
+                }}
+            }}
+
+            let linear: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [x87_powf(p[0] as f32 * recip255, gamma),
+                 x87_powf(p[1] as f32 * recip255, gamma),
+                 x87_powf(p[2] as f32 * recip255, gamma),
+                 p[3] as f32 * recip255]
+            }).collect();
+
+            let nw = width / 2;
+            let nh = height / 2;
+            let nbpw = nw / 4;
+            let mut filtered = vec![[0.0f32; 4]; nw * nh];
+            for y in 0..nh { for x in 0..nw {
+                let x0 = (x*2).min(width-1); let y0 = (y*2).min(height-1);
+                let x1 = (x*2+1).min(width-1); let y1 = (y*2+1).min(height-1);
+                let pp00 = &linear[y0*width+x0]; let pp10 = &linear[y0*width+x1];
+                let pp01 = &linear[y1*width+x0]; let pp11 = &linear[y1*width+x1];
+                for c in 0..4 {
+                    filtered[y*nw+x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+
+            let total = mip1_size / block_size;
+            let mut tex_mismatch = 0;
+            for b in 0..total {
+                let rb = &ref_mip1[b*8..(b+1)*8];
+                let bx = b % nbpw;
+                let by = b / nbpw;
+
+                let mut bp = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &filtered[((by*4+py).min(nh-1))*nw + (bx*4+px).min(nw-1)];
+                    bp[py*4+px] = [
+                        x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0,255) as u8,
+                        x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0,255) as u8,
+                        x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0,255) as u8,
+                        x87_float_to_u8(fv[3]),
+                    ];
+                }}
+
+                let our_block = encode_dxt1_block(&bp, false, true);
+                if our_block == rb[..8] { continue; } // Matches, skip
+
+                // Skip solid blocks
+                let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+                let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+                if rc0 == rc1 { continue; }
+
+                // Call native encoder with our pixels
+                let native_result = crate::encoder_native::native_encode_rangefit(&bp);
+                if native_result.is_none() {
+                    if !native_unavailable {
+                        eprintln!("  Native encoder not available (wrong platform?)");
+                        native_unavailable = true;
+                    }
+                    continue;
+                }
+                let native_block = native_result.unwrap();
+
+                total_tested += 1;
+                if native_block == rb[..8] {
+                    native_matches_ref += 1;
+                    if tex_mismatch < 3 {
+                        tex_mismatch += 1;
+                        let nc0 = u16::from_le_bytes([native_block[0], native_block[1]]);
+                        let nc1 = u16::from_le_bytes([native_block[2], native_block[3]]);
+                        let oc0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+                        let oc1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+                        eprintln!("  ENCODER BUG block {} ({},{}): ref={:04X}/{:04X} native={:04X}/{:04X} ours={:04X}/{:04X}",
+                            b, bx, by, rc0, rc1, nc0, nc1, oc0, oc1);
+                    }
+                } else if native_block == our_block[..] {
+                    native_matches_ours += 1;
+                } else {
+                    native_matches_neither += 1;
+                }
+            }
+        }
+
+        eprintln!("\n=== Native encoder comparison ({} non-solid mismatching blocks) ===", total_tested);
+        eprintln!("  Native matches REFERENCE (our encoder wrong): {}", native_matches_ref);
+        eprintln!("  Native matches OURS (our pixels wrong):       {}", native_matches_ours);
+        eprintln!("  Native matches NEITHER:                       {}", native_matches_neither);
+    }
+
+    /// Compare Frida-captured native pipeline values against our pipeline
+    /// stage-by-stage to identify WHERE divergence first appears.
+    ///
+    /// Run with: cargo test frida_stage_comparison -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_frida_stage_comparison() {
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let trace_path = base.join("tools/full_stage_trace.json");
+        if !trace_path.exists() {
+            eprintln!("  Run tools/frida_full_stage_trace.py first");
+            return;
+        }
+        let raw = std::fs::read_to_string(&trace_path).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        // ── Stage 1→2: Compare gamma linearization ──
+        let pre_gamma = data["pre_gamma"].as_array().unwrap();
+        let post_gamma = data["post_gamma"].as_array().unwrap();
+
+        eprintln!("\n=== STAGE: Gamma linearization (native vs ours) ===");
+        let mut gamma_mismatches = 0;
+        let mut gamma_total = 0;
+        for i in 0..pre_gamma.len().min(post_gamma.len()) {
+            let pre_f32 = pre_gamma[i].as_f64().unwrap() as f32;
+            let native_post = post_gamma[i].as_f64().unwrap() as f32;
+
+            if pre_f32 == 0.0 && native_post == 0.0 { continue; }
+            gamma_total += 1;
+
+            // Reconstruct u8 from pre-gamma
+            let u8_val = (pre_f32 / recip255).round() as u8;
+
+            // Our linearization (both paths)
+            let our_linearize = x87_linearize(u8_val as f32, recip255, gamma);
+            let our_powf = x87_powf(pre_f32, gamma); // Use native's f32 as base
+
+            let lin_match = our_linearize.to_bits() == native_post.to_bits();
+            let powf_match = our_powf.to_bits() == native_post.to_bits();
+
+            if !lin_match || !powf_match {
+                gamma_mismatches += 1;
+                if gamma_mismatches <= 8 {
+                    eprintln!("  [{:3}] u8={:3} native={:08X} linearize={:08X}{} powf={:08X}{}",
+                        i, u8_val,
+                        native_post.to_bits(),
+                        our_linearize.to_bits(), if lin_match { " ✓" } else { " ✗" },
+                        our_powf.to_bits(), if powf_match { " ✓" } else { " ✗" });
+                }
+            }
+        }
+        eprintln!("  Gamma: {}/{} mismatches (linearize or powf vs native)",
+            gamma_mismatches, gamma_total);
+
+        // ── Stage 2→3: Compare box filter ──
+        // Feed NATIVE post-gamma values to our box filter, compare against native post-box
+        let post_box = data["post_box"].as_array();
+        let tex_w = data["tex_w"].as_u64().unwrap_or(0) as usize;
+        let tex_h = data["tex_h"].as_u64().unwrap_or(0) as usize;
+
+        if let Some(native_box) = post_box {
+            eprintln!("\n=== STAGE: Box filter (native post-gamma → our box → compare native post-box) ===");
+            let nw = tex_w / 2;
+            let nh = tex_h / 2;
+
+            // Build planar ch0 from native post-gamma (only channel 0)
+            let native_gamma_ch0: Vec<f32> = post_gamma.iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+
+            let mut box_mismatches = 0;
+            let mut box_total = 0;
+            let box_limit = native_box.len().min(nw * nh);
+            for i in 0..box_limit {
+                let native_boxed = native_box[i].as_f64().unwrap() as f32;
+                // Compute box filter: pixel (x,y) in mip1 comes from 2x2 at (x*2, y*2) in mip0
+                let x = i % nw;
+                let y = i / nw;
+                let x0 = (x * 2).min(tex_w - 1);
+                let y0 = (y * 2).min(tex_h - 1);
+                let x1 = (x * 2 + 1).min(tex_w - 1);
+                let y1 = (y * 2 + 1).min(tex_h - 1);
+
+                // Get native post-gamma values at these positions
+                let idx00 = y0 * tex_w + x0;
+                let idx10 = y0 * tex_w + x1;
+                let idx01 = y1 * tex_w + x0;
+                let idx11 = y1 * tex_w + x1;
+
+                if idx11 >= native_gamma_ch0.len() { continue; }
+
+                let p00 = native_gamma_ch0[idx00];
+                let p10 = native_gamma_ch0[idx10];
+                let p01 = native_gamma_ch0[idx01];
+                let p11 = native_gamma_ch0[idx11];
+
+                // Our box filter with the correct add order
+                let our_boxed = if x % 4 == 1 {
+                    x87_box_filter_f32(p00, p10, p01, p11)
+                } else {
+                    x87_box_filter_f32(p10, p00, p01, p11)
+                };
+
+                box_total += 1;
+                if our_boxed.to_bits() != native_boxed.to_bits() {
+                    box_mismatches += 1;
+                    if box_mismatches <= 8 {
+                        let diff_ulp = (our_boxed.to_bits() as i64 - native_boxed.to_bits() as i64).unsigned_abs();
+                        eprintln!("  [{:3}] ({:3},{:1}) native={:08X} ours={:08X} diff={}ULP  inputs=({:08X},{:08X},{:08X},{:08X})",
+                            i, x, y, native_boxed.to_bits(), our_boxed.to_bits(), diff_ulp,
+                            p10.to_bits(), p00.to_bits(), p01.to_bits(), p11.to_bits());
+                    }
+                }
+            }
+            eprintln!("  Box filter: {}/{} mismatches", box_mismatches, box_total);
+        }
+
+        // ── Stage 3→encoder: Compare degamma ──
+        // Feed NATIVE post-box values to our degamma, compare against native encoder input
+        let blocks = data["encoder_blocks"].as_array().unwrap();
+        if let Some(native_box) = post_box {
+            eprintln!("\n=== STAGE: Degamma + encode comparison ===");
+            let nw = tex_w / 2;
+            let nh = tex_h / 2;
+            let nbpw = nw / 4;
+
+            let native_box_ch0: Vec<f32> = native_box.iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+
+            // For each encoder block, the block at position (bx, by) in mip1:
+            // pixel (bx*4+px, by*4+py) maps to post_box index [(by*4+py)*nw + bx*4+px]
+            // But we only have ch0 — compare only the R channel
+            let mut degamma_mismatches = 0;
+            let mut degamma_total = 0;
+            let mut shown_detail = 0;
+
+            for (bi, block) in blocks.iter().enumerate() {
+                if bi >= 64 { break; } // Only mip1 blocks
+                let bx = bi % nbpw;
+                let by = bi / nbpw;
+                let native_px = block["px"].as_array().unwrap();
+
+                for py in 0..4 {
+                    for px in 0..4 {
+                        let fx = bx * 4 + px;
+                        let fy = by * 4 + py;
+                        if fy >= nh || fx >= nw { continue; }
+
+                        let box_idx = fy * nw + fx;
+                        if box_idx >= native_box_ch0.len() { continue; }
+
+                        let native_box_val = native_box_ch0[box_idx];
+
+                        // Native encoder input pixel (BGRA u32) → R channel
+                        let bgra = native_px[py * 4 + px].as_u64().unwrap() as u32;
+                        let native_r = ((bgra >> 16) & 0xFF) as u8;
+
+                        // Our degamma on the native box-filtered value
+                        let our_r = x87_degamma_scale_floor(native_box_val, gamma, scale)
+                            .clamp(0, 255) as u8;
+
+                        degamma_total += 1;
+                        if our_r != native_r {
+                            degamma_mismatches += 1;
+                            if shown_detail < 10 {
+                                shown_detail += 1;
+                                eprintln!("  block {} px({},{}) box_f32={:08X}({:.8}) native_R={} our_R={} diff={}",
+                                    bi, px, py, native_box_val.to_bits(), native_box_val,
+                                    native_r, our_r, (native_r as i32 - our_r as i32));
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("  Degamma: {}/{} R-channel mismatches", degamma_mismatches, degamma_total);
+        }
+
+        // ── Full pipeline comparison: our pipeline vs native encoder input ──
+        eprintln!("\n=== FULL PIPELINE: our gamma→box→degamma vs native encoder pixels ===");
+        // Reconstruct full ch0 from pre_gamma (we only have first 128 floats)
+        let captured_pixels = pre_gamma.len();
+        let full_ch0: Vec<f32> = pre_gamma.iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+
+        // Linearize with x87_powf (matching native per above results)
+        let our_gamma_ch0: Vec<f32> = full_ch0.iter()
+            .map(|&v| if v > 0.0 { x87_powf(v, gamma) } else { 0.0 })
+            .collect();
+
+        let nw = tex_w / 2;
+        let nh = tex_h / 2;
+        let nbpw = nw / 4;
+
+        // Box filter our gamma'd values (only where we have data)
+        let max_src_idx = captured_pixels.min(tex_w * tex_h);
+        let mut our_box_ch0 = vec![0.0f32; nw * nh];
+        for y in 0..nh {
+            for x in 0..nw {
+                let x0 = (x * 2).min(tex_w - 1);
+                let y0 = (y * 2).min(tex_h - 1);
+                let x1 = (x * 2 + 1).min(tex_w - 1);
+                let y1 = (y * 2 + 1).min(tex_h - 1);
+                let idx11 = y1 * tex_w + x1;
+                if idx11 >= max_src_idx { continue; }
+                let p00 = our_gamma_ch0[y0 * tex_w + x0];
+                let p10 = our_gamma_ch0[y0 * tex_w + x1];
+                let p01 = our_gamma_ch0[y1 * tex_w + x0];
+                let p11 = our_gamma_ch0[y1 * tex_w + x1];
+                our_box_ch0[y * nw + x] = if x % 4 == 1 {
+                    x87_box_filter_f32(p00, p10, p01, p11)
+                } else {
+                    x87_box_filter_f32(p10, p00, p01, p11)
+                };
+            }
+        }
+
+        // Degamma and compare against native encoder input (R channel only)
+        let mut full_mismatches = 0;
+        let mut full_total = 0;
+        let mut shown = 0;
+        for (bi, block) in blocks.iter().enumerate() {
+            if bi >= 64 { break; }
+            let bx = bi % nbpw;
+            let by = bi / nbpw;
+            let native_px = block["px"].as_array().unwrap();
+
+            for py in 0..4 { for px in 0..4 {
+                let fx = bx * 4 + px;
+                let fy = by * 4 + py;
+                if fy >= nh || fx >= nw { continue; }
+
+                let bgra = native_px[py * 4 + px].as_u64().unwrap() as u32;
+                let native_r = ((bgra >> 16) & 0xFF) as u8;
+
+                let our_box_val = our_box_ch0[fy * nw + fx];
+                let our_r = x87_degamma_scale_floor(our_box_val, gamma, scale)
+                    .clamp(0, 255) as u8;
+
+                full_total += 1;
+                if our_r != native_r {
+                    full_mismatches += 1;
+                    if shown < 10 {
+                        shown += 1;
+                        eprintln!("  block {} px({},{}) our_box={:08X} our_R={} native_R={} diff={}",
+                            bi, px, py, our_box_val.to_bits(), our_r, native_r,
+                            native_r as i32 - our_r as i32);
+                    }
+                }
+            }}
+        }
+        eprintln!("  Full pipeline: {}/{} R-channel mismatches ({:.1}%)",
+            full_mismatches, full_total,
+            100.0 * full_mismatches as f64 / full_total.max(1) as f64);
+    }
+
+    /// Measure encode_dxt1_range_fit accuracy against native-captured encoder blocks.
+    ///
+    /// Run with: cargo test encoder_pipeline_trace -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_encoder_pipeline_trace() {
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let trace_path = base.join("tools/pipeline_trace.json");
+        if !trace_path.exists() {
+            eprintln!("  pipeline_trace.json not found at {:?}", trace_path);
+            eprintln!("  Run tools/frida_pipeline_trace.py first");
+            return;
+        }
+
+        let raw = std::fs::read_to_string(&trace_path).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let blocks = data["blocks"].as_array().unwrap();
+        eprintln!("  Loaded {} blocks from pipeline_trace.json", blocks.len());
+
+        let mut total_tested = 0u32;
+        let mut full_match = 0u32;
+        let mut endpoint_match = 0u32;
+        let mut mismatches: Vec<(u32, u16, u16, u32, u16, u16, u32)> = Vec::new(); // (idx, rc0, rc1, rix, oc0, oc1, oix)
+
+        for (idx, block) in blocks.iter().enumerate() {
+            let ref_c0 = block["c0"].as_u64().unwrap() as u16;
+            let ref_c1 = block["c1"].as_u64().unwrap() as u16;
+
+            // Skip solid blocks — handled by a separate path
+            if ref_c0 == ref_c1 {
+                continue;
+            }
+
+            let ref_ix = block["ix"].as_u64().unwrap() as u32;
+            let px_arr = block["px"].as_array().unwrap();
+
+            // Convert BGRA u32 pixels to RGBA [u8; 4]
+            let mut pixels = [[0u8; 4]; 16];
+            for (i, px_val) in px_arr.iter().enumerate().take(16) {
+                let bgra = px_val.as_u64().unwrap() as u32;
+                let r = ((bgra >> 16) & 0xFF) as u8;
+                let g = ((bgra >> 8) & 0xFF) as u8;
+                let b = (bgra & 0xFF) as u8;
+                let a = ((bgra >> 24) & 0xFF) as u8;
+                pixels[i] = [r, g, b, a];
+            }
+
+            let our_block = encode_dxt1_range_fit(&pixels);
+            let our_c0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+            let our_c1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+            let our_ix = u32::from_le_bytes([our_block[4], our_block[5], our_block[6], our_block[7]]);
+
+            // Reconstruct reference 8-byte block for comparison
+            let ref_block: [u8; 8] = {
+                let mut b = [0u8; 8];
+                b[0..2].copy_from_slice(&ref_c0.to_le_bytes());
+                b[2..4].copy_from_slice(&ref_c1.to_le_bytes());
+                b[4..8].copy_from_slice(&ref_ix.to_le_bytes());
+                b
+            };
+
+            total_tested += 1;
+
+            if our_block == ref_block {
+                full_match += 1;
+            } else {
+                let endpoints_ok = our_c0 == ref_c0 && our_c1 == ref_c1;
+                if endpoints_ok {
+                    endpoint_match += 1;
+                }
+                if mismatches.len() < 5 {
+                    mismatches.push((idx as u32, ref_c0, ref_c1, ref_ix, our_c0, our_c1, our_ix));
+                }
+            }
+        }
+
+        eprintln!("\n=== Encoder pipeline trace ({} non-solid blocks) ===", total_tested);
+        eprintln!("  Full match (c0+c1+ix):   {}/{} ({:.1}%)",
+            full_match, total_tested,
+            100.0 * full_match as f64 / total_tested.max(1) as f64);
+        eprintln!("  Endpoint-only match:     {}/{} ({:.1}%)",
+            endpoint_match, total_tested,
+            100.0 * endpoint_match as f64 / total_tested.max(1) as f64);
+
+        if !mismatches.is_empty() {
+            eprintln!("\n  First {} mismatches:", mismatches.len());
+            for (idx, rc0, rc1, rix, oc0, oc1, oix) in &mismatches {
+                eprintln!("  [block {:3}] ref c0={:04X} c1={:04X} ix={:08X}  ours c0={:04X} c1={:04X} ix={:08X}",
+                    idx, rc0, rc1, rix, oc0, oc1, oix);
+            }
+        }
     }
 
 }
