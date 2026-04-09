@@ -9149,24 +9149,58 @@ mod tests {
 
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
         let trace_path = base.join("tools/pipeline_trace.json");
-        if !trace_path.exists() {
-            eprintln!("  pipeline_trace.json not found at {:?}", trace_path);
-            eprintln!("  Run tools/frida_pipeline_trace.py first");
+        let trace_1024_path = base.join("tools/pipeline_trace_1024.json");
+
+        // Collect blocks from both trace files. pipeline_trace_1024.json uses the
+        // "encoder_blocks" key; the original file uses "blocks".
+        let mut all_blocks: Vec<serde_json::Value> = Vec::new();
+        let mut sources: Vec<(String, usize)> = Vec::new(); // (file, block count)
+
+        if trace_path.exists() {
+            let raw = std::fs::read_to_string(&trace_path).unwrap();
+            let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if let Some(arr) = data["blocks"].as_array() {
+                sources.push(("pipeline_trace.json".to_string(), arr.len()));
+                all_blocks.extend(arr.iter().cloned());
+            }
+        }
+
+        if trace_1024_path.exists() {
+            let raw = std::fs::read_to_string(&trace_1024_path).unwrap();
+            let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let tex_w = data["tex_w"].as_u64().unwrap_or(0);
+            let tex_h = data["tex_h"].as_u64().unwrap_or(0);
+            if let Some(arr) = data["encoder_blocks"].as_array() {
+                eprintln!("  pipeline_trace_1024.json: {}x{} texture, {} blocks",
+                    tex_w, tex_h, arr.len());
+                sources.push((format!("pipeline_trace_1024.json ({}x{})", tex_w, tex_h), arr.len()));
+                all_blocks.extend(arr.iter().cloned());
+            }
+        }
+
+        if all_blocks.is_empty() {
+            eprintln!("  No trace files found. Run tools/frida_full_stage_trace.py first.");
             return;
         }
 
-        let raw = std::fs::read_to_string(&trace_path).unwrap();
-        let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for (src, n) in &sources {
+            eprintln!("  Loaded {} blocks from {}", n, src);
+        }
+        eprintln!("  Total blocks to test: {}", all_blocks.len());
 
-        let blocks = data["blocks"].as_array().unwrap();
-        eprintln!("  Loaded {} blocks from pipeline_trace.json", blocks.len());
+        // Track per-source stats for 1024 blocks specifically
+        let base_blocks_count = sources.first().map(|(_, n)| *n).unwrap_or(0);
 
         let mut total_tested = 0u32;
         let mut full_match = 0u32;
         let mut endpoint_match = 0u32;
         let mut mismatches: Vec<(u32, u16, u16, u32, u16, u16, u32)> = Vec::new(); // (idx, rc0, rc1, rix, oc0, oc1, oix)
 
-        for (idx, block) in blocks.iter().enumerate() {
+        // 1024-specific counters
+        let mut total_1024 = 0u32;
+        let mut match_1024 = 0u32;
+
+        for (idx, block) in all_blocks.iter().enumerate() {
             let ref_c0 = block["c0"].as_u64().unwrap() as u16;
             let ref_c1 = block["c1"].as_u64().unwrap() as u16;
 
@@ -9204,9 +9238,11 @@ mod tests {
             };
 
             total_tested += 1;
+            let is_1024_block = idx >= base_blocks_count;
 
             if our_block == ref_block {
                 full_match += 1;
+                if is_1024_block { match_1024 += 1; }
             } else {
                 let endpoints_ok = our_c0 == ref_c0 && our_c1 == ref_c1;
                 if endpoints_ok {
@@ -9216,15 +9252,22 @@ mod tests {
                     mismatches.push((idx as u32, ref_c0, ref_c1, ref_ix, our_c0, our_c1, our_ix));
                 }
             }
+            if is_1024_block { total_1024 += 1; }
         }
 
-        eprintln!("\n=== Encoder pipeline trace ({} non-solid blocks) ===", total_tested);
+        eprintln!("\n=== Encoder pipeline trace ({} non-solid blocks total) ===", total_tested);
         eprintln!("  Full match (c0+c1+ix):   {}/{} ({:.1}%)",
             full_match, total_tested,
             100.0 * full_match as f64 / total_tested.max(1) as f64);
         eprintln!("  Endpoint-only match:     {}/{} ({:.1}%)",
             endpoint_match, total_tested,
             100.0 * endpoint_match as f64 / total_tested.max(1) as f64);
+
+        if total_1024 > 0 {
+            eprintln!("\n  1024x1024 blocks specifically: {}/{} ({:.1}%)",
+                match_1024, total_1024,
+                100.0 * match_1024 as f64 / total_1024 as f64);
+        }
 
         if !mismatches.is_empty() {
             eprintln!("\n  First {} mismatches:", mismatches.len());
