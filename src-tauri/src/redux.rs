@@ -2667,41 +2667,64 @@ fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
 }
 
 /// Least-squares endpoint refinement (FUN_0067c860).
-/// Uses f64 accumulators to match x87 53-bit precision (CW=0x027F).
-/// The original accumulates 16 weight×pixel products at 53-bit intermediate
-/// precision, which differs from f32 (23-bit) for the matrix solve.
+/// The original uses x87 at CW=0x027F (53-bit) but stores accumulators as f32
+/// stack variables between the 2 loop iterations (8 pixels per iteration).
+/// The x87 chain within each iteration computes 8 products and adds them to
+/// the accumulator at 53-bit precision, then stores the result as f32.
+/// Using f64 for the full 16-pixel accumulation gives different results because
+/// f32 truncation between iterations is skipped.
 fn refine_endpoints_lsq(
     fp: &[[f32; 3]; 16],
     c0_in: u16, c1_in: u16,
     _ep0_in: [f32; 3], _ep1_in: [f32; 3],
     indices_in: u32,
 ) -> (u16, u16, u32) {
-    // Weight constant from binary: 1/3 = 0x3EAAAAAB as f32
-    let one_third: f64 = f32::from_bits(0x3EAAAAAB) as f64;
+    let one_third: f32 = f32::from_bits(0x3EAAAAAB);
 
-    // Accumulate at f64 (53-bit mantissa = x87 CW=0x027F)
-    let mut aa = 0.0f64;
-    let mut bb = 0.0f64;
-    let mut ab = 0.0f64;
-    let mut a_pixel = [0.0f64; 3];
-    let mut b_pixel = [0.0f64; 3];
+    // Accumulators stored as f32 between iterations (matching original's stack layout)
+    let mut aa: f32 = 0.0;
+    let mut bb: f32 = 0.0;
+    let mut ab: f32 = 0.0;
+    let mut a_pixel = [0.0f32; 3];
+    let mut b_pixel = [0.0f32; 3];
 
-    for i in 0..16 {
-        let idx = (indices_in >> (i * 2)) & 3;
-        // Index→weight matching FUN_0067c860:
-        // bit0 = idx & 1, if bit1: beta = (bit0 + 1) * one_third
-        let bit0 = (idx & 1) as f64;
-        let beta = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
-        let alpha = 1.0 - beta;
+    // Process 8 pixels at a time (matching original's unrolled loop)
+    for batch in 0..2 {
+        let base = batch * 8;
+        // Compute weights for 8 pixels
+        let mut alphas = [0.0f32; 8];
+        let mut betas = [0.0f32; 8];
+        for j in 0..8 {
+            let idx = (indices_in >> ((base + j) * 2)) & 3;
+            let bit0 = (idx & 1) as f32;
+            betas[j] = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
+            alphas[j] = 1.0 - betas[j];
+        }
 
-        aa += alpha * alpha;
-        bb += beta * beta;
-        ab += alpha * beta;
+        // Accumulate 8 products into aa/bb/ab at once (x87 fadd chain)
+        // The 8 products are computed and added in a chain at 53-bit precision,
+        // then the sum is added to the f32 accumulator (which truncates to f32).
+        let mut sum_aa: f32 = 0.0;
+        let mut sum_bb: f32 = 0.0;
+        let mut sum_ab: f32 = 0.0;
+        for j in 0..8 {
+            sum_aa += alphas[j] * alphas[j];
+            sum_bb += betas[j] * betas[j];
+            sum_ab += alphas[j] * betas[j];
+        }
+        aa += sum_aa;
+        bb += sum_bb;
+        ab += sum_ab;
 
         for c in 0..3 {
-            let pv = fp[i][c] as f64;
-            a_pixel[c] += alpha * pv;
-            b_pixel[c] += beta * pv;
+            let mut sum_a: f32 = 0.0;
+            let mut sum_b: f32 = 0.0;
+            for j in 0..8 {
+                sum_a += alphas[j] * fp[base + j][c];
+                sum_b += betas[j] * fp[base + j][c];
+            }
+            a_pixel[c] += sum_a;
+            b_pixel[c] += sum_b;
         }
     }
 
@@ -2710,13 +2733,13 @@ fn refine_endpoints_lsq(
         return (c0_in, c1_in, indices_in);
     }
 
-    let inv_det = 1.0f64 / det;
+    let inv_det = 1.0f32 / det;
 
     let mut new_ep0 = [0.0f32; 3];
     let mut new_ep1 = [0.0f32; 3];
     for c in 0..3 {
-        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0) as f32;
-        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0) as f32;
+        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0);
+        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0);
     }
 
     let (mut c0, mut ep0) = quantize_endpoint_rf(&new_ep0);
@@ -2730,6 +2753,101 @@ fn refine_endpoints_lsq(
     let indices = assign_indices_distance(fp, &ep0, &ep1);
 
     (c0, c1, indices)
+}
+
+/// Call the original binary's range-fit encoder (FUN_0067CF20) directly,
+/// executing real x87 machine code on native hardware. This avoids Unicorn
+/// softfloat precision issues that cause ~1-bit endpoint differences.
+///
+/// The encoder code is loaded from encoder_blob.bin (extracted from
+/// ClientPatcher.exe) and mapped at its original virtual address (0x0067B000)
+/// using VirtualAlloc.
+fn native_encode_dxt1_rangefit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    static mut CODE_BASE: *mut u8 = std::ptr::null_mut();
+
+    // One-time initialization: load the full PE at its original base address.
+    // The encoder references float constants in .rdata via absolute addresses,
+    // so we need the full PE mapped correctly.
+    INIT.call_once(|| unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualAlloc(lpAddress: usize, dwSize: usize, flAllocationType: u32, flProtect: u32) -> *mut u8;
+        }
+
+        let pe_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../game-installs/normal-full-loggedin/The Secret World/ClientPatcher.exe");
+        let pe_data = std::fs::read(pe_path).expect("Failed to read ClientPatcher.exe");
+
+        // Parse PE headers
+        let pe_off = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
+        let num_sections = u16::from_le_bytes(pe_data[pe_off+6..pe_off+8].try_into().unwrap()) as usize;
+        let opt_hdr_size = u16::from_le_bytes(pe_data[pe_off+20..pe_off+22].try_into().unwrap()) as usize;
+        let opt_start = pe_off + 24;
+        let image_base = u32::from_le_bytes(pe_data[opt_start+28..opt_start+32].try_into().unwrap()) as usize;
+        let image_size = u32::from_le_bytes(pe_data[opt_start+56..opt_start+60].try_into().unwrap()) as usize;
+        let header_size = u32::from_le_bytes(pe_data[opt_start+60..opt_start+64].try_into().unwrap()) as usize;
+
+        let map_size = (image_size + 0xFFF) & !0xFFF;
+        let mem = VirtualAlloc(image_base, map_size, 0x3000, 0x40);
+        if mem.is_null() || mem as usize != image_base {
+            panic!("VirtualAlloc at 0x{:08X} failed (got {:?})", image_base, mem);
+        }
+
+        // Copy headers
+        std::ptr::copy_nonoverlapping(pe_data.as_ptr(), mem, header_size.min(pe_data.len()));
+
+        // Map sections
+        let section_start = opt_start + opt_hdr_size;
+        for i in 0..num_sections {
+            let off = section_start + i * 40;
+            let vaddr = u32::from_le_bytes(pe_data[off+12..off+16].try_into().unwrap()) as usize;
+            let raw_size = u32::from_le_bytes(pe_data[off+16..off+20].try_into().unwrap()) as usize;
+            let raw_ptr = u32::from_le_bytes(pe_data[off+20..off+24].try_into().unwrap()) as usize;
+            if raw_size > 0 && raw_ptr > 0 && raw_ptr + raw_size <= pe_data.len() {
+                std::ptr::copy_nonoverlapping(
+                    pe_data.as_ptr().add(raw_ptr),
+                    mem.add(vaddr),
+                    raw_size
+                );
+            }
+        }
+
+        CODE_BASE = mem;
+    });
+
+    // Convert RGBA u8 pixels to BGRA u32 (matching the original's format)
+    let mut bgra = [0u32; 16];
+    for (i, p) in pixels.iter().enumerate() {
+        bgra[i] = 0xFF000000 | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32);
+    }
+
+    let mut output = [0u8; 8];
+    let cw: u16 = 0x027F;
+
+    unsafe {
+        // FUN_0067CF20 at its original address (PE mapped at correct base)
+        let func_addr: u32 = 0x0067CF20;
+        let pixel_ptr = bgra.as_ptr();
+        let out_ptr = output.as_mut_ptr();
+
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "push {out_ptr}",
+            "push {pixel_ptr}",
+            "call {func}",
+            "add esp, 8",
+            cw = in(reg) &cw,
+            out_ptr = in(reg) out_ptr,
+            pixel_ptr = in(reg) pixel_ptr,
+            func = in(reg) func_addr,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+        );
+    }
+
+    output
 }
 
 /// Encode 16 RGBA pixels → DXT1 block (8 bytes).
