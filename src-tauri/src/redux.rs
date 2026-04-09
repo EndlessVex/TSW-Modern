@@ -3465,6 +3465,44 @@ mod tests {
 
     #[test]
     #[test]
+    fn test_u8_to_float_precision() {
+        // Compare SSE float conversion vs x87 fild+fmul for u8→float
+        let recip255: f32 = 1.0 / 255.0;
+        let mut diffs = 0;
+        for v in 0..=255u8 {
+            // SSE: cvtsi2ss + mulss (24-bit result)
+            let sse_result = v as f32 * recip255;
+            // x87: fild + fmul (53-bit intermediate, stored as f32)
+            let x87_result: f32;
+            let iv = v as i32;
+            unsafe {
+                let cw: u16 = 0x027F;
+                let mut result: f32 = 0.0;
+                std::arch::asm!(
+                    "fldcw word ptr [{cw}]",
+                    "fild dword ptr [{iv}]",
+                    "fmul dword ptr [{recip}]",
+                    "fstp dword ptr [{out}]",
+                    cw = in(reg) &cw,
+                    iv = in(reg) &iv,
+                    recip = in(reg) &recip255,
+                    out = in(reg) &mut result,
+                    options(nostack),
+                );
+                x87_result = result;
+            }
+            if sse_result.to_bits() != x87_result.to_bits() {
+                diffs += 1;
+                if diffs <= 10 {
+                    eprintln!("  v={}: SSE=0x{:08X} ({:.10})  x87=0x{:08X} ({:.10})",
+                        v, sse_result.to_bits(), sse_result, x87_result.to_bits(), x87_result);
+                }
+            }
+        }
+        eprintln!("  u8→float: {}/256 values differ between SSE and x87", diffs);
+    }
+
+    #[test]
     fn test_linearize_vs_powf() {
         // Check if x87_linearize produces different results from x87_powf
         let recip255: f32 = 1.0 / 255.0;
@@ -4201,16 +4239,19 @@ mod tests {
         }
         let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
 
-        // Try texture 6086415 first (100% opaque, verified 98.9% match), fall back to any 699088-byte DXT1
-        let entry = dbg_idx.entries.iter()
-            .find(|e| e.id == 6086415 && e.rdb_type == 1010004 && e.file_num != 255)
-            .or_else(|| dbg_idx.entries.iter()
-                .find(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088));
-        let entry = match entry {
-            Some(e) => e,
-            None => { eprintln!("  No suitable texture found in debug-run"); return; }
-        };
-        eprintln!("  Using texture ID {}", entry.id);
+        // Test ALL available 699088-byte DXT1 textures
+        let candidates: Vec<_> = dbg_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088)
+            .collect();
+        if candidates.is_empty() {
+            eprintln!("  No suitable textures in debug-run"); return;
+        }
+        eprintln!("  Testing {} textures of size 699088 (DXT1 ~1024x1024)", candidates.len());
+
+        let mut total_all = 0usize;
+        let mut match_all = 0usize;
+
+        for entry in &candidates {
 
         let fctx = {
             let path = dbg_dir.join(format!("{:02}.rdbdata", entry.file_num));
@@ -4408,6 +4449,13 @@ mod tests {
             eprintln!("    block {}: ref c0={:04X} c1={:04X} ix={:08X}  ours c0={:04X} c1={:04X} ix={:08X}",
                 b, rc0, rc1, rix, oc0, oc1, oix);
         }
+
+        total_all += total;
+        match_all += matching;
+        } // end for entry in candidates
+
+        eprintln!("\n  AGGREGATE: {}/{} blocks match ({:.1}%)", match_all, total_all,
+            100.0*match_all as f64/total_all as f64);
     }
 
     #[test]
