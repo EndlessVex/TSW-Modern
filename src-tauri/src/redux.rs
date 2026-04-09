@@ -698,9 +698,10 @@ fn x87_powf(base: f32, exp: f32) -> f32 {
         return 0.0;
     }
     // x87 pow using FYL2X + F2XM1 + FSCALE, matching FUN_682EE0.
-    // Keeps all intermediates at 80-bit extended precision.
+    // Uses CW=0x027F (53-bit, MSVC default) to match the original's precision.
+    // FUN_682EE0 does NOT set the CW — it inherits the MSVC default.
     let mut result: f32 = 0.0;
-    let cw: u16 = 0x037F; // 80-bit precision, round-to-nearest
+    let cw: u16 = 0x027F; // 53-bit precision (MSVC default), NOT 0x037F
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw}]",
@@ -735,8 +736,8 @@ fn x87_pow_scale_floor(base: f32, exp: f32, scale: f32) -> i32 {
         return 0;
     }
     let mut result: i32 = 0;
-    let cw_ext: u16 = 0x037F;  // 80-bit precision, round-to-nearest
-    let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation (round toward zero)
+    let cw_ext: u16 = 0x027F;  // 53-bit precision (MSVC default)
+    let cw_trunc: u16 = 0x0E7F; // 53-bit precision, truncation (round toward zero)
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw_ext}]",
