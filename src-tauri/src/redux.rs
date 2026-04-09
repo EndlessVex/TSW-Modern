@@ -6555,4 +6555,191 @@ mod tests {
         eprintln!("  All {} pow values match FUN_682EE0 exactly", test_cases.len());
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test gamma_overlap_analysis -- --ignored --nocapture
+    fn gamma_overlap_analysis() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx"))
+            .expect("Failed to parse le.idx");
+        let block_size = 8usize;
+        let fctx_header_size = 24usize;
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma_val: f32 = 2.2;
+        let inv_gamma: f32 = 1.0 / 2.2;
+        let scale255: f32 = 255.0;
+
+        let (id, width, height) = (19767u32, 512usize, 512usize);
+        let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+        let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+        let ref_data = {
+            let mut file = std::fs::File::open(&ref_path).unwrap();
+            file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        // Extract mip levels
+        let mut mip_sizes = Vec::new();
+        let (mut w, mut h) = (width, height);
+        loop {
+            mip_sizes.push(((w+3)/4)*((h+3)/4)*block_size);
+            if w<=1 && h<=1 { break; }
+            w=(w/2).max(1); h=(h/2).max(1);
+        }
+        let mut ref_mips: Vec<&[u8]> = Vec::new();
+        let mut off = fctx_header_size;
+        for i in (0..mip_sizes.len()).rev() {
+            ref_mips.push(&ref_data[off..off+mip_sizes[i]]);
+            off += mip_sizes[i];
+        }
+        ref_mips.reverse();
+
+        // Decode mip0
+        let (mip0_w, mip0_h) = (width, height);
+        let pbx = (mip0_w/4).max(1);
+        let pby = (mip0_h/4).max(1);
+        let mut decoded = vec![[0u8;4]; mip0_w*mip0_h];
+        for by in 0..pby { for bx in 0..pbx {
+            let o = (by*pbx+bx)*block_size;
+            if o+block_size > ref_mips[0].len() { continue; }
+            let px = decode_dxt1_block(&ref_mips[0][o..o+block_size]);
+            for py in 0..4 { for ppx in 0..4 {
+                let (xx,yy) = (bx*4+ppx, by*4+py);
+                if xx<mip0_w && yy<mip0_h { decoded[yy*mip0_w+xx] = px[py*4+ppx]; }
+            }}
+        }}
+
+        let (mip1_w, mip1_h) = (width/2, height/2);
+        let nbx = (mip1_w/4).max(1);
+        let nby = (mip1_h/4).max(1);
+        let num_blocks = nbx * nby;
+
+        // === No-gamma mip1 ===
+        let mut nogamma_f = vec![[0.0f32;4]; mip0_w*mip0_h];
+        for (i,p) in decoded.iter().enumerate() {
+            nogamma_f[i] = [p[0] as f32*recip255, p[1] as f32*recip255,
+                            p[2] as f32*recip255, p[3] as f32*recip255];
+        }
+        let mut ng_filtered = vec![[0.0f32;4]; mip1_w*mip1_h];
+        for y in 0..mip1_h { for x in 0..mip1_w {
+            let (x0,y0) = ((x*2).min(mip0_w-1),(y*2).min(mip0_h-1));
+            let (x1,y1) = ((x*2+1).min(mip0_w-1),(y*2+1).min(mip0_h-1));
+            for c in 0..4 {
+                ng_filtered[y*mip1_w+x][c] = x87_box_filter_f32(
+                    nogamma_f[y0*mip0_w+x0][c], nogamma_f[y0*mip0_w+x1][c],
+                    nogamma_f[y1*mip0_w+x0][c], nogamma_f[y1*mip0_w+x1][c]);
+            }
+        }}
+        let mut ng_mip = Vec::with_capacity(num_blocks*block_size);
+        for by in 0..nby { for bx in 0..nbx {
+            let mut bp = [[0u8;4];16];
+            for py in 0..4 { for px in 0..4 {
+                let fv = &ng_filtered[((by*4+py).min(mip1_h-1))*mip1_w+(bx*4+px).min(mip1_w-1)];
+                bp[py*4+px] = [x87_float_to_u8(fv[0]), x87_float_to_u8(fv[1]),
+                               x87_float_to_u8(fv[2]), x87_float_to_u8(fv[3])];
+            }}
+            ng_mip.extend_from_slice(&encode_dxt1_block(&bp, false, true));
+        }}
+
+        // === Gamma mip1 ===
+        let mut gamma_f = vec![[0.0f32;4]; mip0_w*mip0_h];
+        for (i,p) in decoded.iter().enumerate() {
+            let fv = [p[0] as f32*recip255, p[1] as f32*recip255,
+                      p[2] as f32*recip255, p[3] as f32*recip255];
+            gamma_f[i] = [x87_powf(fv[0], gamma_val), x87_powf(fv[1], gamma_val),
+                          x87_powf(fv[2], gamma_val), fv[3]];
+        }
+        let mut gm_filtered = vec![[0.0f32;4]; mip1_w*mip1_h];
+        for y in 0..mip1_h { for x in 0..mip1_w {
+            let (x0,y0) = ((x*2).min(mip0_w-1),(y*2).min(mip0_h-1));
+            let (x1,y1) = ((x*2+1).min(mip0_w-1),(y*2+1).min(mip0_h-1));
+            for c in 0..4 {
+                gm_filtered[y*mip1_w+x][c] = x87_box_filter_f32(
+                    gamma_f[y0*mip0_w+x0][c], gamma_f[y0*mip0_w+x1][c],
+                    gamma_f[y1*mip0_w+x0][c], gamma_f[y1*mip0_w+x1][c]);
+            }
+        }}
+        let mut gm_mip = Vec::with_capacity(num_blocks*block_size);
+        for by in 0..nby { for bx in 0..nbx {
+            let mut bp = [[0u8;4];16];
+            for py in 0..4 { for px in 0..4 {
+                let fv = &gm_filtered[((by*4+py).min(mip1_h-1))*mip1_w+(bx*4+px).min(mip1_w-1)];
+                for c in 0..3 {
+                    let v = x87_pow_scale_floor(fv[c], inv_gamma, scale255);
+                    bp[py*4+px][c] = v.clamp(0, 255) as u8;
+                }
+                bp[py*4+px][3] = x87_float_to_u8(fv[3]);
+            }}
+            gm_mip.extend_from_slice(&encode_dxt1_block(&bp, false, true));
+        }}
+
+        // === Compare ===
+        let ref_mip1 = ref_mips[1];
+        let mut both = 0usize;
+        let mut ng_only = 0usize;
+        let mut gm_only = 0usize;
+        let mut neither = 0usize;
+        let mut ref_solid = 0usize;
+
+        for b in 0..num_blocks {
+            let rb = &ref_mip1[b*8..(b+1)*8];
+            let ng = &ng_mip[b*8..(b+1)*8];
+            let gm = &gm_mip[b*8..(b+1)*8];
+            let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+            let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+            if rc0 == rc1 { ref_solid += 1; }
+            let ng_match = ng == rb;
+            let gm_match = gm == rb;
+            if ng_match && gm_match { both += 1; }
+            else if ng_match { ng_only += 1; }
+            else if gm_match { gm_only += 1; }
+            else { neither += 1; }
+        }
+
+        eprintln!("\n=== Gamma vs No-Gamma Overlap (ID {} mip1, {} blocks) ===", id, num_blocks);
+        eprintln!("  Reference solid blocks: {}", ref_solid);
+        eprintln!("  Match BOTH:        {:>5} ({:.1}%)", both, both as f64/num_blocks as f64*100.0);
+        eprintln!("  No-gamma ONLY:     {:>5} ({:.1}%)", ng_only, ng_only as f64/num_blocks as f64*100.0);
+        eprintln!("  Gamma ONLY:        {:>5} ({:.1}%)", gm_only, gm_only as f64/num_blocks as f64*100.0);
+        eprintln!("  NEITHER:           {:>5} ({:.1}%)", neither, neither as f64/num_blocks as f64*100.0);
+        eprintln!("  No-gamma total:    {:>5} ({:.1}%)", both+ng_only, (both+ng_only) as f64/num_blocks as f64*100.0);
+        eprintln!("  Gamma total:       {:>5} ({:.1}%)", both+gm_only, (both+gm_only) as f64/num_blocks as f64*100.0);
+
+        // Show first 10 "gamma ONLY" blocks (blocks gamma gets right that no-gamma doesn't)
+        let mut printed = 0;
+        for b in 0..num_blocks {
+            if printed >= 10 { break; }
+            let rb = &ref_mip1[b*8..(b+1)*8];
+            let ng = &ng_mip[b*8..(b+1)*8];
+            let gm = &gm_mip[b*8..(b+1)*8];
+            if gm == rb && ng != rb {
+                let bx = b % nbx; let by = b / nbx;
+                eprintln!("  [gamma-only] block ({},{}) ref={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    bx, by, rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7]);
+                printed += 1;
+            }
+        }
+
+        // Show first 10 "no-gamma ONLY" blocks
+        printed = 0;
+        for b in 0..num_blocks {
+            if printed >= 10 { break; }
+            let rb = &ref_mip1[b*8..(b+1)*8];
+            let ng = &ng_mip[b*8..(b+1)*8];
+            let gm = &gm_mip[b*8..(b+1)*8];
+            if ng == rb && gm != rb {
+                let bx = b % nbx; let by = b / nbx;
+                eprintln!("  [ng-only] block ({},{}) ref={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    bx, by, rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7]);
+                printed += 1;
+            }
+        }
+    }
+
 }
