@@ -1575,22 +1575,41 @@ fn decode_dxt1_block(data: &[u8]) -> [[u8; 4]; 16] {
     pixels
 }
 
-/// Encode a solid-color DXT1 block matching the original game's approach:
-/// both endpoints set to the same RGB565 value, all indices = 0.
-/// Fresh patcher output confirms: c0==c1, ix=0x00000000 for solid blocks.
+/// Encode a solid-color DXT1 block using bracket quantization to match the
+/// native encoder's sub-RGB565 precision. For each channel, two neighboring
+/// quantized values (lo, hi) bracket the input, and index 2 (2/3*c0 + 1/3*c1)
+/// blends them to reconstruct the original value more accurately than a single
+/// rounded endpoint.
 fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
-    // Quantize to nearest RGB565 using round-to-nearest (matching the original's
-    // floor(normalized * scale + 0.5) formula from the Compress4 decompilation)
-    let r5 = ((r as u16 * 31 + 127) / 255) as u16;
-    let g6 = ((g as u16 * 63 + 127) / 255) as u16;
-    let b5 = ((b as u16 * 31 + 127) / 255) as u16;
-    let c0 = (r5 << 11) | (g6 << 5) | b5;
-    // c0 == c1 with ix=0: all pixels select color 0 = c0. This is 3-color mode
-    // (c0 <= c1), but with all indices = 0, no pixel hits the transparent slot.
+    let [r5_0, r5_1] = DXT1_SOLID_5BIT[r as usize];
+    let [g6_0, g6_1] = DXT1_SOLID_6BIT[g as usize];
+    let [b5_0, b5_1] = DXT1_SOLID_5BIT[b as usize];
+
+    let c0 = ((r5_0 as u16) << 11) | ((g6_0 as u16) << 5) | (b5_0 as u16);
+    let c1 = ((r5_1 as u16) << 11) | ((g6_1 as u16) << 5) | (b5_1 as u16);
+
     let mut block = [0u8; 8];
-    block[0..2].copy_from_slice(&c0.to_le_bytes());
-    block[2..4].copy_from_slice(&c0.to_le_bytes());
-    // indices = 0x00000000 (all select color 0)
+    if c0 > c1 {
+        // 4-color mode: c0 > c1. Index 2 = 2/3*c0 + 1/3*c1.
+        block[0..2].copy_from_slice(&c0.to_le_bytes());
+        block[2..4].copy_from_slice(&c1.to_le_bytes());
+        block[4..8].copy_from_slice(&0xAAAAAAAAu32.to_le_bytes());
+    } else if c0 < c1 {
+        // Swap endpoints so c0 > c1 (required for 4-color mode).
+        // Swapping c0/c1 maps index 2 → index 1 via XOR with 0x55555555:
+        // 0xAAAAAAAA ^ 0x55555555 = 0xFFFFFFFF (all index 3 = 1/3*c0 + 2/3*c1,
+        // which after the swap equals the original index 2 blend).
+        block[0..2].copy_from_slice(&c1.to_le_bytes());
+        block[2..4].copy_from_slice(&c0.to_le_bytes());
+        block[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    } else {
+        // c0 == c1: extreme values (e.g. 0 or 255) where both bracket endpoints
+        // are identical. All indices = 0 selects c0 directly.
+        block[0..2].copy_from_slice(&c0.to_le_bytes());
+        block[2..4].copy_from_slice(&c1.to_le_bytes());
+        // indices stay 0x00000000
+    }
+
     block
 }
 
