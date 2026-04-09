@@ -414,11 +414,17 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    // Convert to f32 [0,1] (matching FUN_678F40: val * (1/255))
+    // Convert to f32 [0,1] and gamma-linearize channels 0-2.
+    // The original always applies gamma=2.2 linearization (FUN_677FC0) before
+    // box filtering, confirmed via Frida trace: FUN_6554E0 always sets gamma=2.2
+    // and FUN_677FC0 is called once per unique texture (511/511 = 100%).
     let recip255: f32 = 1.0 / 255.0;
+    let gamma: f32 = 2.2;
     let mut current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-        [p[0] as f32 * recip255, p[1] as f32 * recip255,
-         p[2] as f32 * recip255, p[3] as f32 * recip255]
+        [x87_powf(p[0] as f32 * recip255, gamma),
+         x87_powf(p[1] as f32 * recip255, gamma),
+         x87_powf(p[2] as f32 * recip255, gamma),
+         p[3] as f32 * recip255]
     }).collect();
 
     for mip_idx in 1..mip_count {
@@ -444,7 +450,11 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
             }
         }
 
-        // Convert to uint8 for encoding (fistp round-to-nearest-even)
+        // Convert to uint8 for encoding: degamma channels 0-2 via
+        // pow(val, 1/2.2) * 255, floor (matching FUN_679220 + FUN_681C10).
+        // Channel 3 (alpha) uses direct floor(val * 255) (matching FUN_679070).
+        let inv_gamma: f32 = 1.0f32 / 2.2f32;
+        let scale: f32 = 255.0;
         let new_bx = (new_w / 4).max(1);
         let new_by = (new_h / 4).max(1);
         let mut mip_data = Vec::with_capacity(new_bx * new_by * block_size);
@@ -457,9 +467,9 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
                         let fy = (by * 4 + py).min(new_h - 1);
                         let fv = &new_float[fy * new_w + fx];
                         block_pixels[py * 4 + px] = [
-                            x87_float_to_u8(fv[0]),
-                            x87_float_to_u8(fv[1]),
-                            x87_float_to_u8(fv[2]),
+                            x87_pow_scale_floor(fv[0], inv_gamma, scale).clamp(0, 255) as u8,
+                            x87_pow_scale_floor(fv[1], inv_gamma, scale).clamp(0, 255) as u8,
+                            x87_pow_scale_floor(fv[2], inv_gamma, scale).clamp(0, 255) as u8,
                             x87_float_to_u8(fv[3]),
                         ];
                     }
