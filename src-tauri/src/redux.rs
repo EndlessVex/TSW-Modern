@@ -7245,4 +7245,80 @@ mod tests {
         }
     }
 
+    /// Feed ACTUAL pixel values captured from the live binary (via Frida)
+    /// into our range-fit encoder and compare output.
+    #[test]
+    #[ignore]
+    fn test_captured_pixel_pairs() {
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let pairs_path = base.join("tools/captured_pixel_pairs.json");
+        let data = std::fs::read_to_string(&pairs_path)
+            .expect("Run frida_pixel_capture2.py first to generate captured_pixel_pairs.json");
+
+        let pairs: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
+        eprintln!("Loaded {} pairs from Frida capture", pairs.len());
+
+        let mut total = 0usize;
+        let mut match_full = 0usize;
+        let mut match_c0c1 = 0usize;
+        let mut match_c0 = 0usize;
+        let mut solid = 0usize;
+        let mut printed = 0usize;
+
+        for pair in &pairs {
+            let ref_c0 = pair["c0"].as_u64().unwrap() as u16;
+            let ref_c1 = pair["c1"].as_u64().unwrap() as u16;
+            let ref_idx = pair["ix"].as_u64().unwrap() as u32;
+            let px_arr = pair["px"].as_array().unwrap();
+
+            if ref_c0 == ref_c1 { solid += 1; continue; }
+            total += 1;
+
+            // Decode BGRA u32 → RGBA u8 pixels
+            let mut pixels = [[0u8; 4]; 16];
+            for (i, v) in px_arr.iter().enumerate().take(16) {
+                let bgra = v.as_u64().unwrap() as u32;
+                pixels[i] = [
+                    ((bgra >> 16) & 0xFF) as u8, // R
+                    ((bgra >> 8) & 0xFF) as u8,  // G
+                    (bgra & 0xFF) as u8,          // B
+                    ((bgra >> 24) & 0xFF) as u8,  // A
+                ];
+            }
+
+            // Run our encoder
+            let our_block = encode_dxt1_block(&pixels, false, true);
+            let our_c0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+            let our_c1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+            let our_idx = u32::from_le_bytes([our_block[4], our_block[5], our_block[6], our_block[7]]);
+
+            let full_match = our_c0 == ref_c0 && our_c1 == ref_c1 && our_idx == ref_idx;
+            if full_match { match_full += 1; }
+            if our_c0 == ref_c0 && our_c1 == ref_c1 { match_c0c1 += 1; }
+            if our_c0 == ref_c0 { match_c0 += 1; }
+
+            if !full_match && printed < 10 {
+                printed += 1;
+                eprintln!("  DIFF blk={}: ref=({:04X},{:04X},{:08X}) ours=({:04X},{:04X},{:08X})",
+                    pair["bk"].as_u64().unwrap(),
+                    ref_c0, ref_c1, ref_idx, our_c0, our_c1, our_idx);
+                eprintln!("    px[0]=({},{},{}) px[15]=({},{},{})",
+                    pixels[0][0], pixels[0][1], pixels[0][2],
+                    pixels[15][0], pixels[15][1], pixels[15][2]);
+            }
+        }
+
+        eprintln!("\n=== Captured Pixel Pairs: Encoder Comparison ===");
+        eprintln!("  Solid (skipped): {}", solid);
+        eprintln!("  Non-solid tested: {}", total);
+        eprintln!("  Full match (c0+c1+idx): {}/{} ({:.1}%)", match_full, total,
+            match_full as f64 / total.max(1) as f64 * 100.0);
+        eprintln!("  c0+c1 match: {}/{} ({:.1}%)", match_c0c1, total,
+            match_c0c1 as f64 / total.max(1) as f64 * 100.0);
+        eprintln!("  c0 only match: {}/{} ({:.1}%)", match_c0, total,
+            match_c0 as f64 / total.max(1) as f64 * 100.0);
+    }
+
 }
