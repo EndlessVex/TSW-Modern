@@ -2681,65 +2681,83 @@ fn refine_endpoints_lsq(
 ) -> (u16, u16, u32) {
     let one_third: f32 = f32::from_bits(0x3EAAAAAB);
 
-    // Accumulators stored as f32 between iterations (matching original's stack layout)
-    let mut aa: f32 = 0.0;
-    let mut bb: f32 = 0.0;
-    let mut ab: f32 = 0.0;
+    // Accumulate at f32. The original uses x87 at CW=0x027F (53-bit) with an
+    // 8-pixel unrolled loop, storing accumulators as f32 between iterations.
+    // Matching the exact x87 instruction ordering is impractical; f32 gives
+    // correct results for ~90% of non-solid blocks, with the remaining ~10%
+    // differing by 1 quantization level due to x87 vs SSE rounding.
+    let mut aa = 0.0f32;
+    let mut bb = 0.0f32;
+    let mut ab = 0.0f32;
     let mut a_pixel = [0.0f32; 3];
     let mut b_pixel = [0.0f32; 3];
 
-    // Process 8 pixels at a time (matching original's unrolled loop)
-    for batch in 0..2 {
-        let base = batch * 8;
-        // Compute weights for 8 pixels
-        let mut alphas = [0.0f32; 8];
-        let mut betas = [0.0f32; 8];
-        for j in 0..8 {
-            let idx = (indices_in >> ((base + j) * 2)) & 3;
-            let bit0 = (idx & 1) as f32;
-            betas[j] = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
-            alphas[j] = 1.0 - betas[j];
-        }
+    for i in 0..16 {
+        let idx = (indices_in >> (i * 2)) & 3;
+        let bit0 = (idx & 1) as f32;
+        let beta = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
+        let alpha = 1.0 - beta;
 
-        // Accumulate 8 products into aa/bb/ab at once (x87 fadd chain)
-        // The 8 products are computed and added in a chain at 53-bit precision,
-        // then the sum is added to the f32 accumulator (which truncates to f32).
-        let mut sum_aa: f32 = 0.0;
-        let mut sum_bb: f32 = 0.0;
-        let mut sum_ab: f32 = 0.0;
-        for j in 0..8 {
-            sum_aa += alphas[j] * alphas[j];
-            sum_bb += betas[j] * betas[j];
-            sum_ab += alphas[j] * betas[j];
-        }
-        aa += sum_aa;
-        bb += sum_bb;
-        ab += sum_ab;
+        aa += alpha * alpha;
+        bb += beta * beta;
+        ab += alpha * beta;
 
         for c in 0..3 {
-            let mut sum_a: f32 = 0.0;
-            let mut sum_b: f32 = 0.0;
-            for j in 0..8 {
-                sum_a += alphas[j] * fp[base + j][c];
-                sum_b += betas[j] * fp[base + j][c];
-            }
-            a_pixel[c] += sum_a;
-            b_pixel[c] += sum_b;
+            a_pixel[c] += alpha * fp[i][c];
+            b_pixel[c] += beta * fp[i][c];
         }
     }
 
-    let det = aa * bb - ab * ab;
+    // Matrix solve using x87 inline asm for real hardware precision.
+    // The original computes det, inv_det, and endpoint values at x87 53-bit
+    // precision (CW=0x027F). Unicorn softfloat differs from real x87 for
+    // values near quantization boundaries, causing ~1-bit endpoint differences.
+    let det: f32 = aa * bb - ab * ab;
     if det.abs() < 0.0001 {
         return (c0_in, c1_in, indices_in);
     }
 
-    let inv_det = 1.0f32 / det;
-
     let mut new_ep0 = [0.0f32; 3];
     let mut new_ep1 = [0.0f32; 3];
+    let cw: u16 = 0x027F;
     for c in 0..3 {
-        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0);
-        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0);
+        // Compute (bb * a_pixel[c] - ab * b_pixel[c]) / det at x87 precision
+        // and (aa * b_pixel[c] - ab * a_pixel[c]) / det at x87 precision
+        let mut ep0_val: f32 = 0.0;
+        let mut ep1_val: f32 = 0.0;
+        unsafe {
+            std::arch::asm!(
+                "fldcw word ptr [{cw}]",
+                // ep0 = (bb * a_pix - ab * b_pix) / det
+                "fld dword ptr [{bb}]",
+                "fmul dword ptr [{a_pix}]",
+                "fld dword ptr [{ab}]",
+                "fmul dword ptr [{b_pix}]",
+                "fsubp st(1), st(0)",   // st(0) = bb*a_pix - ab*b_pix
+                "fdiv dword ptr [{det}]",
+                "fstp dword ptr [{ep0}]",
+                // ep1 = (aa * b_pix - ab * a_pix) / det
+                "fld dword ptr [{aa_v}]",
+                "fmul dword ptr [{b_pix}]",
+                "fld dword ptr [{ab}]",
+                "fmul dword ptr [{a_pix}]",
+                "fsubp st(1), st(0)",   // st(0) = aa*b_pix - ab*a_pix
+                "fdiv dword ptr [{det}]",
+                "fstp dword ptr [{ep1}]",
+                cw = in(reg) &cw,
+                bb = in(reg) &bb,
+                aa_v = in(reg) &aa,
+                ab = in(reg) &ab,
+                a_pix = in(reg) &a_pixel[c],
+                b_pix = in(reg) &b_pixel[c],
+                det = in(reg) &det,
+                ep0 = in(reg) &mut ep0_val,
+                ep1 = in(reg) &mut ep1_val,
+                options(nostack),
+            );
+        }
+        new_ep0[c] = ep0_val.max(0.0).min(255.0);
+        new_ep1[c] = ep1_val.max(0.0).min(255.0);
     }
 
     let (mut c0, mut ep0) = quantize_endpoint_rf(&new_ep0);
