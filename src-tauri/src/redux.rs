@@ -2393,34 +2393,31 @@ fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
 }
 
 /// Least-squares endpoint refinement (FUN_0067c860).
-/// From current indices, solve the 2x2 linear system for optimal endpoints,
-/// then re-quantize and re-assign indices.
+/// Uses f64 accumulators to match x87 53-bit precision (CW=0x027F).
+/// The original accumulates 16 weight×pixel products at 53-bit intermediate
+/// precision, which differs from f32 (23-bit) for the matrix solve.
 fn refine_endpoints_lsq(
     fp: &[[f32; 3]; 16],
     c0_in: u16, c1_in: u16,
-    ep0_in: [f32; 3], ep1_in: [f32; 3],
+    _ep0_in: [f32; 3], _ep1_in: [f32; 3],
     indices_in: u32,
 ) -> (u16, u16, u32) {
-    // Compute alpha/beta weights from indices
-    // Index 0 → alpha=1, beta=0
-    // Index 1 → alpha=0, beta=1
-    // Index 2 → alpha=2/3, beta=1/3
-    // Index 3 → alpha=1/3, beta=2/3
-    let mut aa = 0.0f32;
-    let mut bb = 0.0f32;
-    let mut ab = 0.0f32;
-    let mut a_pixel = [0.0f32; 3];
-    let mut b_pixel = [0.0f32; 3];
+    // Weight constant from binary: 1/3 = 0x3EAAAAAB as f32
+    let one_third: f64 = f32::from_bits(0x3EAAAAAB) as f64;
+
+    // Accumulate at f64 (53-bit mantissa = x87 CW=0x027F)
+    let mut aa = 0.0f64;
+    let mut bb = 0.0f64;
+    let mut ab = 0.0f64;
+    let mut a_pixel = [0.0f64; 3];
+    let mut b_pixel = [0.0f64; 3];
 
     for i in 0..16 {
         let idx = (indices_in >> (i * 2)) & 3;
-        let beta = match idx {
-            0 => 0.0f32,
-            1 => 1.0f32,
-            2 => 0.33333334f32, // (0+1)/3
-            3 => 0.66666666f32, // (1+1)/3  -- matching original: (bit0+1)*0.33333334
-            _ => unreachable!(),
-        };
+        // Index→weight matching FUN_0067c860:
+        // bit0 = idx & 1, if bit1: beta = (bit0 + 1) * one_third
+        let bit0 = (idx & 1) as f64;
+        let beta = if (idx & 2) != 0 { (bit0 + 1.0) * one_third } else { bit0 };
         let alpha = 1.0 - beta;
 
         aa += alpha * alpha;
@@ -2428,38 +2425,34 @@ fn refine_endpoints_lsq(
         ab += alpha * beta;
 
         for c in 0..3 {
-            a_pixel[c] += alpha * fp[i][c];
-            b_pixel[c] += beta * fp[i][c];
+            let pv = fp[i][c] as f64;
+            a_pixel[c] += alpha * pv;
+            b_pixel[c] += beta * pv;
         }
     }
 
     let det = aa * bb - ab * ab;
     if det.abs() < 0.0001 {
-        // Singular — keep original endpoints
         return (c0_in, c1_in, indices_in);
     }
 
-    let inv_det = 1.0 / det;
+    let inv_det = 1.0f64 / det;
 
-    // Solve for new endpoints
     let mut new_ep0 = [0.0f32; 3];
     let mut new_ep1 = [0.0f32; 3];
     for c in 0..3 {
-        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0);
-        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0);
+        new_ep0[c] = ((bb * a_pixel[c] - ab * b_pixel[c]) * inv_det).max(0.0).min(255.0) as f32;
+        new_ep1[c] = ((aa * b_pixel[c] - ab * a_pixel[c]) * inv_det).max(0.0).min(255.0) as f32;
     }
 
-    // Quantize refined endpoints
     let (mut c0, mut ep0) = quantize_endpoint_rf(&new_ep0);
     let (mut c1, mut ep1) = quantize_endpoint_rf(&new_ep1);
 
-    // Ensure c0 > c1
     if c0 < c1 {
         std::mem::swap(&mut c0, &mut c1);
         std::mem::swap(&mut ep0, &mut ep1);
     }
 
-    // Re-assign indices with refined endpoints
     let indices = assign_indices_distance(fp, &ep0, &ep1);
 
     (c0, c1, indices)
@@ -3967,6 +3960,16 @@ mod tests {
                             pmin[0],pmin[1],pmin[2], pmax[0],pmax[1],pmax[2],
                             pixels[0][0],pixels[0][1],pixels[0][2],
                             pixels[15][0],pixels[15][1],pixels[15][2]);
+                        // Dump ALL 16 pixels as BGRA u32 for Unicorn testing (block 3,0 only)
+                        if bx == 3 && by == 0 {
+                            eprintln!("              ALL16 (BGRA u32 for Unicorn):");
+                            for pi in 0..16 {
+                                let p = pixels[pi];
+                                let bgra = (p[3] as u32) << 24 | (p[0] as u32) << 16 | (p[1] as u32) << 8 | (p[2] as u32);
+                                eprint!(" 0x{:08X}", bgra);
+                                if pi % 4 == 3 { eprintln!(); }
+                            }
+                        }
                     }
                 }
 
