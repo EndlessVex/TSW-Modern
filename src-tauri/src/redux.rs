@@ -1158,7 +1158,8 @@ fn generate_mip_from_linear(
     }
 
     // De-linearize to uint8: pow(val, 1/2.2) * 255.0, floor.
-    // Uses x87 for the full chain at 80-bit precision (matching FUN_679220).
+    // Uses x87 for the full chain matching FUN_679220 → FUN_681C10 (floor).
+    // Tested rounding (10.60%) — floor (10.90%) is better.
     let inv_gamma: f32 = 1.0f32 / 2.2f32;
     let scale: f32 = 255.0;
     let mut dst_u8 = vec![[0u8; 4]; new_w * new_h];
@@ -1167,8 +1168,7 @@ fn generate_mip_from_linear(
             let v = x87_pow_scale_floor(dst_lin[i][c], inv_gamma, scale);
             dst_u8[i][c] = v.clamp(0, 255) as u8;
         }
-        // Alpha: no gamma, just scale and floor
-        dst_u8[i][3] = (dst_lin[i][3] * 255.0).max(0.0).min(255.0) as u8;
+        dst_u8[i][3] = x87_float_to_u8(dst_lin[i][3]);
     }
 
     // Encode
@@ -7046,6 +7046,34 @@ mod tests {
                 printed += 1;
             }
         }
+    }
+
+    /// Compare one-shot degamma (pow*255 at 80-bit) vs two-step (pow→f32→*255→floor)
+    #[test]
+    fn test_degamma_oneshot_vs_twostep() {
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let inv_gamma: f32 = 1.0 / 2.2;
+        let scale: f32 = 255.0;
+        let mut diffs = 0;
+        // Test all possible linearized values (from all 256 pixel values)
+        for v in 0u16..=255 {
+            let f32_val = v as f32 * recip255;
+            let lin = x87_powf(f32_val, gamma); // linearize
+            // One-shot: pow(lin, 1/2.2) * 255 at 80-bit, floor
+            let oneshot = x87_pow_scale_floor(lin, inv_gamma, scale).clamp(0, 255) as u8;
+            // Two-step: pow(lin, 1/2.2) → f32, then f32 * 255 → floor
+            let pow_result = x87_powf(lin, inv_gamma); // pow → f32
+            let twostep = x87_float_to_u8(pow_result); // f32 * 255, floor
+            if oneshot != twostep {
+                diffs += 1;
+                if diffs <= 20 {
+                    eprintln!("  v={}: oneshot={} twostep={} lin={:e} pow={:e}",
+                        v, oneshot, twostep, lin, pow_result);
+                }
+            }
+        }
+        eprintln!("  Degamma oneshot vs twostep: {}/256 differ", diffs);
     }
 
     /// Check if x87_powf and f64 pow agree for ALL 256 pixel values.
