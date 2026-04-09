@@ -7321,4 +7321,81 @@ mod tests {
             match_c0 as f64 / total.max(1) as f64 * 100.0);
     }
 
+    #[test]
+    #[ignore] // Run with: cargo test captured_pairs_regression -- --ignored --nocapture
+    fn captured_pairs_regression() {
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let pairs_path = base.join("tools/captured_pixel_pairs.json");
+        let data = std::fs::read_to_string(&pairs_path)
+            .expect("Failed to read captured_pixel_pairs.json");
+        let pairs: serde_json::Value = serde_json::from_str(&data)
+            .expect("Failed to parse JSON");
+        let arr = pairs.as_array().unwrap();
+
+        let mut total = 0usize;
+        let mut matched = 0usize;
+        let mut solid_total = 0usize;
+        let mut solid_matched = 0usize;
+        let mut nonsolid_total = 0usize;
+        let mut nonsolid_matched = 0usize;
+        let mut first_mismatches: Vec<String> = Vec::new();
+
+        for entry in arr {
+            let px_arr = entry["px"].as_array().unwrap();
+            let ref_c0 = entry["c0"].as_u64().unwrap() as u16;
+            let ref_c1 = entry["c1"].as_u64().unwrap() as u16;
+            let ref_ix = entry["ix"].as_u64().unwrap() as u32;
+
+            // Convert BGRA u32 → RGBA u8 array
+            let mut pixels = [[0u8; 4]; 16];
+            for i in 0..16 {
+                let bgra = px_arr[i].as_u64().unwrap() as u32;
+                let b = (bgra & 0xFF) as u8;
+                let g = ((bgra >> 8) & 0xFF) as u8;
+                let r = ((bgra >> 16) & 0xFF) as u8;
+                let a = ((bgra >> 24) & 0xFF) as u8;
+                pixels[i] = [r, g, b, a];
+            }
+
+            let result = encode_dxt1_range_fit(&pixels);
+            let our_c0 = u16::from_le_bytes([result[0], result[1]]);
+            let our_c1 = u16::from_le_bytes([result[2], result[3]]);
+            let our_ix = u32::from_le_bytes([result[4], result[5], result[6], result[7]]);
+
+            let mut ref_block = [0u8; 8];
+            ref_block[0..2].copy_from_slice(&ref_c0.to_le_bytes());
+            ref_block[2..4].copy_from_slice(&ref_c1.to_le_bytes());
+            ref_block[4..8].copy_from_slice(&ref_ix.to_le_bytes());
+
+            let is_solid = ref_c0 == ref_c1;
+            total += 1;
+            if is_solid { solid_total += 1; } else { nonsolid_total += 1; }
+
+            if result == ref_block {
+                matched += 1;
+                if is_solid { solid_matched += 1; } else { nonsolid_matched += 1; }
+            } else if first_mismatches.len() < 10 {
+                let tx = entry["tx"].as_u64().unwrap();
+                let bk = entry["bk"].as_u64().unwrap();
+                first_mismatches.push(format!(
+                    "  tx={} bk={}: ref c0=0x{:04X} c1=0x{:04X} ix=0x{:08X} | ours c0=0x{:04X} c1=0x{:04X} ix=0x{:08X}",
+                    tx, bk, ref_c0, ref_c1, ref_ix, our_c0, our_c1, our_ix
+                ));
+            }
+        }
+
+        eprintln!("\n=== Captured Pairs Regression ({} blocks) ===", total);
+        eprintln!("  Overall:    {}/{} ({:.1}%)", matched, total, matched as f64 / total as f64 * 100.0);
+        eprintln!("  Solid:      {}/{} ({:.1}%)", solid_matched, solid_total,
+            if solid_total > 0 { solid_matched as f64 / solid_total as f64 * 100.0 } else { 0.0 });
+        eprintln!("  Non-solid:  {}/{} ({:.1}%)", nonsolid_matched, nonsolid_total,
+            if nonsolid_total > 0 { nonsolid_matched as f64 / nonsolid_total as f64 * 100.0 } else { 0.0 });
+        if !first_mismatches.is_empty() {
+            eprintln!("\n  First {} mismatches:", first_mismatches.len());
+            for m in &first_mismatches { eprintln!("{}", m); }
+        }
+    }
+
 }
