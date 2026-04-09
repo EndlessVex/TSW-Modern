@@ -9278,4 +9278,252 @@ mod tests {
         }
     }
 
+    /// Export the first mismatching non-solid block's source pixels for Unicorn comparison.
+    /// Saves mip0 8x8 region, our pipeline's 4x4 u8 output, and reference/ours encoder values.
+    ///
+    /// Run with: cargo test export_mismatch_source -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn export_mismatch_source() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let dbg_dir = base.join("game-installs/debug-run/RDB");
+        let dbg_idx_path = dbg_dir.join("le.idx");
+        if !dbg_idx_path.exists() {
+            eprintln!("  debug-run not available, skipping");
+            return;
+        }
+        let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
+
+        // Find 1024x1024 DXT1 textures (699088 bytes FCTX)
+        let candidates: Vec<_> = dbg_idx.entries.iter()
+            .filter(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088)
+            .collect();
+        if candidates.is_empty() {
+            eprintln!("  No suitable textures found");
+            return;
+        }
+
+        let block_size = 8usize;
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+
+        for entry in &candidates {
+            let fctx = {
+                let path = dbg_dir.join(format!("{:02}.rdbdata", entry.file_num));
+                let mut file = std::fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+
+            let width = 1usize << (fctx[16] as usize - 1);
+            let height = 1usize << (fctx[17] as usize - 1);
+            if width != 1024 || height != 1024 { continue; }
+
+            let mip0_size = (width / 4) * (height / 4) * block_size;
+            let mip1_size = (width / 8) * (height / 8) * block_size;
+            let ref_mip0 = &fctx[fctx.len() - mip0_size..];
+            let ref_mip1 = &fctx[fctx.len() - mip0_size - mip1_size..fctx.len() - mip0_size];
+
+            // Decode mip0 to u8 pixels
+            let bpw = width / 4;
+            let mut decoded_u8 = vec![[0u8; 4]; width * height];
+            for by in 0..(height / 4) {
+                for bx in 0..bpw {
+                    let off = (by * bpw + bx) * block_size;
+                    let bp = decode_dxt1_block(&ref_mip0[off..off + block_size]);
+                    for py in 0..4 { for px in 0..4 {
+                        decoded_u8[(by * 4 + py) * width + bx * 4 + px] = bp[py * 4 + px];
+                    }}
+                }
+            }
+
+            // Linearize (u8 -> f32 gamma) — two-step matching native:
+            // FUN_678F40 stores val*recip255 as f32, then pow loads it back
+            let linear_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+                [x87_powf(p[0] as f32 * recip255, gamma),
+                 x87_powf(p[1] as f32 * recip255, gamma),
+                 x87_powf(p[2] as f32 * recip255, gamma),
+                 p[3] as f32 * recip255]
+            }).collect();
+
+            // Box filter
+            let nw = width / 2;
+            let nh = height / 2;
+            let mut filtered_float = vec![[0.0f32; 4]; nw * nh];
+            for y in 0..nh { for x in 0..nw {
+                let x0 = (x * 2).min(width - 1);
+                let y0 = (y * 2).min(height - 1);
+                let x1 = (x * 2 + 1).min(width - 1);
+                let y1 = (y * 2 + 1).min(height - 1);
+                let pp00 = &linear_float[y0 * width + x0];
+                let pp10 = &linear_float[y0 * width + x1];
+                let pp01 = &linear_float[y1 * width + x0];
+                let pp11 = &linear_float[y1 * width + x1];
+                for c in 0..4 {
+                    filtered_float[y * nw + x][c] = if x % 4 == 1 {
+                        x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                    } else {
+                        x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                    };
+                }
+            }}
+
+            // Degamma + find mismatching block
+            let nbpw = nw / 4;
+            let nbph = nh / 4;
+
+            for by in 0..nbph { for bx in 0..nbpw {
+                let b = by * nbpw + bx;
+                let rb = &ref_mip1[b * 8..(b + 1) * 8];
+                let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+                let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+                if rc0 == rc1 { continue; } // skip solid
+                if rc0 < rc1 { continue; } // skip 3-color/transparent blocks
+
+                // Check that all 8x8 source pixels are fully opaque
+                let mut all_opaque = true;
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        let gy = by * 8 + sy;
+                        let gx = bx * 8 + sx;
+                        if decoded_u8[gy * width + gx][3] < 255 {
+                            all_opaque = false;
+                        }
+                    }
+                }
+                if !all_opaque { continue; }
+
+                // Skip uniform blocks (all 64 source pixels identical)
+                let first_pixel = decoded_u8[by * 8 * width + bx * 8];
+                let mut all_same = true;
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        if decoded_u8[(by * 8 + sy) * width + bx * 8 + sx] != first_pixel {
+                            all_same = false;
+                        }
+                    }
+                }
+                if all_same { continue; }
+
+                // Compute our mip1 pixels for this block
+                let mut our_pixels = [[0u8; 4]; 16];
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &filtered_float[((by * 4 + py).min(nh - 1)) * nw + (bx * 4 + px).min(nw - 1)];
+                    our_pixels[py * 4 + px] = [
+                        x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0, 255) as u8,
+                        x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0, 255) as u8,
+                        x87_float_to_u8(fv[3]),
+                    ];
+                }}
+
+                let our_block = encode_dxt1_block(&our_pixels, false, true);
+                if our_block == rb[..8] { continue; } // matches
+
+                let oc0 = u16::from_le_bytes([our_block[0], our_block[1]]);
+                let oc1 = u16::from_le_bytes([our_block[2], our_block[3]]);
+                let rix = u32::from_le_bytes([rb[4], rb[5], rb[6], rb[7]]);
+                let oix = u32::from_le_bytes([our_block[4], our_block[5], our_block[6], our_block[7]]);
+
+                eprintln!("Found mismatch: texture id={} block ({},{}) idx={}", entry.id, bx, by, b);
+                eprintln!("  REF:  c0={:04X} c1={:04X} ix={:08X}", rc0, rc1, rix);
+                eprintln!("  OURS: c0={:04X} c1={:04X} ix={:08X}", oc0, oc1, oix);
+
+                // Extract 8x8 mip0 source region
+                let mut mip0_8x8: Vec<[u8; 4]> = Vec::with_capacity(64);
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        let gy = by * 8 + sy;
+                        let gx = bx * 8 + sx;
+                        mip0_8x8.push(decoded_u8[gy * width + gx]);
+                    }
+                }
+
+                // Our 4x4 mip1 pixels
+                let our_mip1_4x4: Vec<[u8; 4]> = our_pixels.to_vec();
+
+                // Also export per-pixel intermediate values for comparison
+                let mut intermediates = Vec::new();
+                for py in 0..4 { for px in 0..4 {
+                    let mip1_x = bx * 4 + px;
+                    let mip1_y = by * 4 + py;
+                    // Source 2x2 from mip0
+                    let src_x0 = mip1_x * 2;
+                    let src_y0 = mip1_y * 2;
+                    let src_x1 = (src_x0 + 1).min(width - 1);
+                    let src_y1 = (src_y0 + 1).min(height - 1);
+
+                    let p00 = decoded_u8[src_y0 * width + src_x0];
+                    let p10 = decoded_u8[src_y0 * width + src_x1];
+                    let p01 = decoded_u8[src_y1 * width + src_x0];
+                    let p11 = decoded_u8[src_y1 * width + src_x1];
+
+                    let fv = &filtered_float[mip1_y.min(nh - 1) * nw + mip1_x.min(nw - 1)];
+                    let lin00 = &linear_float[src_y0 * width + src_x0];
+                    let lin10 = &linear_float[src_y0 * width + src_x1];
+                    let lin01 = &linear_float[src_y1 * width + src_x0];
+                    let lin11 = &linear_float[src_y1 * width + src_x1];
+
+                    let mut pixel_info = serde_json::json!({
+                        "px": px, "py": py,
+                        "mip1_x": mip1_x, "mip1_y": mip1_y,
+                        "src_u8": {
+                            "p00": [p00[0], p00[1], p00[2], p00[3]],
+                            "p10": [p10[0], p10[1], p10[2], p10[3]],
+                            "p01": [p01[0], p01[1], p01[2], p01[3]],
+                            "p11": [p11[0], p11[1], p11[2], p11[3]],
+                        },
+                        "linearized": {
+                            "p00": [lin00[0], lin00[1], lin00[2], lin00[3]],
+                            "p10": [lin10[0], lin10[1], lin10[2], lin10[3]],
+                            "p01": [lin01[0], lin01[1], lin01[2], lin01[3]],
+                            "p11": [lin11[0], lin11[1], lin11[2], lin11[3]],
+                        },
+                        "box_filtered": [fv[0], fv[1], fv[2], fv[3]],
+                        "box_filtered_hex": [
+                            format!("{:08X}", fv[0].to_bits()),
+                            format!("{:08X}", fv[1].to_bits()),
+                            format!("{:08X}", fv[2].to_bits()),
+                            format!("{:08X}", fv[3].to_bits()),
+                        ],
+                        "degamma_u8": [our_pixels[py * 4 + px][0], our_pixels[py * 4 + px][1],
+                                        our_pixels[py * 4 + px][2], our_pixels[py * 4 + px][3]],
+                        "box_filter_order": if mip1_x % 4 == 1 { "p00_first" } else { "p10_first" },
+                    });
+                    intermediates.push(pixel_info);
+                }}
+
+                let output = serde_json::json!({
+                    "texture_id": entry.id,
+                    "block_idx": b,
+                    "block_xy": [bx, by],
+                    "texture_size": [width, height],
+                    "mip0_8x8": mip0_8x8.iter().map(|p| vec![p[0], p[1], p[2], p[3]]).collect::<Vec<_>>(),
+                    "our_mip1_4x4": our_mip1_4x4.iter().map(|p| vec![p[0], p[1], p[2], p[3]]).collect::<Vec<_>>(),
+                    "ref_c0": rc0,
+                    "ref_c1": rc1,
+                    "ref_ix": rix,
+                    "our_c0": oc0,
+                    "our_c1": oc1,
+                    "our_ix": oix,
+                    "pixel_intermediates": intermediates,
+                });
+
+                let out_path = base.join("tools/mismatch_source_pixels.json");
+                std::fs::write(&out_path, serde_json::to_string_pretty(&output).unwrap()).unwrap();
+                eprintln!("  Saved to {}", out_path.display());
+                return; // First mismatch only
+            }}
+        }
+
+        eprintln!("  No mismatching non-solid blocks found in any 1024x1024 texture");
+    }
+
 }
