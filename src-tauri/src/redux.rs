@@ -1564,11 +1564,16 @@ fn encode_dxt1_solid(r: u8, g: u8, b: u8) -> [u8; 8] {
     // c0 = quantized value and c1 = c0 - 1. All indices = 0 (select c0).
     // This differs from our previous c0==c1 encoding.
     // The original's monochrome encoder (FUN_006807F0) uses bracket lookup
-    // tables that produce c0==c1 with all indices = 0.
+    // tables that produce c0==c1 with all indices = 0.  However, during mip
+    // generation, the original's precision produces slightly varied pixel values
+    // (not truly monochrome), so the range-fit encoder runs instead, producing
+    // c0=quantized, c1=c0-1, indices=0xAAAAAAAA (all index 2).
+    // We match this by using c0>c1 4-color mode.
+    let c1 = if c0 > 0 { c0 - 1 } else { 0 };
     let mut block = [0u8; 8];
     block[0..2].copy_from_slice(&c0.to_le_bytes());
-    block[2..4].copy_from_slice(&c0.to_le_bytes());
-    // indices = 0: all pixels select palette entry 0 (= c0 = c1)
+    block[2..4].copy_from_slice(&c1.to_le_bytes());
+    block[4..8].copy_from_slice(&0xAAAAAAAAu32.to_le_bytes());
     block
 }
 
