@@ -421,9 +421,9 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     let recip255: f32 = 1.0 / 255.0;
     let gamma: f32 = 2.2;
     let mut current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-        [x87_powf(p[0] as f32 * recip255, gamma),
-         x87_powf(p[1] as f32 * recip255, gamma),
-         x87_powf(p[2] as f32 * recip255, gamma),
+        [x87_linearize(p[0] as f32, recip255, gamma),
+         x87_linearize(p[1] as f32, recip255, gamma),
+         x87_linearize(p[2] as f32, recip255, gamma),
          p[3] as f32 * recip255]
     }).collect();
 
@@ -702,8 +702,52 @@ fn linear_to_srgb(l: f32) -> u8 {
 /// x87-precision pow(base, exp) matching the original's FUN_682EE0.
 ///
 /// Uses the standard x87 sequence: pow(x, y) = 2^(y * log2(x))
+/// x87 linearization: computes pow(val * recip255, gamma) without truncating
+/// the intermediate val*recip255 to f32. The original keeps this value on the
+/// x87 stack at 53-bit precision (CW=0x027F) and passes it directly to pow.
+/// Truncating to f32 between multiply and pow causes 1-ULP errors for certain
+/// values (confirmed via Frida comparison against real binary).
+#[inline(never)]
+fn x87_linearize(val: f32, recip255: f32, gamma: f32) -> f32 {
+    if val <= 0.0 {
+        return 0.0;
+    }
+    let mut result: f32 = 0.0;
+    let cw: u16 = 0x027F;
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{gamma}]",      // st(0)=gamma (exponent)
+            "fld dword ptr [{val}]",        // st(0)=val, st(1)=gamma
+            "fmul dword ptr [{recip}]",     // st(0)=val/255 (base), st(1)=gamma
+            // fyl2x: ST(1) * log2(ST(0)) = gamma * log2(val/255)
+            "fyl2x",
+            "fld st(0)",
+            "frndint",
+            "fsub st(1), st(0)",
+            "fxch st(1)",
+            "f2xm1",
+            "fld1",
+            "faddp st(1), st(0)",
+            "fscale",
+            "fstp st(1)",
+            "fstp dword ptr [{out}]",
+            cw = in(reg) &cw,
+            val = in(reg) &val,
+            recip = in(reg) &recip255,
+            gamma = in(reg) &gamma,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result
+}
+
 /// via FYL2X + FRNDINT + F2XM1 + FSCALE, all at 80-bit precision.
 /// The result is stored as f32 to match the original's fstp dword.
+///
+/// NOTE: For gamma linearization, use x87_linearize() instead — it keeps
+/// the val*recip255 intermediate at 53-bit precision, matching the original.
 fn x87_powf(base: f32, exp: f32) -> f32 {
     // For base <= 0, return 0 (gamma only applies to positive pixel values)
     if base <= 0.0 {
@@ -3411,6 +3455,26 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_linearize_vs_powf() {
+        // Check if x87_linearize produces different results from x87_powf
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let mut diffs = 0;
+        for v in 0..=255u8 {
+            let old = x87_powf(v as f32 * recip255, gamma);
+            let new_val = x87_linearize(v as f32, recip255, gamma);
+            if old.to_bits() != new_val.to_bits() {
+                diffs += 1;
+                if diffs <= 10 {
+                    eprintln!("  v={}: powf={:.10} (0x{:08X}) linearize={:.10} (0x{:08X})",
+                        v, old, old.to_bits(), new_val, new_val.to_bits());
+                }
+            }
+        }
+        eprintln!("  x87_linearize vs x87_powf: {}/256 differ", diffs);
+    }
+
     fn test_degamma_round_trip() {
         // Verify x87_degamma_scale_floor produces correct round-trip for all 256 values.
         // The original computes 1/2.2 at x87 precision (fld1;fdiv), NOT pre-computed f32.
@@ -4042,9 +4106,9 @@ mod tests {
         let recip255: f32 = 1.0 / 255.0;
         let gamma: f32 = 2.2;
         let current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
-            [x87_powf(p[0] as f32 * recip255, gamma),
-             x87_powf(p[1] as f32 * recip255, gamma),
-             x87_powf(p[2] as f32 * recip255, gamma),
+            [x87_linearize(p[0] as f32, recip255, gamma),
+             x87_linearize(p[1] as f32, recip255, gamma),
+             x87_linearize(p[2] as f32, recip255, gamma),
              p[3] as f32 * recip255]
         }).collect();
 
@@ -4815,11 +4879,12 @@ mod tests {
                     if xx<cw && yy<ch { decoded[yy*cw+xx] = px[py*4+ppx]; }
                 }}
             }}
-            // Convert to linear float
+            // Convert to linear float using x87_linearize (keeps val*recip255 at
+            // 53-bit precision on the x87 stack, matching the original pipeline)
             let mut cur_lin: Vec<[f32;4]> = decoded.iter().map(|p| {
-                [x87_powf(p[0] as f32 * recip255g, gamma_val),
-                 x87_powf(p[1] as f32 * recip255g, gamma_val),
-                 x87_powf(p[2] as f32 * recip255g, gamma_val),
+                [x87_linearize(p[0] as f32, recip255g, gamma_val),
+                 x87_linearize(p[1] as f32, recip255g, gamma_val),
+                 x87_linearize(p[2] as f32, recip255g, gamma_val),
                  p[3] as f32 * recip255g]
             }).collect();
 
