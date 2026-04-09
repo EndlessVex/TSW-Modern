@@ -451,9 +451,11 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         }
 
         // Convert to uint8 for encoding: degamma channels 0-2 via
-        // pow(val, 1/2.2) * 255, floor (matching FUN_679220 + FUN_681C10).
+        // pow(val, 1/gamma) * 255, floor (matching FUN_679220 + FUN_681C10).
+        // The original computes 1/gamma at x87 precision using fld1;fdiv, NOT
+        // from a pre-computed f32 reciprocal (which causes 67/256 values to be
+        // off by 1 due to the f32 reciprocal being slightly too large).
         // Channel 3 (alpha) uses direct floor(val * 255) (matching FUN_679070).
-        let inv_gamma: f32 = 1.0f32 / 2.2f32;
         let scale: f32 = 255.0;
         let new_bx = (new_w / 4).max(1);
         let new_by = (new_h / 4).max(1);
@@ -467,9 +469,9 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
                         let fy = (by * 4 + py).min(new_h - 1);
                         let fv = &new_float[fy * new_w + fx];
                         block_pixels[py * 4 + px] = [
-                            x87_pow_scale_floor(fv[0], inv_gamma, scale).clamp(0, 255) as u8,
-                            x87_pow_scale_floor(fv[1], inv_gamma, scale).clamp(0, 255) as u8,
-                            x87_pow_scale_floor(fv[2], inv_gamma, scale).clamp(0, 255) as u8,
+                            x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0, 255) as u8,
+                            x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0, 255) as u8,
+                            x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0, 255) as u8,
                             x87_float_to_u8(fv[3]),
                         ];
                     }
@@ -731,6 +733,62 @@ fn x87_powf(base: f32, exp: f32) -> f32 {
             cw = in(reg) &cw,
             exp = in(reg) &exp,
             base = in(reg) &base,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// x87 degamma: pow(base, 1/gamma) * scale → floor → i32.
+/// Matches the original's FUN_679220 which computes 1/gamma at x87 precision
+/// using `fld1; fdiv dword [gamma]`, NOT from a pre-computed f32 reciprocal.
+/// The f32 reciprocal (0.454545468) is slightly too large, causing 67/256 values
+/// to floor 1 unit too low.
+#[inline(never)]
+fn x87_degamma_scale_floor(base: f32, gamma: f32, scale: f32) -> i32 {
+    if base <= 0.0 {
+        return 0;
+    }
+    let mut result: i32 = 0;
+    let cw_ext: u16 = 0x027F;
+    let cw_trunc: u16 = 0x0E7F;
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw_ext}]",
+            // Compute 1/gamma at x87 precision: fld1; fdiv dword [gamma]
+            "fld1",
+            "fdiv dword ptr [{gamma}]",
+            // Now st(0) = 1/gamma (high precision)
+            // Set up for pow: st(0)=exp=1/gamma, st(1)=base
+            "fld dword ptr [{base}]",
+            "fxch st(1)",
+            // fyl2x: st(0) = exp * log2(base) (but args are swapped from convention)
+            // Actually fyl2x computes st(1) * log2(st(0)), pops, result in st(0)
+            // We need: (1/gamma) * log2(base)
+            // fyl2x expects st(0)=x, st(1)=y, computes y*log2(x)
+            // So st(0)=base, st(1)=1/gamma → result = (1/gamma)*log2(base) ✓
+            "fxch st(1)",
+            "fyl2x",
+            "fld st(0)",
+            "frndint",
+            "fsub st(1), st(0)",
+            "fxch st(1)",
+            "f2xm1",
+            "fld1",
+            "faddp st(1), st(0)",
+            "fscale",
+            "fstp st(1)",
+            // st(0) = base^(1/gamma)
+            "fmul dword ptr [{scale}]",
+            "fldcw word ptr [{cw_trunc}]",
+            "fistp dword ptr [{out}]",
+            "fldcw word ptr [{cw_ext}]",
+            cw_ext = in(reg) &cw_ext,
+            cw_trunc = in(reg) &cw_trunc,
+            gamma = in(reg) &gamma,
+            base = in(reg) &base,
+            scale = in(reg) &scale,
             out = in(reg) &mut result,
             options(nostack),
         );
@@ -1116,8 +1174,8 @@ fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
 fn x87_float_to_u8(val: f32) -> u8 {
     let scale: f32 = 255.0;
     let mut result: i32 = 0;
-    let cw_ext: u16 = 0x037F;   // 80-bit precision, round-to-nearest
-    let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation
+    let cw_ext: u16 = 0x027F;   // 53-bit precision (MSVC default), matching original
+    let cw_trunc: u16 = 0x0E7F; // 53-bit precision, truncation (round toward zero)
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw_ext}]",
@@ -1167,15 +1225,16 @@ fn generate_mip_from_linear(
         }
     }
 
-    // De-linearize to uint8: pow(val, 1/2.2) * 255.0, floor.
-    // Uses x87 for the full chain matching FUN_679220 → FUN_681C10 (floor).
-    // Tested rounding (10.60%) — floor (10.90%) is better.
-    let inv_gamma: f32 = 1.0f32 / 2.2f32;
+    // De-linearize to uint8: pow(val, 1/gamma) * 255.0, floor.
+    // Uses fld1;fdiv to compute 1/gamma at x87 precision, matching FUN_679220.
+    // Pre-computed f32(1/2.2) is slightly too large, causing 67/256 values to
+    // be off by 1.
+    let gamma_val: f32 = 2.2;
     let scale: f32 = 255.0;
     let mut dst_u8 = vec![[0u8; 4]; new_w * new_h];
     for i in 0..new_w * new_h {
         for c in 0..3 {
-            let v = x87_pow_scale_floor(dst_lin[i][c], inv_gamma, scale);
+            let v = x87_degamma_scale_floor(dst_lin[i][c], gamma_val, scale);
             dst_u8[i][c] = v.clamp(0, 255) as u8;
         }
         dst_u8[i][3] = x87_float_to_u8(dst_lin[i][3]);
@@ -3216,6 +3275,41 @@ mod tests {
     }
 
     #[test]
+    fn test_degamma_round_trip() {
+        // Verify x87_degamma_scale_floor produces correct round-trip for all 256 values.
+        // The original computes 1/2.2 at x87 precision (fld1;fdiv), NOT pre-computed f32.
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let scale: f32 = 255.0;
+        let mut mismatches = 0;
+        for v in 0..=255u8 {
+            let fval = v as f32 * recip255;
+            let lin = x87_powf(fval, gamma);
+            let result = x87_degamma_scale_floor(lin, gamma, scale).clamp(0, 255) as u8;
+            if result != v {
+                if mismatches < 5 {
+                    eprintln!("  MISMATCH: v={} → lin={:.10} → degamma={}", v, lin, result);
+                }
+                mismatches += 1;
+            }
+        }
+        eprintln!("  degamma round-trip: {}/256 mismatches", mismatches);
+        // Also test the OLD function for comparison
+        let inv_gamma: f32 = 1.0f32 / 2.2f32;
+        let mut old_mismatches = 0;
+        for v in 0..=255u8 {
+            let fval = v as f32 * recip255;
+            let lin = x87_powf(fval, gamma);
+            let result = x87_pow_scale_floor(lin, inv_gamma, scale).clamp(0, 255) as u8;
+            if result != v {
+                old_mismatches += 1;
+            }
+        }
+        eprintln!("  OLD pow_scale_floor: {}/256 mismatches", old_mismatches);
+        assert_eq!(mismatches, 0, "x87_degamma_scale_floor should round-trip perfectly");
+    }
+
+    #[test]
     fn test_rgb565_roundtrip() {
         for &(r, g, b) in &[(0, 0, 0), (255, 255, 255), (128, 64, 32), (255, 0, 0)] {
             let encoded = encode_rgb565(r, g, b);
@@ -3754,6 +3848,128 @@ mod tests {
                 matching_bytes, total_bytes,
                 (matching_bytes as f64 / total_bytes as f64) * 100.0);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gamma_pipeline_vs_unicorn() {
+        // Compare our Rust gamma pipeline output pixel-by-pixel against
+        // Unicorn-generated ground truth (tools/unicorn_mip1_truth.json).
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let truth_path = base.join("tools/unicorn_mip1_truth.json");
+        let truth_str = std::fs::read_to_string(&truth_path).unwrap();
+        let truth: serde_json::Value = serde_json::from_str(&truth_str).unwrap();
+
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+        let entry = ref_idx.entries.iter().find(|e| e.id == 19767).unwrap();
+        let ref_data = {
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let mut file = std::fs::File::open(&ref_path).unwrap();
+            file.seek(std::io::SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        let width = 512usize;
+        let height = 512usize;
+        let block_size = 8;
+        let fctx_header_size = 24;
+        let mip0_size = (width/4)*(height/4)*block_size;
+
+        // Extract mip0 (last in FCTX)
+        let mip0 = &ref_data[ref_data.len()-mip0_size..];
+
+        // Decode mip0 to pixels
+        let bpw = width / 4;
+        let mut decoded_u8 = vec![[0u8; 4]; width * height];
+        for by in 0..(height/4) {
+            for bx in 0..bpw {
+                let off = (by * bpw + bx) * block_size;
+                let block_pixels = decode_dxt1_block(&mip0[off..off+block_size]);
+                for py in 0..4 {
+                    for px in 0..4 {
+                        let x = bx * 4 + px;
+                        let y = by * 4 + py;
+                        decoded_u8[y * width + x] = block_pixels[py * 4 + px];
+                    }
+                }
+            }
+        }
+
+        // Convert to float + gamma linearize (matching decompress_iog1)
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
+            [x87_powf(p[0] as f32 * recip255, gamma),
+             x87_powf(p[1] as f32 * recip255, gamma),
+             x87_powf(p[2] as f32 * recip255, gamma),
+             p[3] as f32 * recip255]
+        }).collect();
+
+        // Box filter for mip1
+        let new_w = width / 2;
+        let new_h = height / 2;
+        let mut new_float = vec![[0.0f32; 4]; new_w * new_h];
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let x0 = (x * 2).min(width - 1);
+                let y0 = (y * 2).min(height - 1);
+                let x1 = (x * 2 + 1).min(width - 1);
+                let y1 = (y * 2 + 1).min(height - 1);
+                for c in 0..4 {
+                    new_float[y * new_w + x][c] = x87_box_filter_f32(
+                        current_float[y0 * width + x0][c],
+                        current_float[y0 * width + x1][c],
+                        current_float[y1 * width + x0][c],
+                        current_float[y1 * width + x1][c],
+                    );
+                }
+            }
+        }
+
+        // Degamma to u8
+        let scale: f32 = 255.0;
+        let mut mip1_u8 = vec![[0u8; 3]; new_w * new_h];
+        for i in 0..new_w * new_h {
+            for c in 0..3 {
+                mip1_u8[i][c] = x87_degamma_scale_floor(new_float[i][c], gamma, scale)
+                    .clamp(0, 255) as u8;
+            }
+        }
+
+        // Compare against Unicorn ground truth
+        let mut mismatches = 0;
+        let mut total = 0;
+        for entry in truth.as_array().unwrap() {
+            let x = entry["x"].as_u64().unwrap() as usize;
+            let y = entry["y"].as_u64().unwrap() as usize;
+            let expected = entry["expected"].as_array().unwrap();
+
+            for c in 0..3 {
+                let exp = expected[c].as_i64().unwrap() as u8;
+                let ours = mip1_u8[y * new_w + x][c];
+                total += 1;
+                if ours != exp {
+                    mismatches += 1;
+                    if mismatches <= 10 {
+                        let src = entry["src"].as_array().unwrap();
+                        let vals: Vec<i64> = (0..4).map(|i| src[i][c].as_i64().unwrap()).collect();
+                        eprintln!("  MISMATCH mip1({},{}) ch{}: src={:?} unicorn={} rust={}",
+                            x, y, c, vals, exp, ours);
+                    }
+                }
+            }
+        }
+
+        eprintln!("  Rust vs Unicorn: {}/{} channel-values, {} mismatches ({:.2}%)",
+            total, total, mismatches, 100.0 * mismatches as f64 / total as f64);
+        assert_eq!(mismatches, 0, "Rust pipeline should match Unicorn composed chain");
     }
 
     #[test]
