@@ -4201,14 +4201,16 @@ mod tests {
         }
         let dbg_idx = parse_le_index(&dbg_idx_path).unwrap();
 
-        // Find texture 6086415 (512x512 DXT1, 100% opaque, 699088 bytes)
-        let entry = match dbg_idx.entries.iter().find(|e| e.id == 6086415 && e.rdb_type == 1010004) {
+        // Try texture 6086415 first (100% opaque, verified 98.9% match), fall back to any 699088-byte DXT1
+        let entry = dbg_idx.entries.iter()
+            .find(|e| e.id == 6086415 && e.rdb_type == 1010004 && e.file_num != 255)
+            .or_else(|| dbg_idx.entries.iter()
+                .find(|e| e.rdb_type == 1010004 && e.file_num != 255 && e.length == 699088));
+        let entry = match entry {
             Some(e) => e,
-            None => { eprintln!("  Texture 6086415 not found in debug-run"); return; }
+            None => { eprintln!("  No suitable texture found in debug-run"); return; }
         };
-        if entry.file_num == 255 {
-            eprintln!("  Texture 6086415 not yet processed"); return;
-        }
+        eprintln!("  Using texture ID {}", entry.id);
 
         let fctx = {
             let path = dbg_dir.join(format!("{:02}.rdbdata", entry.file_num));
@@ -4254,7 +4256,7 @@ mod tests {
         let nw = width / 2;
         let nh = height / 2;
 
-        // Linearize
+        // Linearize — use x87_linearize (chains mul+pow without f32 truncation)
         let current_float: Vec<[f32; 4]> = decoded_u8.iter().map(|p| {
             [x87_linearize(p[0] as f32, recip255, gamma),
              x87_linearize(p[1] as f32, recip255, gamma),
@@ -4304,6 +4306,76 @@ mod tests {
         eprintln!("  Fresh patcher match (texture 6086415, {}x{} DXT1):", width, height);
         eprintln!("    {}/{} blocks match ({:.1}%)", matching, total, 100.0*matching as f64/total as f64);
         eprintln!("    Solid: {}/{}", solid, total);
+
+        // Analyze mismatching blocks
+        let mut c0_same_c1_diff = 0;
+        let mut c0_diff_c1_same = 0;
+        let mut both_diff = 0;
+        let mut idx_only_diff = 0;
+        let mut c1_off_by_1 = 0;
+        let mut c0_off_by_1 = 0;
+        for b in 0..total {
+            let rb = &ref_mip1[b*8..(b+1)*8];
+            let ob = &our_mip1[b*8..(b+1)*8];
+            if rb == ob { continue; }
+            let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+            let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+            let oc0 = u16::from_le_bytes([ob[0], ob[1]]);
+            let oc1 = u16::from_le_bytes([ob[2], ob[3]]);
+            if rc0 == oc0 && rc1 == oc1 { idx_only_diff += 1; }
+            else if rc0 == oc0 { c0_same_c1_diff += 1; if (rc1 as i32 - oc1 as i32).abs() <= 1 { c1_off_by_1 += 1; } }
+            else if rc1 == oc1 { c0_diff_c1_same += 1; if (rc0 as i32 - oc0 as i32).abs() <= 1 { c0_off_by_1 += 1; } }
+            else { both_diff += 1; }
+        }
+        let mismatch = total - matching;
+        eprintln!("    Mismatch analysis ({} blocks):", mismatch);
+        eprintln!("      Endpoints match, indices differ: {}", idx_only_diff);
+        eprintln!("      c0 same, c1 differs: {} (off-by-1: {})", c0_same_c1_diff, c1_off_by_1);
+        eprintln!("      c1 same, c0 differs: {} (off-by-1: {})", c0_diff_c1_same, c0_off_by_1);
+        eprintln!("      Both endpoints differ: {}", both_diff);
+
+        // Show first 5 mismatching blocks with their pixel values
+        let mut shown = 0;
+        for b in 0..total {
+            let rb = &ref_mip1[b*8..(b+1)*8];
+            let ob = &our_mip1[b*8..(b+1)*8];
+            if rb == ob { continue; }
+            if shown >= 3 { break; }
+            shown += 1;
+            let bx = b % nbpw;
+            let by = b / nbpw;
+            let rc0 = u16::from_le_bytes([rb[0], rb[1]]);
+            let rc1 = u16::from_le_bytes([rb[2], rb[3]]);
+            let oc0 = u16::from_le_bytes([ob[0], ob[1]]);
+            let oc1 = u16::from_le_bytes([ob[2], ob[3]]);
+            eprintln!("    Mismatch block ({},{}):", bx, by);
+            eprintln!("      ref:  c0={:04X} c1={:04X}", rc0, rc1);
+            eprintln!("      ours: c0={:04X} c1={:04X}", oc0, oc1);
+            // Show the pixel values we fed to the encoder
+            let mut px_range = [255u8, 0u8];
+            for py in 0..4 { for px in 0..4 {
+                let fv = &new_float[((by*4+py).min(nh-1))*nw + (bx*4+px).min(nw-1)];
+                let u = x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0,255) as u8;
+                px_range[0] = px_range[0].min(u);
+                px_range[1] = px_range[1].max(u);
+            }}
+            eprintln!("      pixel R range: [{}, {}] spread={}", px_range[0], px_range[1], px_range[1]-px_range[0]);
+            // Dump ALL 16 pixels as BGRA u32 for Frida/native testing
+            if shown == 1 {
+                let mut bgra_line = String::from("      BGRA: [");
+                for py in 0..4 { for px in 0..4 {
+                    let fv = &new_float[((by*4+py).min(nh-1))*nw + (bx*4+px).min(nw-1)];
+                    let r = x87_degamma_scale_floor(fv[0], gamma, scale).clamp(0,255) as u8;
+                    let g = x87_degamma_scale_floor(fv[1], gamma, scale).clamp(0,255) as u8;
+                    let bb = x87_degamma_scale_floor(fv[2], gamma, scale).clamp(0,255) as u8;
+                    let bgra = 0xFF000000u32 | ((r as u32)<<16) | ((g as u32)<<8) | (bb as u32);
+                    if py*4+px > 0 { bgra_line.push_str(", "); }
+                    bgra_line.push_str(&format!("0x{:08X}", bgra));
+                }}
+                bgra_line.push(']');
+                eprintln!("{}", bgra_line);
+            }
+        }
 
         // Pixel-level analysis: decode both and compare u8 pixel values
         let mut total_diff = 0u64;
