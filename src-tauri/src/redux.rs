@@ -2590,14 +2590,49 @@ fn cluster_fit_3color(pixels: &[[u8; 4]; 16]) -> ([u8; 8], f32) {
     (out, err)
 }
 
-/// Quantize a float RGB channel value [0,255] to 5-bit or 6-bit.
-/// Matches FUN_0067c0b0: val * scale, clamp to [0, max], then trunc(clamped + 0.5).
-/// The original sets x87 to truncation mode (OR 0x0C00) before fistp.
-/// trunc(x + 0.5) for positive x = floor(x + 0.5) = standard round-half-up.
+/// Quantize a float RGB channel value [0,255] to 5-bit or 6-bit,
+/// matching the native encoder's x87 precision chain:
+///   fmul at 53-bit (CW=0x027F) → fstp dword (double-rounding to f32) → clamp → fadd 0.5 → fistp
 fn quantize_channel_rf(val: f32, scale: f32, max_val: f32) -> u32 {
-    let scaled = val * scale;
-    let clamped = if scaled < 0.0 { 0.0 } else if scaled > max_val { max_val } else { scaled };
-    (clamped + 0.5) as u32 // trunc for positive = floor = round-half-up
+    // Step 1: multiply at x87 53-bit precision, store back as f32.
+    // This "double rounding" (53-bit intermediate -> f32 store) matches the native
+    // and can differ from a plain SSE f32 multiply for certain inputs.
+    let mut scaled_f32: f32 = 0.0;
+    let cw_53bit: u16 = 0x027F; // 53-bit precision, round-to-nearest-even
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{val}]",
+            "fmul dword ptr [{scale}]",
+            "fstp dword ptr [{out}]",
+            cw = in(reg) &cw_53bit,
+            val = in(reg) &val,
+            scale = in(reg) &scale,
+            out = in(reg) &mut scaled_f32,
+            options(nostack),
+        );
+    }
+    // Step 2: clamp to [0, max_val] (same as native's conditional pointer select)
+    let clamped = if scaled_f32 < 0.0 { 0.0f32 } else if scaled_f32 > max_val { max_val } else { scaled_f32 };
+    // Step 3: add 0.5 and fistp with TRUNCATION mode (CW OR 0x0C00),
+    // matching the native's trunc(clamped + 0.5) = round-half-up for positive values.
+    let half: f32 = 0.5;
+    let mut result: i32 = 0;
+    let cw_trunc: u16 = 0x0E7F; // 53-bit + truncation mode (0x027F | 0x0C00)
+    unsafe {
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            "fld dword ptr [{val}]",
+            "fadd dword ptr [{half}]",
+            "fistp dword ptr [{out}]",
+            cw = in(reg) &cw_trunc,
+            val = in(reg) &clamped,
+            half = in(reg) &half,
+            out = in(reg) &mut result,
+            options(nostack),
+        );
+    }
+    result.max(0) as u32
 }
 
 /// Assign DXT1 4-color indices by nearest distance (FUN_0067c260).
@@ -2700,16 +2735,42 @@ fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
     if cross_rb < 0.0 { std::mem::swap(&mut minc[0], &mut maxc[0]); }
     if cross_bg < 0.0 { std::mem::swap(&mut minc[1], &mut maxc[1]); }
 
-    // Step 4: Inset endpoints (FUN_0067bfc0)
-    // step = (max - min) / 16 - 0.5/255
-    let bias: f32 = 0.0019607844; // ≈ 0.5/255, exact f32 value from binary
+    // Step 4: Inset endpoints -- matching native x87 precision (CW=0x027F).
+    // step = (max - min) * (1/16) - bias; new_max = max - step; new_min = min + step
+    let bias: f32 = 0.0019607844; // 0x3B008081, exact f32 from the native binary
+    let one_sixteenth: f32 = 0.0625;
+    let cw_inset: u16 = 0x027F;
     for c in 0..3 {
-        let step = (maxc[c] - minc[c]) * 0.0625 - bias;
-        maxc[c] -= step;
-        minc[c] += step;
-        // Clamp to [0, 255] (FUN_0067bcb0)
-        maxc[c] = maxc[c].max(0.0).min(255.0);
-        minc[c] = minc[c].max(0.0).min(255.0);
+        let mut new_max: f32 = 0.0;
+        let mut new_min: f32 = 0.0;
+        unsafe {
+            std::arch::asm!(
+                "fldcw word ptr [{cw}]",
+                // step = (max - min) * (1/16) - bias
+                "fld dword ptr [{max}]",
+                "fsub dword ptr [{min}]",
+                "fmul dword ptr [{sixteenth}]",
+                "fsub dword ptr [{bias}]",
+                // new_max = max - step  (step still in st(0))
+                "fld dword ptr [{max}]",
+                "fsub st, st(1)",
+                "fstp dword ptr [{out_max}]",
+                // new_min = min + step  (step still in st(0))
+                "fld dword ptr [{min}]",
+                "faddp st(1), st",
+                "fstp dword ptr [{out_min}]",
+                cw = in(reg) &cw_inset,
+                max = in(reg) &maxc[c],
+                min = in(reg) &minc[c],
+                sixteenth = in(reg) &one_sixteenth,
+                bias = in(reg) &bias,
+                out_max = in(reg) &mut new_max,
+                out_min = in(reg) &mut new_min,
+                options(nostack),
+            );
+        }
+        maxc[c] = new_max.max(0.0).min(255.0);
+        minc[c] = new_min.max(0.0).min(255.0);
     }
 
     // Step 5: Quantize to RGB565 and dequantize (FUN_0067c0b0)
