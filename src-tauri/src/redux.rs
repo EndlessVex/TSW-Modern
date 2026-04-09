@@ -771,6 +771,210 @@ fn x87_pow_scale_floor(base: f32, exp: f32, scale: f32) -> i32 {
     result
 }
 
+/// NVTT's fast pow(x, 11/5) approximation for gamma 2.2 linearization.
+/// Splits float into exponent + mantissa, uses a lookup table for pow(2^e, 2.2)
+/// and a degree-4 minimax polynomial for pow(mantissa, 2.2).
+/// Relative error < 2.9e-6.
+fn nvtt_powf_11_5(x: f32) -> f32 {
+    // pow(2.0, e * 11/5.0) over e=[-127,128], indexed by [sign|exponent] bits
+    static TABLE: [f32; 512] = [
+        // sign bit = 0
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+        0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 1.40129846e-45,
+        4.20389539e-45, 1.96181785e-44, 8.96831017e-44, 4.11981749e-43,
+        1.89315423e-42, 8.69926087e-42, 3.99734400e-41, 1.83670992e-40,
+        8.43930599e-40, 3.87768572e-39, 1.78171625e-38, 8.18661824e-38,
+        3.76158192e-37, 1.72836915e-36, 7.94149964e-36, 3.64895487e-35,
+        1.67661942e-34, 7.70371978e-34, 3.53970002e-33, 1.62641913e-32,
+        7.47305957e-32, 3.43371656e-31, 1.57772181e-30, 7.24930563e-30,
+        3.33090637e-29, 1.53048260e-28, 7.03225152e-28, 3.23117427e-27,
+        1.48465779e-26, 6.82169625e-26, 3.13442837e-25, 1.44020511e-24,
+        6.61744490e-24, 3.04057916e-23, 1.39708339e-22, 6.41930929e-22,
+        2.94954007e-21, 1.35525272e-20, 6.22710612e-20, 2.86122679e-19,
+        1.31467454e-18, 6.04065806e-18, 2.77555756e-17, 1.27531133e-16,
+        5.85979246e-16, 2.69245347e-15, 1.23712677e-14, 5.68434189e-14,
+        2.61183761e-13, 1.20008550e-12, 5.51414470e-12, 2.53363563e-11,
+        1.16415322e-10, 5.34904343e-10, 2.45777509e-09, 1.12929683e-08,
+        5.18888577e-08, 2.38418579e-07, 1.09548409e-06, 5.03352339e-06,
+        2.31279992e-05, 1.06268380e-04, 4.88281250e-04, 2.24355143e-03,
+        1.03086559e-02, 4.73661423e-02, 2.17637643e-01, 1.00000000e+00,
+        4.59479332e+00, 2.11121273e+01, 9.70058594e+01, 4.45721893e+02,
+        2.04800000e+03, 9.41013672e+03, 4.32376367e+04, 1.98668000e+05,
+        9.12838438e+05, 4.19430400e+06, 1.92719600e+07, 8.85506800e+07,
+        4.06872064e+08, 1.86949312e+09, 8.58993459e+09, 3.94689741e+10,
+        1.81351793e+11, 8.33273987e+11, 3.82872191e+12, 1.75921860e+13,
+        8.08324589e+13, 3.71408471e+14, 1.70654513e+15, 7.84122247e+15,
+        3.60287970e+16, 1.65544876e+17, 7.60644549e+17, 3.49500442e+18,
+        1.60588236e+19, 7.37869763e+19, 3.39035906e+20, 1.55780004e+21,
+        7.15776905e+21, 3.28884708e+22, 1.51115727e+23, 6.94345535e+23,
+        3.19037448e+24, 1.46591110e+25, 6.73555881e+25, 3.09485010e+26,
+        1.42201966e+27, 6.53388693e+27, 3.00218593e+28, 1.37944245e+29,
+        6.33825300e+29, 2.91229625e+30, 1.33814004e+31, 6.14847679e+31,
+        2.82509813e+32, 1.29807421e+33, 5.96438273e+33, 2.74051081e+34,
+        1.25920805e+35, 5.78580097e+35, 2.65845599e+36, 1.22150558e+37,
+        5.61256613e+37, 2.57885808e+38, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        // sign bit = 1 (all zeros)
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+
+    let bits = x.to_bits();
+    let k = (bits >> 23) as usize; // [sign|exponent] bits = 0..511
+    let m_bits = (bits & 0x007F_FFFF) | (127 << 23);
+    let m = f32::from_bits(m_bits);
+
+    let pow_e = TABLE[k];
+    // Minimax polynomial for pow(m, 11/5) over m=[1,2)
+    let pow_m = (((-0.00916587552f32 * m + 0.119315466) * m + 1.01847068) * m - 0.158338739) * m + 0.0297184721;
+    pow_e * pow_m
+}
+
+/// NVTT's fast pow(x, 5/11) approximation for gamma 1/2.2 de-linearization.
+/// Splits float into exponent + mantissa, uses a lookup table for pow(2^e, 1/2.2)
+/// and a degree-4 minimax polynomial for pow(mantissa, 1/2.2).
+/// Relative error < 1.2e-5.
+fn nvtt_powf_5_11(x: f32) -> f32 {
+    // pow(2.0, e * 5/11.0) over e=[-127,128], indexed by [sign|exponent] bits
+    static TABLE: [f32; 512] = [
+        // sign bit = 0
+        0.00000000e+00, 5.74369237e-18, 7.87087416e-18, 1.07858603e-17,
+        1.47804139e-17, 2.02543544e-17, 2.77555756e-17, 3.80348796e-17,
+        5.21211368e-17, 7.14242467e-17, 9.78762916e-17, 1.34124875e-16,
+        1.83798156e-16, 2.51867973e-16, 3.45147530e-16, 4.72973245e-16,
+        6.48139341e-16, 8.88178420e-16, 1.21711615e-15, 1.66787638e-15,
+        2.28557589e-15, 3.13204133e-15, 4.29199599e-15, 5.88154098e-15,
+        8.05977514e-15, 1.10447209e-14, 1.51351438e-14, 2.07404589e-14,
+        2.84217094e-14, 3.89477167e-14, 5.33720441e-14, 7.31384286e-14,
+        1.00225323e-13, 1.37343872e-13, 1.88209311e-13, 2.57912805e-13,
+        3.53431070e-13, 4.84324603e-13, 6.63694685e-13, 9.09494702e-13,
+        1.24632693e-12, 1.70790541e-12, 2.34042972e-12, 3.20721032e-12,
+        4.39500389e-12, 6.02269797e-12, 8.25320975e-12, 1.13097942e-11,
+        1.54983873e-11, 2.12382299e-11, 2.91038305e-11, 3.98824619e-11,
+        5.46529731e-11, 7.48937509e-11, 1.02630730e-10, 1.40640125e-10,
+        1.92726335e-10, 2.64102712e-10, 3.61913416e-10, 4.95948393e-10,
+        6.79623358e-10, 9.31322575e-10, 1.27623878e-09, 1.74889514e-09,
+        2.39660003e-09, 3.28418337e-09, 4.50048399e-09, 6.16724272e-09,
+        8.45128678e-09, 1.15812293e-08, 1.58703486e-08, 2.17479474e-08,
+        2.98023224e-08, 4.08396410e-08, 5.59646445e-08, 7.66912009e-08,
+        1.05093868e-07, 1.44015488e-07, 1.97351767e-07, 2.70441177e-07,
+        3.70599338e-07, 5.07851155e-07, 6.95934318e-07, 9.53674316e-07,
+        1.30686851e-06, 1.79086862e-06, 2.45411843e-06, 3.36300377e-06,
+        4.60849560e-06, 6.31525654e-06, 8.65411766e-06, 1.18591788e-05,
+        1.62512370e-05, 2.22698982e-05, 3.05175781e-05, 4.18197924e-05,
+        5.73077959e-05, 7.85317898e-05, 1.07616121e-04, 1.47471859e-04,
+        2.02088209e-04, 2.76931765e-04, 3.79493722e-04, 5.20039583e-04,
+        7.12636742e-04, 9.76562500e-04, 1.33823336e-03, 1.83384947e-03,
+        2.51301727e-03, 3.44371586e-03, 4.71909950e-03, 6.46682270e-03,
+        8.86181649e-03, 1.21437991e-02, 1.66412666e-02, 2.28043757e-02,
+        3.12500000e-02, 4.28234674e-02, 5.86831830e-02, 8.04165527e-02,
+        1.10198908e-01, 1.51011184e-01, 2.06938326e-01, 2.83578128e-01,
+        3.88601571e-01, 5.32520533e-01, 7.29740024e-01, 1.00000000e+00,
+        1.37035096e+00, 1.87786186e+00, 2.57332969e+00, 3.52636504e+00,
+        4.83235788e+00, 6.62202644e+00, 9.07450008e+00, 1.24352503e+01,
+        1.70406570e+01, 2.33516808e+01, 3.20000000e+01, 4.38512306e+01,
+        6.00915794e+01, 8.23465500e+01, 1.12843681e+02, 1.54635452e+02,
+        2.11904846e+02, 2.90384003e+02, 3.97928009e+02, 5.45301025e+02,
+        7.47253784e+02, 1.02400000e+03, 1.40323938e+03, 1.92293054e+03,
+        2.63508960e+03, 3.61099780e+03, 4.94833447e+03, 6.78095508e+03,
+        9.29228809e+03, 1.27336963e+04, 1.74496328e+04, 2.39121211e+04,
+        3.27680000e+04, 4.49036602e+04, 6.15337773e+04, 8.43228672e+04,
+        1.15551930e+05, 1.58346703e+05, 2.16990563e+05, 2.97353219e+05,
+        4.07478281e+05, 5.58388250e+05, 7.65187875e+05, 1.04857600e+06,
+        1.43691713e+06, 1.96908088e+06, 2.69833175e+06, 3.69766175e+06,
+        5.06709450e+06, 6.94369800e+06, 9.51530300e+06, 1.30393050e+07,
+        1.78684240e+07, 2.44860120e+07, 3.35544320e+07, 4.59813480e+07,
+        6.30105880e+07, 8.63466160e+07, 1.18325176e+08, 1.62147024e+08,
+        2.22198336e+08, 3.04489696e+08, 4.17257760e+08, 5.71789568e+08,
+        7.83552384e+08, 1.07374182e+09, 1.47140314e+09, 2.01633882e+09,
+        2.76309171e+09, 3.78640563e+09, 5.18870477e+09, 7.11034675e+09,
+        9.74367027e+09, 1.33522483e+10, 1.82972662e+10, 2.50736763e+10,
+        3.43597384e+10, 4.70849004e+10, 6.45228421e+10, 8.84189348e+10,
+        1.21164980e+11, 1.66038553e+11, 2.27531096e+11, 3.11797449e+11,
+        4.27271946e+11, 5.85512518e+11, 8.02357641e+11, 1.09951163e+12,
+        1.50671681e+12, 2.06473095e+12, 2.82940591e+12, 3.87727937e+12,
+        5.31323368e+12, 7.28099507e+12, 9.97751836e+12, 1.36727023e+13,
+        1.87364006e+13, 2.56754445e+13, 3.51843721e+13, 4.82149380e+13,
+        6.60713903e+13, 9.05409892e+13, 1.24072940e+14, 1.70023478e+14,
+        2.32991842e+14, 3.19280587e+14, 4.37526473e+14, 5.99564818e+14,
+        8.21614225e+14, 1.12589991e+15, 1.54287801e+15, 2.11428449e+15,
+        2.89731166e+15, 3.97033407e+15, 5.44075129e+15, 7.45573896e+15,
+        1.02169788e+16, 1.40008471e+16, 1.91860742e+16, 2.62916552e+16,
+        3.60287970e+16, 4.93720965e+16, 6.76571037e+16, 9.27139730e+16,
+        1.27050690e+17, 1.74104041e+17, 2.38583647e+17, f32::INFINITY,
+        // sign bit = 1 (all zeros)
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+
+    let bits = x.to_bits();
+    let k = (bits >> 23) as usize;
+    let m_bits = (bits & 0x007F_FFFF) | (127 << 23);
+    let m = f32::from_bits(m_bits);
+
+    let pow_e = TABLE[k];
+    // Minimax polynomial for pow(m, 5/11) over m=[1,2)
+    let pow_m = (((-0.0110083047f32 * m + 0.0905038750) * m - 0.324697506) * m + 0.876040946) * m + 0.369160989;
+    pow_e * pow_m
+}
+
 /// 1. Decode entire source mip to full pixel buffer
 /// 2. Box-filter in float space (2x2 average with rounding)
 /// 3. Re-encode block by block from filtered image
@@ -4197,6 +4401,104 @@ mod tests {
         }
         eprintln!("  [gamma] OVERALL: {}/{} ({:.2}%)",
             gamma_match, gamma_total, gamma_match as f64/gamma_total as f64*100.0);
+
+        // === NVTT GAMMA (polynomial fast-path linearization) ===
+        eprintln!("\n  === NVTT gamma (nvtt_powf_11_5 / nvtt_powf_5_11) ===");
+        let mut nvtt_total = 0usize;
+        let mut nvtt_match = 0usize;
+
+        for &(id, width, height) in test_textures {
+            let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+            let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+            let ref_data = {
+                let mut file = std::fs::File::open(&ref_path).unwrap();
+                file.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf).unwrap();
+                buf
+            };
+            let mut ms = Vec::new();
+            let (mut w, mut h) = (width, height);
+            loop { ms.push(((w+3)/4)*((h+3)/4)*block_size); if w<=1&&h<=1{break;} w=(w/2).max(1); h=(h/2).max(1); }
+            let mc = ms.len();
+            let mut rm: Vec<&[u8]> = Vec::new();
+            let mut off = fctx_header_size;
+            for i in (0..mc).rev() { rm.push(&ref_data[off..off+ms[i]]); off+=ms[i]; }
+            rm.reverse();
+
+            // Decode mip0 -> uint8 -> linearize with nvtt_powf_11_5
+            let (mut cw, mut ch) = (width, height);
+            let (pbx, pby) = ((cw/4).max(1), (ch/4).max(1));
+            let mut decoded = vec![[0u8;4]; cw*ch];
+            for by in 0..pby { for bx in 0..pbx {
+                let o2 = (by*pbx+bx)*block_size;
+                if o2+block_size > rm[0].len() { continue; }
+                let px = decode_dxt1_block(&rm[0][o2..o2+block_size]);
+                for py in 0..4 { for ppx in 0..4 {
+                    let (xx,yy) = (bx*4+ppx, by*4+py);
+                    if xx<cw && yy<ch { decoded[yy*cw+xx] = px[py*4+ppx]; }
+                }}
+            }}
+            let r255nvtt: f32 = 1.0 / 255.0;
+            let mut cur_lin: Vec<[f32;4]> = decoded.iter().map(|p| {
+                [nvtt_powf_11_5(p[0] as f32 * r255nvtt),
+                 nvtt_powf_11_5(p[1] as f32 * r255nvtt),
+                 nvtt_powf_11_5(p[2] as f32 * r255nvtt),
+                 p[3] as f32 * r255nvtt]
+            }).collect();
+
+            let mut t_total = 0usize;
+            let mut t_match = 0usize;
+            for mi in 1..mc {
+                let (nw, nh) = ((cw/2).max(1), (ch/2).max(1));
+                // Box filter in linear space
+                let mut new_lin = vec![[0.0f32;4]; nw*nh];
+                for y in 0..nh { for x in 0..nw {
+                    let (x0,y0) = ((x*2).min(cw-1), (y*2).min(ch-1));
+                    let (x1,y1) = ((x*2+1).min(cw-1), (y*2+1).min(ch-1));
+                    for c in 0..4 {
+                        new_lin[y*nw+x][c] = x87_box_filter_f32(
+                            cur_lin[y0*cw+x0][c], cur_lin[y0*cw+x1][c],
+                            cur_lin[y1*cw+x0][c], cur_lin[y1*cw+x1][c],
+                        );
+                    }
+                }}
+                // De-linearize with nvtt_powf_5_11, scale by 255, floor
+                let mut dst_u8 = vec![[0u8;4]; nw*nh];
+                for i in 0..nw*nh {
+                    for c in 0..3 {
+                        let srgb = nvtt_powf_5_11(new_lin[i][c]);
+                        let v = (srgb * 255.0).floor();
+                        dst_u8[i][c] = v.clamp(0.0, 255.0) as u8;
+                    }
+                    dst_u8[i][3] = (new_lin[i][3] * 255.0).max(0.0).min(255.0) as u8;
+                }
+                // Encode DXT1
+                let nbx = (nw/4).max(1); let nby = (nh/4).max(1);
+                let mut mip = Vec::with_capacity(nbx*nby*block_size);
+                for by2 in 0..nby { for bx2 in 0..nbx {
+                    let mut bp = [[0u8;4];16];
+                    for py in 0..4 { for px in 0..4 {
+                        bp[py*4+px] = dst_u8[((by2*4+py).min(nh-1))*nw + (bx2*4+px).min(nw-1)];
+                    }}
+                    mip.extend_from_slice(&encode_dxt1_block(&bp, false, true));
+                }}
+                let r = rm[mi]; let nb = r.len()/block_size;
+                let mut mm = 0;
+                for b in 0..nb {
+                    if mip[b*8..(b+1)*8] == r[b*8..(b+1)*8] { mm += 1; }
+                }
+                if id == 19767 {
+                    eprintln!("  [nvtt-gamma] ID {} mip{} ({}x{}): {}/{} ({:.1}%)",
+                        id, mi, nw, nh, mm, nb, mm as f64/nb as f64*100.0);
+                }
+                t_total += nb; t_match += mm;
+                cur_lin = new_lin; cw = nw; ch = nh;
+            }
+            nvtt_total += t_total; nvtt_match += t_match;
+        }
+        eprintln!("  [nvtt-gamma] OVERALL: {}/{} ({:.2}%)",
+            nvtt_match, nvtt_total, nvtt_match as f64/nvtt_total as f64*100.0);
     }
 
     #[test]
@@ -6743,6 +7045,175 @@ mod tests {
                     bx, by, rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7]);
                 printed += 1;
             }
+        }
+    }
+
+    /// Check if x87_powf and f64 pow agree for ALL 256 pixel values.
+    #[test]
+    fn test_pow_x87_vs_f64_exhaustive() {
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let mut diffs = 0;
+        for v in 0u16..=255 {
+            let f32_val = v as f32 * recip255;
+            let x87_result = if f32_val <= 0.0 { 0.0f32 } else { x87_powf(f32_val, gamma) };
+            let f64_result = if f32_val <= 0.0 { 0.0 } else {
+                (f32_val as f64).powf(gamma as f64) as f32
+            };
+            if x87_result.to_bits() != f64_result.to_bits() {
+                diffs += 1;
+                eprintln!("  v={}: x87=0x{:08X} f64=0x{:08X} diff={}ULP",
+                    v, x87_result.to_bits(), f64_result.to_bits(),
+                    (x87_result.to_bits() as i64 - f64_result.to_bits() as i64).unsigned_abs());
+            }
+        }
+        eprintln!("  pow(val, 2.2): {}/256 differ between x87 and f64", diffs);
+
+        // Also test degamma: pow(val, 1/2.2)
+        let inv_gamma: f32 = 1.0 / 2.2;
+        let mut diffs2 = 0;
+        for v in 0u16..=255 {
+            let f32_val = v as f32 * recip255;
+            let x87_result = if f32_val <= 0.0 { 0.0f32 } else { x87_powf(f32_val, inv_gamma) };
+            let f64_result = if f32_val <= 0.0 { 0.0 } else {
+                (f32_val as f64).powf(inv_gamma as f64) as f32
+            };
+            if x87_result.to_bits() != f64_result.to_bits() {
+                diffs2 += 1;
+                if diffs2 <= 10 {
+                    eprintln!("  v={}: x87=0x{:08X} f64=0x{:08X}", v, x87_result.to_bits(), f64_result.to_bits());
+                }
+            }
+        }
+        eprintln!("  pow(val, 1/2.2): {}/256 differ between x87 and f64", diffs2);
+        assert_eq!(diffs + diffs2, 0, "x87 and f64 pow differ for {} values", diffs + diffs2);
+    }
+
+    /// Compare gamma pixel values computed two ways for ALL mip1 pixels:
+    /// Method A: x87 inline asm (our pipeline)
+    /// Method B: f64 math (should match x87 53-bit)
+    /// Any difference reveals where our pipeline diverges.
+    #[test]
+    #[ignore]
+    fn bulk_gamma_pixel_comparison() {
+        use crate::rdb::parse_le_index;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let ref_dir = base.join("game-installs/normal-full-loggedin/The Secret World/RDB");
+        let ref_idx = parse_le_index(&ref_dir.join("le.idx")).unwrap();
+        let block_size = 8usize;
+        let fctx_header_size = 24usize;
+
+        let (id, width, height) = (19767u32, 512usize, 512usize);
+        let entry = ref_idx.entries.iter().find(|e| e.id == id).unwrap();
+        let ref_path = ref_dir.join(format!("{:02}.rdbdata", entry.file_num));
+        let ref_data = {
+            let mut f = std::fs::File::open(&ref_path).unwrap();
+            f.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
+            let mut b = vec![0u8; entry.length as usize];
+            f.read_exact(&mut b).unwrap();
+            b
+        };
+
+        // Extract mip0
+        let mut ms = Vec::new();
+        let (mut w, mut h) = (width, height);
+        loop { ms.push(((w+3)/4)*((h+3)/4)*block_size); if w<=1&&h<=1{break;} w=(w/2).max(1); h=(h/2).max(1); }
+        let mut rm: Vec<&[u8]> = Vec::new();
+        let mut off = fctx_header_size;
+        for i in (0..ms.len()).rev() { rm.push(&ref_data[off..off+ms[i]]); off+=ms[i]; }
+        rm.reverse();
+
+        // Decode mip0
+        let pbx = (width/4).max(1); let pby = (height/4).max(1);
+        let mut mip0 = vec![[0u8;4]; width*height];
+        for by in 0..pby { for bx in 0..pbx {
+            let o = (by*pbx+bx)*block_size;
+            if o+block_size > rm[0].len() { continue; }
+            let px = decode_dxt1_block(&rm[0][o..o+block_size]);
+            for py in 0..4 { for ppx in 0..4 {
+                let (xx,yy) = (bx*4+ppx, by*4+py);
+                if xx<width && yy<height { mip0[yy*width+xx] = px[py*4+ppx]; }
+            }}
+        }}
+
+        let (mip1_w, mip1_h) = (width/2, height/2);
+        let recip255: f32 = 1.0 / 255.0;
+        let gamma: f32 = 2.2;
+        let inv_gamma: f32 = 1.0 / 2.2;
+        let scale: f32 = 255.0;
+
+        let mut total = 0usize;
+        let mut diffs_r = 0usize;
+        let mut diffs_g = 0usize;
+        let mut diffs_b = 0usize;
+        let mut printed = 0usize;
+
+        for y in 0..mip1_h {
+            for x in 0..mip1_w {
+                let sx = x*2; let sy = y*2;
+                let x0 = sx.min(width-1); let y0 = sy.min(height-1);
+                let x1 = (sx+1).min(width-1); let y1 = (sy+1).min(height-1);
+
+                let p00 = mip0[y0*width+x0];
+                let p10 = mip0[y0*width+x1];
+                let p01 = mip0[y1*width+x0];
+                let p11 = mip0[y1*width+x1];
+
+                for c in 0..3 {
+                    // Method A: x87 pipeline (our code)
+                    let f0 = p00[c] as f32 * recip255;
+                    let f1 = p10[c] as f32 * recip255;
+                    let f2 = p01[c] as f32 * recip255;
+                    let f3 = p11[c] as f32 * recip255;
+                    let lin0 = x87_powf(f0, gamma);
+                    let lin1 = x87_powf(f1, gamma);
+                    let lin2 = x87_powf(f2, gamma);
+                    let lin3 = x87_powf(f3, gamma);
+                    let avg_lin = x87_box_filter_f32(lin0, lin1, lin2, lin3);
+                    let method_a = x87_pow_scale_floor(avg_lin, inv_gamma, scale)
+                        .clamp(0, 255) as u8;
+
+                    // Method B: f64 math (reference computation)
+                    let df0 = (p00[c] as f64) * (recip255 as f64);
+                    let df1 = (p10[c] as f64) * (recip255 as f64);
+                    let df2 = (p01[c] as f64) * (recip255 as f64);
+                    let df3 = (p11[c] as f64) * (recip255 as f64);
+                    let dlin0 = df0.powf(gamma as f64);
+                    let dlin1 = df1.powf(gamma as f64);
+                    let dlin2 = df2.powf(gamma as f64);
+                    let dlin3 = df3.powf(gamma as f64);
+                    let davg = (dlin0 + dlin1 + dlin2 + dlin3) * 0.25;
+                    let method_b = (davg.powf(inv_gamma as f64) * 255.0).floor()
+                        .max(0.0).min(255.0) as u8;
+
+                    // Method C: no-gamma (integer truncation)
+                    let method_c = ((p00[c] as u32 + p10[c] as u32 +
+                                     p01[c] as u32 + p11[c] as u32) / 4) as u8;
+
+                    total += 1;
+                    if method_a != method_b {
+                        match c { 0 => diffs_r += 1, 1 => diffs_g += 1, _ => diffs_b += 1, }
+                        if printed < 20 {
+                            printed += 1;
+                            eprintln!("  DIFF ({},{}) ch={}: x87={} f64={} nogamma={} src=[{},{},{},{}]",
+                                x, y, c, method_a, method_b, method_c,
+                                p00[c], p10[c], p01[c], p11[c]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_diffs = diffs_r + diffs_g + diffs_b;
+        eprintln!("\n=== Bulk Gamma Pixel Comparison ({} channels tested) ===", total);
+        eprintln!("  Diffs: {} ({:.2}%) [R={}, G={}, B={}]",
+            total_diffs, total_diffs as f64 / total as f64 * 100.0,
+            diffs_r, diffs_g, diffs_b);
+        if total_diffs == 0 {
+            eprintln!("  x87 pipeline and f64 reference AGREE for all pixels");
         }
     }
 
