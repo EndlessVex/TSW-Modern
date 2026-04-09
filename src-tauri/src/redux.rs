@@ -431,7 +431,14 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         let new_w = (current_w / 2).max(1);
         let new_h = (current_h / 2).max(1);
 
-        // x87 box filter in float space (keeps f32 for cascading)
+        // x87 box filter in float space (keeps f32 for cascading).
+        // The original's FUN_677FE0 is unrolled 4x per row. The unrolled blocks
+        // use different fadd orders due to the compiler's register allocation:
+        //   Block 0 (pos%4==0): fld p10; fadd p00; fadd p01; fadd p11
+        //   Block 1 (pos%4==1): fld p00; fadd p10; fadd p01; fadd p11
+        //   Block 2 (pos%4==2): fld p10; fadd p00; fadd p01; fadd p11
+        //   Block 3 (pos%4==3): fld p10; fadd p00; fadd p01; fadd p11
+        // Due to floating-point non-associativity, this per-pixel order matters.
         let mut new_float = vec![[0.0f32; 4]; new_w * new_h];
         for y in 0..new_h {
             for x in 0..new_w {
@@ -439,13 +446,18 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
                 let y0 = (y * 2).min(current_h - 1);
                 let x1 = (x * 2 + 1).min(current_w - 1);
                 let y1 = (y * 2 + 1).min(current_h - 1);
+                let p00 = &current_float[y0 * current_w + x0];
+                let p10 = &current_float[y0 * current_w + x1];
+                let p01 = &current_float[y1 * current_w + x0];
+                let p11 = &current_float[y1 * current_w + x1];
                 for c in 0..4 {
-                    new_float[y * new_w + x][c] = x87_box_filter_f32(
-                        current_float[y0 * current_w + x0][c],
-                        current_float[y0 * current_w + x1][c],
-                        current_float[y1 * current_w + x0][c],
-                        current_float[y1 * current_w + x1][c],
-                    );
+                    new_float[y * new_w + x][c] = if x % 4 == 1 {
+                        // Block 1: p00 first (fld p00; fadd p10; fadd p01; fadd p11)
+                        x87_box_filter_f32(p00[c], p10[c], p01[c], p11[c])
+                    } else {
+                        // Blocks 0,2,3: p10 first (fld p10; fadd p00; fadd p01; fadd p11)
+                        x87_box_filter_f32(p10[c], p00[c], p01[c], p11[c])
+                    };
                 }
             }
         }
@@ -1261,10 +1273,16 @@ fn generate_mip_from_linear(
             let x1 = (x * 2 + 1).min(prev_w - 1);
             let y1 = (y * 2 + 1).min(prev_h - 1);
             for c in 0..4 {
-                dst_lin[y * new_w + x][c] = x87_box_filter_f32(
-                    src[y0*prev_w+x0][c], src[y0*prev_w+x1][c],
-                    src[y1*prev_w+x0][c], src[y1*prev_w+x1][c],
-                );
+                // Match original's 4x unrolled add order
+                dst_lin[y * new_w + x][c] = if x % 4 == 1 {
+                    x87_box_filter_f32(
+                        src[y0*prev_w+x0][c], src[y0*prev_w+x1][c],
+                        src[y1*prev_w+x0][c], src[y1*prev_w+x1][c])
+                } else {
+                    x87_box_filter_f32(
+                        src[y0*prev_w+x1][c], src[y0*prev_w+x0][c],
+                        src[y1*prev_w+x0][c], src[y1*prev_w+x1][c])
+                };
             }
         }
     }
@@ -4305,17 +4323,23 @@ mod tests {
              p[3] as f32 * recip255]
         }).collect();
 
-        // Box filter
+        // Box filter — match original's 4x unrolled add order
         let mut new_float = vec![[0.0f32; 4]; nw * nh];
         for y in 0..nh { for x in 0..nw {
             let x0 = (x*2).min(width-1);
             let y0 = (y*2).min(height-1);
             let x1 = (x*2+1).min(width-1);
             let y1 = (y*2+1).min(height-1);
+            let pp00 = &current_float[y0*width+x0];
+            let pp10 = &current_float[y0*width+x1];
+            let pp01 = &current_float[y1*width+x0];
+            let pp11 = &current_float[y1*width+x1];
             for c in 0..4 {
-                new_float[y*nw+x][c] = x87_box_filter_f32(
-                    current_float[y0*width+x0][c], current_float[y0*width+x1][c],
-                    current_float[y1*width+x0][c], current_float[y1*width+x1][c]);
+                new_float[y*nw+x][c] = if x % 4 == 1 {
+                    x87_box_filter_f32(pp00[c], pp10[c], pp01[c], pp11[c])
+                } else {
+                    x87_box_filter_f32(pp10[c], pp00[c], pp01[c], pp11[c])
+                };
             }
         }}
 
