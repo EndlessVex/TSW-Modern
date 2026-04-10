@@ -417,6 +417,36 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
+    // Try native pipeline first (bit-exact mip generation on 32-bit x86)
+    #[cfg(all(target_os = "windows", target_arch = "x86"))]
+    {
+        if block_size == 8 {
+            // Native pipeline currently supports DXT1 only (block_size == 8)
+            if let Some(native_mips) = crate::encoder_native::native_generate_mips(
+                &decoded_u8,
+                current_w,
+                current_h,
+                block_size,
+                mip_count,
+                &mip_sizes,
+                &mip0_data[..mip_sizes[0]],
+            ) {
+                // Native pipeline succeeded — write FCTX: header + mips smallest-first
+                let mut output = Vec::with_capacity(decomp_size);
+                output.extend_from_slice(fctx_hdr);
+                for mip in native_mips.iter().rev() {
+                    output.extend_from_slice(mip);
+                }
+                if output.len() < decomp_size {
+                    output.resize(decomp_size, 0);
+                }
+                return Ok(output);
+            }
+        }
+    }
+
+    // Fallback: our Rust pipeline (64-bit or when native unavailable)
+
     // Convert to f32 [0,1] and gamma-linearize channels 0-2.
     // The original always applies gamma=2.2 linearization (FUN_677FC0) before
     // box filtering, confirmed via Frida trace: FUN_6554E0 always sets gamma=2.2

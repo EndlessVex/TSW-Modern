@@ -354,6 +354,68 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(decompressed)
 }
 
+/// Decompress IOg1 data via the 32-bit helper binary (bit-exact native pipeline).
+///
+/// Falls back to the in-process `decompress_iog1` if the helper binary is not found
+/// next to the main executable.
+fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_dir = std::env::temp_dir();
+    let input_path = temp_dir.join(format!("tsw_iog1_{id}_in.bin"));
+    let output_path = temp_dir.join(format!("tsw_iog1_{id}_out.bin"));
+
+    std::fs::write(&input_path, data)
+        .map_err(|e| format!("Failed to write temp IOg1: {e}"))?;
+
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("decompress-helper.exe")));
+
+    let helper = match helper {
+        Some(p) if p.exists() => p,
+        _ => {
+            let _ = std::fs::remove_file(&input_path);
+            return crate::redux::decompress_iog1(data);
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let output = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        Command::new(&helper)
+            .arg(input_path.to_str().unwrap_or(""))
+            .arg(output_path.to_str().unwrap_or(""))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Helper failed: {e}"))?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new(&helper)
+        .arg(input_path.to_str().unwrap_or(""))
+        .arg(output_path.to_str().unwrap_or(""))
+        .output()
+        .map_err(|e| format!("Helper failed: {e}"))?;
+
+    let _ = std::fs::remove_file(&input_path);
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Helper error: {stderr}"));
+    }
+
+    let fctx = std::fs::read(&output_path)
+        .map_err(|e| format!("Failed to read output: {e}"))?;
+    let _ = std::fs::remove_file(&output_path);
+
+    Ok(fctx)
+}
+
 /// Decompress CDN data — handles IOz1 (zlib), IOz2 (LZMA), IOg1 (Redux texture), or uncompressed.
 ///
 /// CDN textures are double-wrapped: `IOz1(IOg1(...))`. This function handles nested
@@ -372,7 +434,7 @@ pub fn decompress_cdn(data: &[u8]) -> Result<Cow<'_, [u8]>, String> {
             return Ok(Cow::Owned(decompress_cdn_owned(&inner)?));
         }
         if crate::redux::is_iog1(data) {
-            return Ok(Cow::Owned(crate::redux::decompress_iog1(data)?));
+            return Ok(Cow::Owned(decompress_iog1_via_helper(data)?));
         }
     }
     Ok(Cow::Borrowed(data))
@@ -390,7 +452,7 @@ fn decompress_cdn_owned(data: &[u8]) -> Result<Vec<u8>, String> {
             return decompress_cdn_owned(&inner);
         }
         if crate::redux::is_iog1(data) {
-            return crate::redux::decompress_iog1(data);
+            return decompress_iog1_via_helper(data);
         }
     }
     Ok(data.to_vec())
