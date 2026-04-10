@@ -1,0 +1,11 @@
+[package]
+name = "redux-standalone"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "decompress-helper"
+path = "src/bin/decompress_helper.rs"
+
+[dependencies]
+lzma-rs = "0.3"
