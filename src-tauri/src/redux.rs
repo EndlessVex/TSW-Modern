@@ -4354,6 +4354,19 @@ mod tests {
         assert_eq!(mismatches, 0, "Rust pipeline should match Unicorn composed chain");
     }
 
+    /// Compare our mip generation pipeline against fresh patcher output.
+    ///
+    /// IMPORTANT: The patcher only generates mips for textures <1024 wide
+    /// (confirmed by Frida: 18,799 gamma calls across a full patch, zero ≥1024).
+    /// All 1024×1024 DXT1 textures (699088 bytes) have pre-generated mips from
+    /// the CDN DDS (dwMipMapCount > 1) — the patcher copies them directly.
+    ///
+    /// For textures where the patcher DOES generate mips (<1024 wide), our
+    /// pipeline matches at 100% (Frida stage comparison: gamma 0/3960,
+    /// box filter 0/1024, degamma 0/1024, full pipeline 0/1024).
+    ///
+    /// This test compares against 699088-byte textures which are ALL pre-generated.
+    /// Match rate reflects similarity to CDN encoder, not patcher correctness.
     #[test]
     #[ignore]
     fn test_fresh_patcher_match() {
