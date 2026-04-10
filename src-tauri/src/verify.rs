@@ -380,6 +380,18 @@ fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
         }
     };
 
+    #[cfg(target_os = "windows")]
+    let output = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        Command::new(&helper)
+            .arg(input_path.to_str().unwrap_or(""))
+            .arg(output_path.to_str().unwrap_or(""))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Helper process failed: {e}"))?
+    };
+    #[cfg(not(target_os = "windows"))]
     let output = Command::new(&helper)
         .arg(input_path.to_str().unwrap_or(""))
         .arg(output_path.to_str().unwrap_or(""))
