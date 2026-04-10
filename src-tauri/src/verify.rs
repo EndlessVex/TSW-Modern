@@ -354,6 +354,55 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(decompressed)
 }
 
+/// Run IOg1 decompression through the 32-bit helper process for bit-exact
+/// x87 precision matching the native patcher.
+fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+
+    let temp_dir = std::env::temp_dir();
+    let input_path = temp_dir.join("tsw_iog1_input.bin");
+    let output_path = temp_dir.join("tsw_iog1_output.bin");
+
+    std::fs::write(&input_path, data)
+        .map_err(|e| format!("Failed to write temp IOg1: {e}"))?;
+
+    // Find helper next to the main executable
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("decompress-helper.exe")));
+
+    let helper = match helper {
+        Some(p) if p.exists() => p,
+        _ => {
+            // Fallback: 64-bit in-process decompress
+            let _ = std::fs::remove_file(&input_path);
+            return crate::redux::decompress_iog1(data);
+        }
+    };
+
+    let output = Command::new(&helper)
+        .arg(input_path.to_str().unwrap_or(""))
+        .arg(output_path.to_str().unwrap_or(""))
+        .output()
+        .map_err(|e| format!("Helper process failed: {e}"))?;
+
+    // Clean up input immediately
+    let _ = std::fs::remove_file(&input_path);
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Helper error: {stderr}"));
+    }
+
+    let fctx = std::fs::read(&output_path)
+        .map_err(|e| format!("Failed to read helper output: {e}"))?;
+
+    let _ = std::fs::remove_file(&output_path);
+
+    Ok(fctx)
+}
+
 /// Decompress CDN data — handles IOz1 (zlib), IOz2 (LZMA), IOg1 (Redux texture), or uncompressed.
 ///
 /// CDN textures are double-wrapped: `IOz1(IOg1(...))`. This function handles nested
@@ -372,7 +421,7 @@ pub fn decompress_cdn(data: &[u8]) -> Result<Cow<'_, [u8]>, String> {
             return Ok(Cow::Owned(decompress_cdn_owned(&inner)?));
         }
         if crate::redux::is_iog1(data) {
-            return Ok(Cow::Owned(crate::redux::decompress_iog1(data)?));
+            return Ok(Cow::Owned(decompress_iog1_via_helper(data)?));
         }
     }
     Ok(Cow::Borrowed(data))
@@ -390,7 +439,7 @@ fn decompress_cdn_owned(data: &[u8]) -> Result<Vec<u8>, String> {
             return decompress_cdn_owned(&inner);
         }
         if crate::redux::is_iog1(data) {
-            return crate::redux::decompress_iog1(data);
+            return decompress_iog1_via_helper(data);
         }
     }
     Ok(data.to_vec())
