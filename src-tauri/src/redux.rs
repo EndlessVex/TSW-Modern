@@ -816,11 +816,11 @@ fn x87_degamma_scale_floor(base: f32, gamma: f32, scale: f32) -> i32 {
         return 0;
     }
     let mut result: i32 = 0;
-    let cw_ext: u16 = 0x027F;
-    let cw_trunc: u16 = 0x0E7F;
+    // Pack both control words into one array to save a register on i686.
+    let cw: [u16; 2] = [0x027F, 0x0E7F]; // [round-to-nearest, truncate]
     unsafe {
         std::arch::asm!(
-            "fldcw word ptr [{cw_ext}]",
+            "fldcw word ptr [{cw}]",
             // Compute 1/gamma at x87 precision: fld1; fdiv dword [gamma]
             "fld1",
             "fdiv dword ptr [{gamma}]",
@@ -846,11 +846,10 @@ fn x87_degamma_scale_floor(base: f32, gamma: f32, scale: f32) -> i32 {
             "fstp st(1)",
             // st(0) = base^(1/gamma)
             "fmul dword ptr [{scale}]",
-            "fldcw word ptr [{cw_trunc}]",
+            "fldcw word ptr [{cw} + 2]",
             "fistp dword ptr [{out}]",
-            "fldcw word ptr [{cw_ext}]",
-            cw_ext = in(reg) &cw_ext,
-            cw_trunc = in(reg) &cw_trunc,
+            "fldcw word ptr [{cw}]",
+            cw = in(reg) cw.as_ptr(),
             gamma = in(reg) &gamma,
             base = in(reg) &base,
             scale = in(reg) &scale,
@@ -869,11 +868,11 @@ fn x87_pow_scale_floor(base: f32, exp: f32, scale: f32) -> i32 {
         return 0;
     }
     let mut result: i32 = 0;
-    let cw_ext: u16 = 0x027F;  // 53-bit precision (MSVC default)
-    let cw_trunc: u16 = 0x0E7F; // 53-bit precision, truncation (round toward zero)
+    // Pack both control words into one array to save a register on i686.
+    let cw: [u16; 2] = [0x027F, 0x0E7F]; // [round-to-nearest, truncate]
     unsafe {
         std::arch::asm!(
-            "fldcw word ptr [{cw_ext}]",
+            "fldcw word ptr [{cw}]",
             "fld dword ptr [{exp}]",
             "fld dword ptr [{base}]",
             "fyl2x",
@@ -889,11 +888,10 @@ fn x87_pow_scale_floor(base: f32, exp: f32, scale: f32) -> i32 {
             // Now st(0) = base^exp at 80-bit precision
             "fmul dword ptr [{scale}]",  // st(0) = base^exp * scale
             // Floor via truncation mode
-            "fldcw word ptr [{cw_trunc}]",
+            "fldcw word ptr [{cw} + 2]",
             "fistp dword ptr [{out}]",
-            "fldcw word ptr [{cw_ext}]",  // restore
-            cw_ext = in(reg) &cw_ext,
-            cw_trunc = in(reg) &cw_trunc,
+            "fldcw word ptr [{cw}]",  // restore
+            cw = in(reg) cw.as_ptr(),
             exp = in(reg) &exp,
             base = in(reg) &base,
             scale = in(reg) &scale,
@@ -1210,21 +1208,21 @@ fn generate_mip(
 fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
     let quarter: f32 = 0.25;
     let mut result: f32 = 0.0;
+    // Pack inputs into an array so we only need one register for all four floats,
+    // keeping total in(reg) count within i686's available GP registers.
+    let inputs = [f0, f1, f2, f3];
     let cw: u16 = 0x027F; // 53-bit precision (MSVC default), NOT 0x037F
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw}]",
-            "fld dword ptr [{f0}]",
-            "fadd dword ptr [{f1}]",
-            "fadd dword ptr [{f2}]",
-            "fadd dword ptr [{f3}]",
+            "fld dword ptr [{inp}]",
+            "fadd dword ptr [{inp} + 4]",
+            "fadd dword ptr [{inp} + 8]",
+            "fadd dword ptr [{inp} + 12]",
             "fmul dword ptr [{quarter}]",
             "fstp dword ptr [{out}]",
             cw = in(reg) &cw,
-            f0 = in(reg) &f0,
-            f1 = in(reg) &f1,
-            f2 = in(reg) &f2,
-            f3 = in(reg) &f3,
+            inp = in(reg) inputs.as_ptr(),
             quarter = in(reg) &quarter,
             out = in(reg) &mut result,
             options(nostack),
@@ -1239,18 +1237,17 @@ fn x87_box_filter_f32(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
 fn x87_float_to_u8(val: f32) -> u8 {
     let scale: f32 = 255.0;
     let mut result: i32 = 0;
-    let cw_ext: u16 = 0x027F;   // 53-bit precision (MSVC default), matching original
-    let cw_trunc: u16 = 0x0E7F; // 53-bit precision, truncation (round toward zero)
+    // Pack both control words into one array to save a register on i686.
+    let cw: [u16; 2] = [0x027F, 0x0E7F]; // [round-to-nearest, truncate]
     unsafe {
         std::arch::asm!(
-            "fldcw word ptr [{cw_ext}]",
+            "fldcw word ptr [{cw}]",
             "fld dword ptr [{val}]",
             "fmul dword ptr [{scale}]",
-            "fldcw word ptr [{cw_trunc}]",
+            "fldcw word ptr [{cw} + 2]",
             "fistp dword ptr [{out}]",
-            "fldcw word ptr [{cw_ext}]",
-            cw_ext = in(reg) &cw_ext,
-            cw_trunc = in(reg) &cw_trunc,
+            "fldcw word ptr [{cw}]",
+            cw = in(reg) cw.as_ptr(),
             val = in(reg) &val,
             scale = in(reg) &scale,
             out = in(reg) &mut result,
@@ -1335,32 +1332,30 @@ fn generate_mip_from_linear(
 /// The original uses floor (truncation), NOT fistp round-to-nearest.
 #[inline(never)]
 fn x87_box_filter_u8(f0: f32, f1: f32, f2: f32, f3: f32) -> u8 {
-    let quarter: f32 = 0.25;
-    let scale: f32 = 255.0;
+    // Pack inputs and constants into arrays so we need fewer registers.
+    // quarter and scale share one array; f0-f3 share another.
+    let consts: [f32; 2] = [0.25, 255.0]; // [quarter, scale]
+    let inputs = [f0, f1, f2, f3];
     let mut result: i32 = 0;
     let cw_ext: u16 = 0x037F;   // 80-bit precision, round-to-nearest
     let cw_trunc: u16 = 0x0F7F; // 80-bit precision, truncation (round toward zero)
     unsafe {
         std::arch::asm!(
             "fldcw word ptr [{cw_ext}]",
-            "fld dword ptr [{f0}]",
-            "fadd dword ptr [{f1}]",
-            "fadd dword ptr [{f2}]",
-            "fadd dword ptr [{f3}]",
-            "fmul dword ptr [{quarter}]",
-            "fmul dword ptr [{scale}]",
+            "fld dword ptr [{inp}]",
+            "fadd dword ptr [{inp} + 4]",
+            "fadd dword ptr [{inp} + 8]",
+            "fadd dword ptr [{inp} + 12]",
+            "fmul dword ptr [{consts}]",         // * quarter
+            "fmul dword ptr [{consts} + 4]",     // * scale
             // Switch to truncation mode for the floor conversion
             "fldcw word ptr [{cw_trunc}]",
             "fistp dword ptr [{out}]",
             "fldcw word ptr [{cw_ext}]",  // restore
             cw_ext = in(reg) &cw_ext,
             cw_trunc = in(reg) &cw_trunc,
-            f0 = in(reg) &f0,
-            f1 = in(reg) &f1,
-            f2 = in(reg) &f2,
-            f3 = in(reg) &f3,
-            quarter = in(reg) &quarter,
-            scale = in(reg) &scale,
+            inp = in(reg) inputs.as_ptr(),
+            consts = in(reg) consts.as_ptr(),
             out = in(reg) &mut result,
             options(nostack),
         );
@@ -1669,7 +1664,7 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
     for k in 0..3 { centroid[k] /= total_weight; }
 
     // Set x87 to extended precision for PCA (matching original 32-bit x87 behavior)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     let saved_cw = unsafe { x87_set_extended_precision() };
 
     // Weighted covariance matrix with METRIC WEIGHTS applied to deviations.
@@ -1742,7 +1737,7 @@ fn build_color_set(pixels: &[[u8; 4]; 16], dedup: bool) -> (Vec<[f32; 3]>, Vec<f
         x87_fma_f32(c[0], axis[0], x87_fma_f32(c[1], axis[1], 0.0)) + c[2] * axis[2]
     }).collect();
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe { x87_restore(saved_cw); }
     for i in 1..n {
         let key_dot = dots[i];
@@ -1842,7 +1837,7 @@ fn compute_3color_error(pixels: &[[u8; 4]; 16], c0: u16, c1: u16) -> f32 {
 // These helpers set the FPU to extended precision, matching the original.
 
 /// Set x87 FPU to 64-bit extended precision. Returns the saved control word.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 unsafe fn x87_set_extended_precision() -> u16 {
     let mut save_cw: u16 = 0;
     let mut new_cw: u16 = 0;
@@ -1862,7 +1857,7 @@ unsafe fn x87_set_extended_precision() -> u16 {
 }
 
 /// Restore x87 FPU control word.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 unsafe fn x87_restore(saved_cw: u16) {
     let cw = saved_cw;
     unsafe {
@@ -1875,8 +1870,8 @@ unsafe fn x87_restore(saved_cw: u16) {
 
 /// Compute (a * b - c * d) at x87 80-bit precision, return as f32.
 /// Matches: fld a; fmul b; fld c; fmul d; fsubp; fstp result
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_cross_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
     let mut result: f32 = 0.0;
     unsafe {
@@ -1890,8 +1885,6 @@ fn x87_cross_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
             a = in(reg) &a, b = in(reg) &b,
             c = in(reg) &c, d = in(reg) &d,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
@@ -1899,8 +1892,8 @@ fn x87_cross_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
 
 /// Compute a * b + c at x87 80-bit precision, return as f32.
 /// Matches: fld a; fmul b; fadd c; fstp result
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_fma_f32(a: f32, b: f32, c: f32) -> f32 {
     let mut result: f32 = 0.0;
     unsafe {
@@ -1912,16 +1905,14 @@ fn x87_fma_f32(a: f32, b: f32, c: f32) -> f32 {
             a = in(reg) &a, b = in(reg) &b,
             c = in(reg) &c,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
 }
 
 /// Compute 1.0 / a at x87 80-bit precision, return as f32.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_rcp_f32(a: f32) -> f32 {
     let mut result: f32 = 0.0;
     let one: f32 = 1.0;
@@ -1932,8 +1923,6 @@ fn x87_rcp_f32(a: f32) -> f32 {
             "fstp dword ptr [{out}]",
             one = in(reg) &one, a = in(reg) &a,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
@@ -1942,8 +1931,8 @@ fn x87_rcp_f32(a: f32) -> f32 {
 /// Compute a + b + c * d at x87 80-bit precision, return as f32.
 /// Matches: fld a; fadd b; fld c; fmul d; faddp; fstp result
 /// Critical: a+b stays at 80-bit without f32 truncation before adding c*d.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_add_fma_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
     let mut result: f32 = 0.0;
     unsafe {
@@ -1957,16 +1946,14 @@ fn x87_add_fma_f32(a: f32, b: f32, c: f32, d: f32) -> f32 {
             a = in(reg) &a, b = in(reg) &b,
             c = in(reg) &c, d = in(reg) &d,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
 }
 
 /// Compute a - b at x87 80-bit precision, return as f32.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_sub_f32(a: f32, b: f32) -> f32 {
     let mut result: f32 = 0.0;
     unsafe {
@@ -1976,8 +1963,6 @@ fn x87_sub_f32(a: f32, b: f32) -> f32 {
             "fstp dword ptr [{out}]",
             a = in(reg) &a, b = in(reg) &b,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
@@ -1985,8 +1970,8 @@ fn x87_sub_f32(a: f32, b: f32) -> f32 {
 
 /// Compute (a * b - c * d) * e at x87 80-bit precision, return as f32.
 /// Matches: fld a; fmul b; fld c; fmul d; fsubp; fmul e; fstp result
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn x87_cross_mul_f32(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
     let mut result: f32 = 0.0;
     unsafe {
@@ -2002,8 +1987,6 @@ fn x87_cross_mul_f32(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
             c = in(reg) &c, d = in(reg) &d,
             e = in(reg) &e,
             out = in(reg) &mut result,
-            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
         );
     }
     result
@@ -2011,7 +1994,7 @@ fn x87_cross_mul_f32(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
 
 fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
     // Set x87 FPU to 64-bit extended precision (matching original 32-bit code)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     let saved_cw = unsafe { x87_set_extended_precision() };
 
     let (colors, weights, order, n) = build_color_set(pixels, dedup);
@@ -2095,23 +2078,23 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                 // alpha_bb = inner_w*4/9 + (remaining_w - inner_w) + bb_mid_term
                 // Must be ONE x87 sequence — no intermediate f32 stores.
                 let alpha_bb: f32 = {
+                    // Pack operands into arrays to reduce GP register pressure
+                    // inside the large cluster_fit_4color function.
+                    let wt: [f32; 2] = [inner_w, remaining_w]; // [iw, rw]
+                    let ct: [f32; 2] = [c_4_9, bb_mid_term];   // [c49, bbm]
                     let mut result: f32 = 0.0;
                     unsafe {
                         std::arch::asm!(
-                            "fld dword ptr [{iw}]",      // st0 = inner_w
-                            "fmul dword ptr [{c49}]",    // st0 = inner_w * 4/9
-                            "fld dword ptr [{rw}]",      // st0 = remaining_w, st1 = inner_w*4/9
-                            "fsub dword ptr [{iw}]",     // st0 = remaining_w - inner_w
-                            "faddp",                      // st0 = inner_w*4/9 + (remaining_w - inner_w)
-                            "fadd dword ptr [{bbm}]",    // st0 = + bb_mid_term
-                            "fstp dword ptr [{out}]",    // store to f32
-                            iw = in(reg) &inner_w,
-                            c49 = in(reg) &c_4_9,
-                            rw = in(reg) &remaining_w,
-                            bbm = in(reg) &bb_mid_term,
+                            "fld dword ptr [{wt}]",          // st0 = inner_w
+                            "fmul dword ptr [{ct}]",         // st0 = inner_w * 4/9
+                            "fld dword ptr [{wt} + 4]",      // st0 = remaining_w, st1 = inner_w*4/9
+                            "fsub dword ptr [{wt}]",         // st0 = remaining_w - inner_w
+                            "faddp",                          // st0 = inner_w*4/9 + (remaining_w - inner_w)
+                            "fadd dword ptr [{ct} + 4]",     // st0 = + bb_mid_term
+                            "fstp dword ptr [{out}]",        // store to f32
+                            wt = in(reg) wt.as_ptr(),
+                            ct = in(reg) ct.as_ptr(),
                             out = in(reg) &mut result,
-                            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-                            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
                         );
                     }
                     result
@@ -2141,86 +2124,97 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
                     ];
 
                     // Single asm block: compute inv_det ONCE at 80-bit, then all 6 endpoints.
-                    // Uses array pointers to stay within register limits.
-                    let mut ep_a = [0.0f32; 3];
-                    let mut ep_b = [0.0f32; 3];
-                    let mut _dummy: f32 = 0.0;
-                    let alphas = [alpha_aa, alpha_bb, alpha_ab];
+                    // Pack all inputs and outputs into flat arrays (2 pointers) to keep
+                    // GP register pressure low inside this large function on i686.
+                    //
+                    // inp layout (9 f32, 4 bytes each):
+                    //   [0]=aa, [1]=bb, [2]=ab, [3..5]=beta_a RGB, [6..8]=beta_b RGB
+                    // out layout (7 f32):
+                    //   [0..2]=ep_a RGB, [3..5]=ep_b RGB, [6]=inv_det discard
+                    let inp: [f32; 9] = [
+                        alpha_aa, alpha_bb, alpha_ab,
+                        beta_a[0], beta_a[1], beta_a[2],
+                        beta_b[0], beta_b[1], beta_b[2],
+                    ];
+                    let mut ep_out = [0.0f32; 7];
                     unsafe {
                         std::arch::asm!(
                             // --- Compute inv_det at 80-bit (stays on stack) ---
-                            "fld dword ptr [{al}]",        // aa
-                            "fmul dword ptr [{al} + 4]",   // * bb
-                            "fld dword ptr [{al} + 8]",    // ab
-                            "fmul dword ptr [{al} + 8]",   // * ab
-                            "fsubp",                        // det = aa*bb - ab*ab (80-bit)
+                            // inp: aa=0, bb=4, ab=8
+                            "fld dword ptr [{inp}]",           // aa
+                            "fmul dword ptr [{inp} + 4]",      // * bb
+                            "fld dword ptr [{inp} + 8]",       // ab
+                            "fmul dword ptr [{inp} + 8]",      // * ab
+                            "fsubp",                            // det = aa*bb - ab*ab (80-bit)
                             "fld1",
-                            "fdivrp",                       // st0 = inv_det (80-bit)
+                            "fdivrp",                           // st0 = inv_det (80-bit)
 
                             // --- Channel R ---
-                            "fld dword ptr [{ba}]",        // beta_a[0]
-                            "fmul dword ptr [{al} + 4]",   // * bb
-                            "fld dword ptr [{bv}]",        // beta_b[0]
-                            "fmul dword ptr [{al} + 8]",   // * ab
+                            // inp: ba[0]=12, bv[0]=24
+                            // out: ea[0]=0, eb[0]=12
+                            "fld dword ptr [{inp} + 12]",      // beta_a[0]
+                            "fmul dword ptr [{inp} + 4]",      // * bb
+                            "fld dword ptr [{inp} + 24]",      // beta_b[0]
+                            "fmul dword ptr [{inp} + 8]",      // * ab
                             "fsubp",
-                            "fmul st, st(1)",               // * inv_det (80-bit!)
-                            "fstp dword ptr [{ea}]",        // ep_a[0]
+                            "fmul st, st(1)",                   // * inv_det (80-bit!)
+                            "fstp dword ptr [{out}]",           // ep_a[0]
 
-                            "fld dword ptr [{bv}]",        // beta_b[0]
-                            "fmul dword ptr [{al}]",       // * aa
-                            "fld dword ptr [{ba}]",        // beta_a[0]
-                            "fmul dword ptr [{al} + 8]",   // * ab
+                            "fld dword ptr [{inp} + 24]",      // beta_b[0]
+                            "fmul dword ptr [{inp}]",          // * aa
+                            "fld dword ptr [{inp} + 12]",      // beta_a[0]
+                            "fmul dword ptr [{inp} + 8]",      // * ab
                             "fsubp",
                             "fmul st, st(1)",
-                            "fstp dword ptr [{eb}]",        // ep_b[0]
+                            "fstp dword ptr [{out} + 12]",     // ep_b[0]
 
                             // --- Channel G ---
-                            "fld dword ptr [{ba} + 4]",
-                            "fmul dword ptr [{al} + 4]",
-                            "fld dword ptr [{bv} + 4]",
-                            "fmul dword ptr [{al} + 8]",
+                            // inp: ba[1]=16, bv[1]=28
+                            // out: ea[1]=4, eb[1]=16
+                            "fld dword ptr [{inp} + 16]",
+                            "fmul dword ptr [{inp} + 4]",
+                            "fld dword ptr [{inp} + 28]",
+                            "fmul dword ptr [{inp} + 8]",
                             "fsubp",
                             "fmul st, st(1)",
-                            "fstp dword ptr [{ea} + 4]",
+                            "fstp dword ptr [{out} + 4]",
 
-                            "fld dword ptr [{bv} + 4]",
-                            "fmul dword ptr [{al}]",
-                            "fld dword ptr [{ba} + 4]",
-                            "fmul dword ptr [{al} + 8]",
+                            "fld dword ptr [{inp} + 28]",
+                            "fmul dword ptr [{inp}]",
+                            "fld dword ptr [{inp} + 16]",
+                            "fmul dword ptr [{inp} + 8]",
                             "fsubp",
                             "fmul st, st(1)",
-                            "fstp dword ptr [{eb} + 4]",
+                            "fstp dword ptr [{out} + 16]",
 
                             // --- Channel B ---
-                            "fld dword ptr [{ba} + 8]",
-                            "fmul dword ptr [{al} + 4]",
-                            "fld dword ptr [{bv} + 8]",
-                            "fmul dword ptr [{al} + 8]",
+                            // inp: ba[2]=20, bv[2]=32
+                            // out: ea[2]=8, eb[2]=20
+                            "fld dword ptr [{inp} + 20]",
+                            "fmul dword ptr [{inp} + 4]",
+                            "fld dword ptr [{inp} + 32]",
+                            "fmul dword ptr [{inp} + 8]",
                             "fsubp",
                             "fmul st, st(1)",
-                            "fstp dword ptr [{ea} + 8]",
+                            "fstp dword ptr [{out} + 8]",
 
-                            "fld dword ptr [{bv} + 8]",
-                            "fmul dword ptr [{al}]",
-                            "fld dword ptr [{ba} + 8]",
-                            "fmul dword ptr [{al} + 8]",
+                            "fld dword ptr [{inp} + 32]",
+                            "fmul dword ptr [{inp}]",
+                            "fld dword ptr [{inp} + 20]",
+                            "fmul dword ptr [{inp} + 8]",
                             "fsubp",
                             "fmul st, st(1)",
-                            "fstp dword ptr [{eb} + 8]",
+                            "fstp dword ptr [{out} + 20]",
 
-                            // Pop inv_det
-                            "fstp dword ptr [{dm}]",
+                            // Pop inv_det into discard slot out[6]=24
+                            "fstp dword ptr [{out} + 24]",
 
-                            al = in(reg) alphas.as_ptr(),
-                            ba = in(reg) beta_a.as_ptr(),
-                            bv = in(reg) beta_b.as_ptr(),
-                            ea = in(reg) ep_a.as_mut_ptr(),
-                            eb = in(reg) ep_b.as_mut_ptr(),
-                            dm = in(reg) &mut _dummy,
-                            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-                            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                            inp = in(reg) inp.as_ptr(),
+                            out = in(reg) ep_out.as_mut_ptr(),
                         );
                     }
+                    let mut ep_a = [ep_out[0], ep_out[1], ep_out[2]];
+                    let mut ep_b = [ep_out[3], ep_out[4], ep_out[5]];
                     for k in 0..3 {
                         ep_a[k] = ep_a[k].clamp(0.0, 1.0);
                         ep_b[k] = ep_b[k].clamp(0.0, 1.0);
@@ -2352,8 +2346,6 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
 
                                 p = in(reg) err_in.as_ptr(),
                                 out = in(reg) &mut err,
-                                out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
-                                out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
                             );
                         }
                     }
@@ -2476,7 +2468,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
         out[0..2].copy_from_slice(&c0.to_le_bytes());
         out[2..4].copy_from_slice(&c1.to_le_bytes());
         let err = compute_4color_error(pixels, c0, c1);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         unsafe { x87_restore(saved_cw); }
         return (out, err);
     }
@@ -2486,7 +2478,7 @@ fn cluster_fit_4color(pixels: &[[u8; 4]; 16], dedup: bool) -> ([u8; 8], f32) {
     out[2..4].copy_from_slice(&c1.to_le_bytes());
     out[4..8].copy_from_slice(&indices.to_le_bytes());
     let err = compute_4color_error(pixels, c0, c1);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe { x87_restore(saved_cw); }
     (out, err)
 }
@@ -2759,40 +2751,37 @@ fn encode_dxt1_range_fit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
 
     // Step 4: Inset endpoints -- matching native x87 precision (CW=0x027F).
     // step = (max - min) * (1/16) - bias; new_max = max - step; new_min = min + step
-    let bias: f32 = 0.0019607844; // 0x3B008081, exact f32 from the native binary
-    let one_sixteenth: f32 = 0.0625;
+    // Pack constants together to stay within i686's GP register budget.
+    let inset_consts: [f32; 2] = [0.0625, 0.0019607844]; // [one_sixteenth, bias]
     let cw_inset: u16 = 0x027F;
     for c in 0..3 {
-        let mut new_max: f32 = 0.0;
-        let mut new_min: f32 = 0.0;
+        let mut out_vals: [f32; 2] = [0.0, 0.0]; // [new_max, new_min]
         unsafe {
             std::arch::asm!(
                 "fldcw word ptr [{cw}]",
                 // step = (max - min) * (1/16) - bias
                 "fld dword ptr [{max}]",
                 "fsub dword ptr [{min}]",
-                "fmul dword ptr [{sixteenth}]",
-                "fsub dword ptr [{bias}]",
+                "fmul dword ptr [{consts}]",          // * one_sixteenth
+                "fsub dword ptr [{consts} + 4]",      // - bias
                 // new_max = max - step  (step still in st(0))
                 "fld dword ptr [{max}]",
                 "fsub st, st(1)",
-                "fstp dword ptr [{out_max}]",
+                "fstp dword ptr [{out}]",             // out_vals[0] = new_max
                 // new_min = min + step  (step still in st(0))
                 "fld dword ptr [{min}]",
                 "faddp st(1), st",
-                "fstp dword ptr [{out_min}]",
+                "fstp dword ptr [{out} + 4]",         // out_vals[1] = new_min
                 cw = in(reg) &cw_inset,
                 max = in(reg) &maxc[c],
                 min = in(reg) &minc[c],
-                sixteenth = in(reg) &one_sixteenth,
-                bias = in(reg) &bias,
-                out_max = in(reg) &mut new_max,
-                out_min = in(reg) &mut new_min,
+                consts = in(reg) inset_consts.as_ptr(),
+                out = in(reg) out_vals.as_mut_ptr(),
                 options(nostack),
             );
         }
-        maxc[c] = new_max.max(0.0).min(255.0);
-        minc[c] = new_min.max(0.0).min(255.0);
+        maxc[c] = out_vals[0].max(0.0).min(255.0);
+        minc[c] = out_vals[1].max(0.0).min(255.0);
     }
 
     // Step 5: Quantize to RGB565 and dequantize (FUN_0067c0b0)
@@ -2878,45 +2867,45 @@ fn refine_endpoints_lsq(
     let mut new_ep0 = [0.0f32; 3];
     let mut new_ep1 = [0.0f32; 3];
     let cw: u16 = 0x027F;
+    // Pack the four f64 matrix coefficients into one array (aa, bb, ab, det at
+    // offsets 0, 8, 16, 24) to stay within i686's GP register budget.
+    let mat64: [f64; 4] = [aa_hi, bb_hi, ab_hi, det_hi];
     for c in 0..3 {
         // Compute (bb * a_pixel[c] - ab * b_pixel[c]) / det at x87 precision
-        // and (aa * b_pixel[c] - ab * a_pixel[c]) / det at x87 precision
+        // and (aa * b_pixel[c] - ab * a_pixel[c]) / det at x87 precision.
         // All loads from f64 to match native's x87-register-resident accumulators.
-        let mut ep0_val: f32 = 0.0;
-        let mut ep1_val: f32 = 0.0;
+        // Pack pixel pair and output pair into small arrays to stay within 5 GP regs.
+        let pix: [f32; 2] = [a_pixel[c], b_pixel[c]]; // [a_pix, b_pix]
+        let mut ep_out: [f32; 2] = [0.0, 0.0];         // [ep0_val, ep1_val]
         unsafe {
             std::arch::asm!(
                 "fldcw word ptr [{cw}]",
                 // ep0 = (bb * a_pix - ab * b_pix) / det
-                "fld qword ptr [{bb}]",
-                "fmul dword ptr [{a_pix}]",
-                "fld qword ptr [{ab}]",
-                "fmul dword ptr [{b_pix}]",
-                "fsubp st(1), st(0)",   // st(0) = bb*a_pix - ab*b_pix
-                "fdiv qword ptr [{det}]",
-                "fstp dword ptr [{ep0}]",
+                // mat64: [aa=0, bb=8, ab=16, det=24] (f64, 8 bytes each)
+                "fld qword ptr [{mat} + 8]",     // bb
+                "fmul dword ptr [{pix}]",         // * a_pix
+                "fld qword ptr [{mat} + 16]",    // ab
+                "fmul dword ptr [{pix} + 4]",    // * b_pix
+                "fsubp st(1), st(0)",             // bb*a_pix - ab*b_pix
+                "fdiv qword ptr [{mat} + 24]",   // / det
+                "fstp dword ptr [{ep}]",          // ep_out[0] = ep0
                 // ep1 = (aa * b_pix - ab * a_pix) / det
-                "fld qword ptr [{aa_v}]",
-                "fmul dword ptr [{b_pix}]",
-                "fld qword ptr [{ab}]",
-                "fmul dword ptr [{a_pix}]",
-                "fsubp st(1), st(0)",   // st(0) = aa*b_pix - ab*a_pix
-                "fdiv qword ptr [{det}]",
-                "fstp dword ptr [{ep1}]",
+                "fld qword ptr [{mat}]",          // aa
+                "fmul dword ptr [{pix} + 4]",    // * b_pix
+                "fld qword ptr [{mat} + 16]",    // ab
+                "fmul dword ptr [{pix}]",         // * a_pix
+                "fsubp st(1), st(0)",             // aa*b_pix - ab*a_pix
+                "fdiv qword ptr [{mat} + 24]",   // / det
+                "fstp dword ptr [{ep} + 4]",     // ep_out[1] = ep1
                 cw = in(reg) &cw,
-                bb = in(reg) &bb_hi,
-                aa_v = in(reg) &aa_hi,
-                ab = in(reg) &ab_hi,
-                a_pix = in(reg) &a_pixel[c],
-                b_pix = in(reg) &b_pixel[c],
-                det = in(reg) &det_hi,
-                ep0 = in(reg) &mut ep0_val,
-                ep1 = in(reg) &mut ep1_val,
+                mat = in(reg) mat64.as_ptr(),
+                pix = in(reg) pix.as_ptr(),
+                ep = in(reg) ep_out.as_mut_ptr(),
                 options(nostack),
             );
         }
-        new_ep0[c] = ep0_val.max(0.0).min(255.0);
-        new_ep1[c] = ep1_val.max(0.0).min(255.0);
+        new_ep0[c] = ep_out[0].max(0.0).min(255.0);
+        new_ep1[c] = ep_out[1].max(0.0).min(255.0);
     }
 
     let (mut c0, mut ep0) = quantize_endpoint_rf(&new_ep0);
@@ -2939,6 +2928,7 @@ fn refine_endpoints_lsq(
 /// The encoder code is loaded from encoder_blob.bin (extracted from
 /// ClientPatcher.exe) and mapped at its original virtual address (0x0067B000)
 /// using VirtualAlloc.
+#[cfg(target_arch = "x86")]
 fn native_encode_dxt1_rangefit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -3003,18 +2993,22 @@ fn native_encode_dxt1_rangefit(pixels: &[[u8; 4]; 16]) -> [u8; 8] {
     let cw: u16 = 0x027F;
 
     unsafe {
+        // Set x87 control word (separate block to reduce register pressure in the call block)
+        std::arch::asm!(
+            "fldcw word ptr [{cw}]",
+            cw = in(reg) &cw,
+        );
+
         // FUN_0067CF20 at its original address (PE mapped at correct base)
         let func_addr: u32 = 0x0067CF20;
         let pixel_ptr = bgra.as_ptr();
         let out_ptr = output.as_mut_ptr();
 
         std::arch::asm!(
-            "fldcw word ptr [{cw}]",
             "push {out_ptr}",
             "push {pixel_ptr}",
             "call {func}",
             "add esp, 8",
-            cw = in(reg) &cw,
             out_ptr = in(reg) out_ptr,
             pixel_ptr = in(reg) pixel_ptr,
             func = in(reg) func_addr,
