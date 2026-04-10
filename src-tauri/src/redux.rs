@@ -2681,30 +2681,55 @@ fn quantize_channel_rf(val: f32, scale: f32, max_val: f32) -> u32 {
 
 /// Assign DXT1 4-color indices by nearest distance (FUN_0067c260).
 /// Endpoints are dequantized float RGB [0,255].
+///
+/// Matches the native's hybrid precision model exactly:
+///  - Color2/color3 are precomputed at x87 53-bit, stored to f32 (fstp dword)
+///  - d0 and d3 stay on the x87 stack at 53-bit (never stored to f32)
+///  - d1 and d2 are stored to f32 via fstp dword ptr, then reloaded for comparison
+///  - Comparisons use mixed precision: d0/d3 at 53-bit, d1/d2 at f32→53-bit
 fn assign_indices_distance(fpixels: &[[f32; 3]; 16], ep0: &[f32; 3], ep1: &[f32; 3]) -> u32 {
-    // Interpolated palette colors in float space
+    // Precompute color2/color3 at f64 (53-bit), store to f32 — matching native's
+    // x87 fmul/fadd at CW=0x027F followed by fstp dword ptr.
+    let c23_a: f64 = 0.6666666_f32 as f64;   // 0x3F2AAAAA
+    let c13_a: f64 = 0.33333334_f32 as f64;  // 0x3EAAAAAB
+    let c13_b: f64 = 0.3333333_f32 as f64;   // 0x3EAAAAAA
+    let c23_b: f64 = 0.6666667_f32 as f64;   // 0x3F2AAAAB
     let color2 = [
-        ep0[0] * 0.6666666 + ep1[0] * 0.33333334,
-        ep0[1] * 0.6666666 + ep1[1] * 0.33333334,
-        ep0[2] * 0.6666666 + ep1[2] * 0.33333334,
+        (ep0[0] as f64 * c23_a + ep1[0] as f64 * c13_a) as f32,
+        (ep0[1] as f64 * c23_a + ep1[1] as f64 * c13_a) as f32,
+        (ep0[2] as f64 * c23_a + ep1[2] as f64 * c13_a) as f32,
     ];
     let color3 = [
-        ep0[0] * 0.3333333 + ep1[0] * 0.6666667,
-        ep0[1] * 0.3333333 + ep1[1] * 0.6666667,
-        ep0[2] * 0.3333333 + ep1[2] * 0.6666667,
+        (ep0[0] as f64 * c13_b + ep1[0] as f64 * c23_b) as f32,
+        (ep0[1] as f64 * c13_b + ep1[1] as f64 * c23_b) as f32,
+        (ep0[2] as f64 * c13_b + ep1[2] as f64 * c23_b) as f32,
     ];
+
+    let e0 = [ep0[0] as f64, ep0[1] as f64, ep0[2] as f64];
+    let e1 = [ep1[0] as f64, ep1[1] as f64, ep1[2] as f64];
 
     let mut indices = 0u32;
     for i in 0..16 {
-        let p = &fpixels[i];
-        let d0 = (ep0[0]-p[0])*(ep0[0]-p[0]) + (ep0[1]-p[1])*(ep0[1]-p[1]) + (ep0[2]-p[2])*(ep0[2]-p[2]);
-        let d1 = (ep1[0]-p[0])*(ep1[0]-p[0]) + (ep1[1]-p[1])*(ep1[1]-p[1]) + (ep1[2]-p[2])*(ep1[2]-p[2]);
-        let d2 = (color2[0]-p[0])*(color2[0]-p[0]) + (color2[1]-p[1])*(color2[1]-p[1]) + (color2[2]-p[2])*(color2[2]-p[2]);
-        let d3 = (color3[0]-p[0])*(color3[0]-p[0]) + (color3[1]-p[1])*(color3[1]-p[1]) + (color3[2]-p[2])*(color3[2]-p[2]);
+        let p = [fpixels[i][0] as f64, fpixels[i][1] as f64, fpixels[i][2] as f64];
+        let c2 = [color2[0] as f64, color2[1] as f64, color2[2] as f64];
+        let c3 = [color3[0] as f64, color3[1] as f64, color3[2] as f64];
+
+        // d0: stays on x87 stack at 53-bit (never stored to f32)
+        let d0: f64 = (e0[0]-p[0])*(e0[0]-p[0]) + (e0[1]-p[1])*(e0[1]-p[1]) + (e0[2]-p[2])*(e0[2]-p[2]);
+        // d1: computed at 53-bit, stored to f32 (native fstp dword ptr [esp+0x14])
+        let d1: f32 = ((e1[0]-p[0])*(e1[0]-p[0]) + (e1[1]-p[1])*(e1[1]-p[1]) + (e1[2]-p[2])*(e1[2]-p[2])) as f32;
+        // d2: computed at 53-bit, stored to f32 (native fstp dword ptr [esp+0x10])
+        let d2: f32 = ((c2[0]-p[0])*(c2[0]-p[0]) + (c2[1]-p[1])*(c2[1]-p[1]) + (c2[2]-p[2])*(c2[2]-p[2])) as f32;
+        // d3: stays on x87 stack at 53-bit (never stored to f32)
+        let d3: f64 = (c3[0]-p[0])*(c3[0]-p[0]) + (c3[1]-p[1])*(c3[1]-p[1]) + (c3[2]-p[2])*(c3[2]-p[2]);
+
+        // Comparisons: d1/d2 reload from f32 via fld dword ptr → extended to 53-bit
+        let d1d = d1 as f64;
+        let d2d = d2 as f64;
 
         // Bit-logic matching FUN_0067c260
-        let bit1 = (d2 < d0 && d2 < d1) || (d3 < d1 && d3 < d0);
-        let bit0 = d3 < d2 && d3 < d0;
+        let bit1 = (d2d < d0 && d2d < d1d) || (d3 < d1d && d3 < d0);
+        let bit0 = d3 < d2d && d3 < d0;
         let idx = (bit1 as u32) * 2 | (bit0 as u32);
         indices |= idx << (i * 2);
     }
