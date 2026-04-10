@@ -55,6 +55,10 @@ CLAUDE.md
 !tsconfig.node.json
 !src-tauri/tauri.conf.json
 
+# ── Release binaries (built locally) ──
+Secret.World.Launcher.exe
+decompress-helper.exe
+
 # ── Misc ──
 coverage/
 .cache/
