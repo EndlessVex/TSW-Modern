@@ -358,6 +358,14 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
 ///
 /// Falls back to the in-process `decompress_iog1` if the helper binary is not found
 /// next to the main executable.
+/// Set the install path so the helper can find ClientPatcher.exe.
+/// Call this once at the start of a download/install operation.
+static INSTALL_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_install_path(path: &str) {
+    let _ = INSTALL_PATH.set(std::path::PathBuf::from(path));
+}
+
 fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -371,6 +379,7 @@ fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
     std::fs::write(&input_path, data)
         .map_err(|e| format!("Failed to write temp IOg1: {e}"))?;
 
+    // Find helper next to the main executable
     let helper = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("decompress-helper.exe")));
@@ -383,6 +392,11 @@ fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
         }
     };
 
+    // ClientPatcher.exe is in the install directory (we downloaded it there)
+    let patcher_path = INSTALL_PATH.get()
+        .map(|p| p.join("ClientPatcher.exe"))
+        .unwrap_or_default();
+
     #[cfg(target_os = "windows")]
     let output = {
         use std::os::windows::process::CommandExt;
@@ -390,6 +404,7 @@ fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
         Command::new(&helper)
             .arg(input_path.to_str().unwrap_or(""))
             .arg(output_path.to_str().unwrap_or(""))
+            .arg(patcher_path.to_str().unwrap_or(""))
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| format!("Helper failed: {e}"))?
@@ -398,6 +413,7 @@ fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
     let output = Command::new(&helper)
         .arg(input_path.to_str().unwrap_or(""))
         .arg(output_path.to_str().unwrap_or(""))
+        .arg(patcher_path.to_str().unwrap_or(""))
         .output()
         .map_err(|e| format!("Helper failed: {e}"))?;
 

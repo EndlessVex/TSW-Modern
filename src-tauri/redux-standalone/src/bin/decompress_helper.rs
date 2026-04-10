@@ -2,9 +2,14 @@ use std::{env, fs, process};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: decompress-helper <input_iog1> <output_fctx>");
+    if args.len() < 3 {
+        eprintln!("Usage: decompress-helper <input_iog1> <output_fctx> [clientpatcher_path]");
         process::exit(1);
+    }
+
+    // If a ClientPatcher.exe path is provided (arg 3), tell the native pipeline where to find it
+    if args.len() >= 4 && !args[3].is_empty() {
+        redux_standalone::encoder_native::set_pe_path(&args[3]);
     }
 
     let iog1_data = match fs::read(&args[1]) {

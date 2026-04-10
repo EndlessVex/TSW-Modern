@@ -163,8 +163,21 @@ mod inner {
         true
     }
 
-    /// Locate ClientPatcher.exe, trying multiple known paths.
+    /// Set an explicit path to ClientPatcher.exe (called from the helper binary).
+    static EXPLICIT_PE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+    pub fn set_pe_path(path: &str) {
+        let _ = EXPLICIT_PE_PATH.set(std::path::PathBuf::from(path));
+    }
+
+    /// Locate ClientPatcher.exe, trying explicit path first, then known paths.
     fn find_pe_path() -> Option<std::path::PathBuf> {
+        // Check explicit path first (set by helper binary from install directory)
+        if let Some(p) = EXPLICIT_PE_PATH.get() {
+            if p.exists() {
+                return Some(p.clone());
+            }
+        }
         let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
             Ok(d) => d,
             Err(_) => {
@@ -1052,3 +1065,6 @@ pub fn is_ready() -> bool {
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86")))]
 pub fn reset_pool() {}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86")))]
+pub fn set_pe_path(_path: &str) {}
