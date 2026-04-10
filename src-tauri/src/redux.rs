@@ -334,8 +334,11 @@ pub fn decompress_iog1(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // If the DDS contains multiple mip levels (dwMipMapCount > 1 and payload > mip0),
-    // use the pre-generated mips from the DDS instead of regenerating.
-    if dds_mip_count as usize > 1 && dds_payload_size > mip_sizes[0] {
+    // use the pre-generated mips ONLY for large textures (≥1024 wide).
+    // The native patcher regenerates mips for all textures <1024 wide even when
+    // the DDS has pre-generated mips (confirmed by Frida: 18,799 gamma calls
+    // across a full patch, zero for textures ≥1024 wide).
+    if dds_mip_count as usize > 1 && dds_payload_size > mip_sizes[0] && stream1.width >= 1024 {
         // DDS has pre-generated mips — use them directly
         let mut all_mips: Vec<Vec<u8>> = Vec::with_capacity(mip_count);
         let mut dds_off = 0;
