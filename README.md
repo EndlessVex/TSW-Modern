@@ -22,7 +22,7 @@ A downloader for **The Secret World**.
 
 ## Known issues
 
-- **ClientPatcher's "Repair Broken Data" will re-download textures unnecessarily.** Our downloader generates texture mip levels during install. The result is visually identical but not byte-for-byte the same as the original, so ClientPatcher's hash check sees them as corrupted. It'll re-download ~4.6GB the first time, then ~129MB on every subsequent repair. The textures work fine in-game — this is just a hash mismatch, not actual corruption.
+- **ClientPatcher's "Repair Broken Data" re-downloads files unnecessarily.** If you run a repair through the official ClientPatcher, it will report downloading several GB of files. It isn't actually fixing anything. We verified that every file it "repairs" is already identical to what it re-downloads. The patcher's repair mode just does a full re-download pass regardless of whether anything is wrong, writing the data to new files and rebuilding the index. This is just how the patcher works unfortunately.
 - **UI modding source files not included.** Funcom shipped Flash/ActionScript source for building custom UIs, but these aren't part of the core game files so we skip them during install. If you want them, [download the zip](https://github.com/EndlessVex/TSW-Modern/releases/download/game-data/Customized.zip) and extract it to `Data/Gui/` in your install folder.
 
 ## Not affiliated with Funcom
