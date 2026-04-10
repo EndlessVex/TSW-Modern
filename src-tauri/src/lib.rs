@@ -368,9 +368,6 @@ async fn start_full_install(app: tauri::AppHandle, install_path: String) -> Resu
     PATCH_PAUSED.store(false, Ordering::Relaxed);
     PATCH_CANCEL.store(false, Ordering::Relaxed);
 
-    // Tell the decompression helper where to find ClientPatcher.exe in the install dir
-    verify::set_install_path(&install_path);
-
     // Prevent system sleep during download (Windows)
     #[cfg(target_os = "windows")]
     {
