@@ -358,10 +358,13 @@ pub fn decompress_ioz2(data: &[u8]) -> Result<Vec<u8>, String> {
 /// x87 precision matching the native patcher.
 fn decompress_iog1_via_helper(data: &[u8]) -> Result<Vec<u8>, String> {
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_dir = std::env::temp_dir();
-    let input_path = temp_dir.join("tsw_iog1_input.bin");
-    let output_path = temp_dir.join("tsw_iog1_output.bin");
+    let input_path = temp_dir.join(format!("tsw_iog1_{id}_in.bin"));
+    let output_path = temp_dir.join(format!("tsw_iog1_{id}_out.bin"));
 
     std::fs::write(&input_path, data)
         .map_err(|e| format!("Failed to write temp IOg1: {e}"))?;
