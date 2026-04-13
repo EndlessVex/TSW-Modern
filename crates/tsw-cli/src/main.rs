@@ -6,6 +6,7 @@ mod errors;
 mod init;
 mod install;
 mod reporter;
+mod uninstall;
 mod verify_cmd;
 
 use anyhow::Result;
@@ -49,10 +50,7 @@ fn run() -> Result<i32> {
         args::Command::Init(init_args) => init::run(init_args, cli.config),
         args::Command::Install(install_args) => install::run(install_args, cli.config),
         args::Command::Verify(verify_args) => verify_cmd::run(verify_args, cli.config),
-        args::Command::Uninstall(_) => {
-            println!("uninstall: not yet implemented");
-            Ok(0)
-        }
+        args::Command::Uninstall(uninstall_args) => uninstall::run(uninstall_args, cli.config),
     }
 }
 
