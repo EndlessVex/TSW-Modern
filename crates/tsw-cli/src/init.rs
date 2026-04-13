@@ -62,7 +62,9 @@ fn default_install_dir_suggestion() -> PathBuf {
 }
 
 /// Validate that the path is absolute and either exists or can be created.
-fn validate_install_dir(path: &Path) -> Result<PathBuf> {
+/// Creates the directory (including any missing parent directories) after
+/// confirming with the user.
+pub(crate) fn validate_install_dir(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         anyhow::bail!(
             "install directory must be an absolute path, got: {}",
@@ -77,13 +79,6 @@ fn validate_install_dir(path: &Path) -> Result<PathBuf> {
         return Ok(path.canonicalize()?);
     }
 
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine parent of {}", path.display()))?;
-    if !parent.exists() {
-        anyhow::bail!("parent directory does not exist: {}", parent.display());
-    }
-
     println!("Directory does not exist: {}", path.display());
     let create: String = Input::new()
         .with_prompt("Create it?")
@@ -92,8 +87,36 @@ fn validate_install_dir(path: &Path) -> Result<PathBuf> {
     if !matches!(create.trim().to_lowercase().as_str(), "y" | "yes") {
         anyhow::bail!("aborted — install directory not created");
     }
+    // create_dir_all creates parents too, so `~/Games/TheSecretWorld` works
+    // even when `~/Games` does not yet exist.
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
 
+    Ok(path.canonicalize()?)
+}
+
+pub(crate) fn prompt_for_install_dir_interactive() -> Result<PathBuf> {
+    prompt_for_install_dir()
+}
+
+/// Non-interactive counterpart to `validate_install_dir`. Validates the path
+/// is absolute, creates it (and any missing parent directories) if it does
+/// not already exist, and returns the canonical form. Used by the `install`
+/// command after the user has already chosen a directory — no "Create it?"
+/// prompt, because typing `install` is the confirmation.
+pub(crate) fn ensure_install_dir_exists(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "install directory must be an absolute path, got: {}",
+            path.display()
+        );
+    }
+    if path.exists() {
+        if !path.is_dir() {
+            anyhow::bail!("{} exists but is not a directory", path.display());
+        }
+        return Ok(path.canonicalize()?);
+    }
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     Ok(path.canonicalize()?)
 }
 
@@ -113,5 +136,44 @@ mod tests {
         let tmp = std::env::temp_dir();
         assert!(tmp.is_absolute());
         assert!(validate_install_dir(&tmp).is_ok());
+    }
+
+    #[test]
+    fn ensure_rejects_relative_path() {
+        let result = ensure_install_dir_exists(Path::new("relative/nested/path"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn ensure_creates_nested_path() {
+        // Build a path under the system temp dir with multiple missing
+        // parents. This is the case that broke real users: choosing a
+        // directory like $HOME/Games/TheSecretWorld when neither Games nor
+        // the leaf exists. ensure_install_dir_exists must mkdir -p all of it.
+        let tmp = std::env::temp_dir();
+        // Use a unique suffix so parallel test runs don't collide.
+        let base = tmp.join(format!(
+            "tsw-cli-ensure-test-{}",
+            std::process::id()
+        ));
+        let nested = base.join("Games").join("TheSecretWorld");
+        // Make sure it doesn't already exist.
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!nested.exists());
+        assert!(!base.join("Games").exists());
+
+        let result = ensure_install_dir_exists(&nested).expect("should create nested path");
+        assert!(result.exists());
+        assert!(result.is_dir());
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_accepts_existing_temp_dir() {
+        let tmp = std::env::temp_dir();
+        assert!(ensure_install_dir_exists(&tmp).is_ok());
     }
 }

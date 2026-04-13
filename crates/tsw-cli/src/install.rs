@@ -1,9 +1,9 @@
 //! `tsw-downloader install` — download and install The Secret World.
 //!
 //! The bulk of the work happens in `tsw_core::install::run_install_pipeline`.
-//! This module handles the Linux-facing concerns: config resolution,
-//! install-directory validation, Ctrl-C handling, client files, post-install
-//! bxml cache, and the optional verify pass.
+//! This module handles the Linux-facing concerns: first-run install-directory
+//! prompt, config save, Ctrl-C handling, client files, post-install bxml cache,
+//! and the optional verify pass.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -11,23 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::args::InstallArgs;
-use crate::config_file;
-use crate::errors::{ConfigError, UserCancelled, VerifyFoundCorrupted};
+use crate::config_file::{self, Config, DownloadSection, InstallSection, CURRENT_SCHEMA_VERSION};
+use crate::errors::{UserCancelled, VerifyFoundCorrupted};
+use crate::init;
 use crate::reporter::CliReporter;
 
 pub fn run(args: InstallArgs, config_path_override: Option<PathBuf>) -> Result<i32> {
-    let install_dir = resolve_install_dir(&args, config_path_override)?;
-
-    if !install_dir.exists() {
-        if !args.yes {
-            anyhow::bail!(
-                "install directory does not exist: {} (pass --yes to create it)",
-                install_dir.display()
-            );
-        }
-        std::fs::create_dir_all(&install_dir)
-            .with_context(|| format!("creating {}", install_dir.display()))?;
-    }
+    let install_dir = resolve_or_prompt_install_dir(&args, config_path_override)?;
 
     let reporter: Arc<dyn tsw_core::progress::ProgressReporter> = Arc::new(CliReporter::new());
 
@@ -60,26 +50,18 @@ async fn run_pipeline(
     pause_flag: &Arc<AtomicBool>,
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<()> {
-    // The user must provide a directory that already has LocalConfig.xml.
-    // The Linux CLI does not bootstrap a fresh install from scratch —
-    // the user must have either copied LocalConfig.xml from an existing
-    // install or extracted it from the Funcom installer via Wine/Proton.
-    let local_config_path = install_dir.join("LocalConfig.xml");
-    if !local_config_path.exists() {
-        anyhow::bail!(
-            "{} is missing. Copy it from an existing TSW install or extract \
-             it from the Funcom installer before running `tsw-downloader install`.",
-            local_config_path.display()
-        );
-    }
+    // Write embedded static files first. This creates LocalConfig.xml with
+    // the default Funcom CDN URL if it doesn't already exist, plus the
+    // LanguagePrefs.xml and RDB/ directory. The Windows launcher uses this
+    // same function on fresh installs — no user-supplied LocalConfig.xml is
+    // needed.
+    tsw_core::client_files::write_static_files(install_dir).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Fail fast with a CLI-friendly message if LocalConfig.xml is malformed.
+    // Parse LocalConfig.xml to get the CDN URL.
+    let local_config_path = install_dir.join("LocalConfig.xml");
     let patch_config = tsw_core::config::parse_local_config(&local_config_path)
         .with_context(|| format!("parsing {}", local_config_path.display()))?;
     let cdn_base_url = patch_config.http_patch_addr.replace("http://", "https://");
-
-    // Write embedded static files (post-install scripts and such).
-    tsw_core::client_files::write_static_files(install_dir).map_err(|e| anyhow::anyhow!(e))?;
 
     // Loose client files (Data/, exes, dlls). Downloads via the CDN.
     if !args.skip_client_files {
@@ -98,9 +80,9 @@ async fn run_pipeline(
         return Ok(());
     }
 
-    // RDB install pipeline — the big one. Handles bootstrap (le.idx,
-    // RDBHashIndex.bin), rdbdata file creation, and the parallel download
-    // loop. Same function the Windows launcher uses.
+    // RDB install pipeline — handles bootstrap (le.idx, RDBHashIndex.bin),
+    // rdbdata file creation, and the parallel download loop. Same function
+    // the Windows launcher uses.
     tsw_core::install::run_install_pipeline(install_dir, reporter, pause_flag, cancel_flag)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -140,25 +122,60 @@ async fn run_pipeline(
     Ok(())
 }
 
-fn resolve_install_dir(
+/// Resolve the install directory, prompting the user interactively if nothing
+/// has been configured yet. Saves the chosen directory to the config file so
+/// subsequent runs of `install`, `verify`, or `uninstall` don't need to ask
+/// again.
+fn resolve_or_prompt_install_dir(
     args: &InstallArgs,
     config_path_override: Option<PathBuf>,
 ) -> Result<PathBuf> {
+    // Explicit --install-dir flag wins.
     if let Some(dir) = &args.install_dir {
-        return Ok(dir.clone());
+        let canonical = init::ensure_install_dir_exists(dir)?;
+        save_install_dir_to_config(&canonical, config_path_override.clone())?;
+        return Ok(canonical);
     }
+
+    // Existing config wins next.
+    let config_path = config_path_override
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(config_file::default_config_path)?;
+
+    if config_path.exists() {
+        let config = config_file::read(&config_path)?;
+        let saved = &config.install.dir;
+        // Re-create the directory if the user rm -rf'd it between runs so
+        // `install` is idempotent.
+        return init::ensure_install_dir_exists(saved);
+    }
+
+    // No flag, no config — first-run prompt for a directory, then create it.
+    println!("No install directory configured yet. Let's set one up.");
+    let chosen = init::prompt_for_install_dir_interactive()?;
+    let canonical = init::ensure_install_dir_exists(&chosen)?;
+    save_install_dir_to_config(&canonical, config_path_override)?;
+    println!("Saved install directory to {}", config_path.display());
+    Ok(canonical)
+}
+
+fn save_install_dir_to_config(
+    install_dir: &Path,
+    config_path_override: Option<PathBuf>,
+) -> Result<()> {
     let config_path = config_path_override
         .map(Ok)
         .unwrap_or_else(config_file::default_config_path)?;
-    if !config_path.exists() {
-        return Err(ConfigError(format!(
-            "no install directory provided and no config at {} — run `tsw-downloader init` first",
-            config_path.display()
-        ))
-        .into());
-    }
-    let config = config_file::read(&config_path)?;
-    Ok(config.install.dir)
+    let config = Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        install: InstallSection {
+            dir: install_dir.to_path_buf(),
+        },
+        download: DownloadSection::default(),
+    };
+    config_file::write(&config_path, &config)?;
+    Ok(())
 }
 
 fn install_ctrlc_handler(cancel_flag: &Arc<AtomicBool>) -> Result<()> {
