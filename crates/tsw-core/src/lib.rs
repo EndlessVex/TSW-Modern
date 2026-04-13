@@ -4,5 +4,4 @@
 //! and the Linux CLI (`tsw-cli`). It contains no UI code and no Tauri
 //! dependency.
 
-/// Placeholder symbol — replaced by real modules in Phase 2.
-pub fn _placeholder() {}
+pub mod rdb;
