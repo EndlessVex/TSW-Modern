@@ -50,13 +50,19 @@ jobs:
         run: cargo install tauri-cli --version "^2.0" --locked
 
       - name: Build Tauri bundle
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         working-directory: src-tauri
         # --bundles msi,nsis overrides tauri.conf.json's empty "targets": [],
         # which otherwise means cargo tauri build produces only the raw exe.
-        run: cargo tauri build --bundles msi,nsis
+        #
+        # --config disables updater artifact signing for this release. The
+        # committed tauri.conf.json has createUpdaterArtifacts: true, but
+        # the TAURI_SIGNING_PRIVATE_KEY secret stored in the repo is missing
+        # the minisign comment header and tauri rejects it. v0.1.1 shipped
+        # unsigned (only a manually-uploaded Secret.World.Launcher.exe with
+        # no MSI/NSIS at all), so skipping signing keeps parity with the
+        # existing release workflow. Auto-updater signing can be revisited
+        # when the stored key is fixed.
+        run: cargo tauri build --bundles msi,nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Stage Windows release assets
         shell: bash
