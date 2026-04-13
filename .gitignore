@@ -20,6 +20,9 @@ references/
 # ── GSD (agent workspace) ──
 .gsd
 
+# ── Git worktrees (isolated feature branches) ──
+.worktrees/
+
 # ── Background shell state ──
 .bg-shell/
 
