@@ -9,3 +9,5 @@ pub mod config;
 pub mod encoder_native;
 pub mod rdb;
 pub mod rdbdata;
+pub mod redux;
+pub mod verify;

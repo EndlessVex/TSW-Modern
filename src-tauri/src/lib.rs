@@ -5,8 +5,8 @@ pub mod download;
 pub use tsw_core::encoder_native;
 pub use tsw_core::rdb;
 pub use tsw_core::rdbdata;
-pub mod redux;
-pub mod verify;
+pub use tsw_core::redux;
+pub use tsw_core::verify;
 
 use serde::{Deserialize, Serialize};
 use std::fs;

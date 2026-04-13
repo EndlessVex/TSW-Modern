@@ -4985,9 +4985,17 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tsw-core"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "futures",
  "log",
+ "lzma-rs",
+ "md-5",
  "quick-xml 0.37.5",
+ "rand 0.8.5",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
