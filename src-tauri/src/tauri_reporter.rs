@@ -5,6 +5,11 @@
 //! exactly — the frontend reads `event.payload.<field>` and does not
 //! know tsw-core exists.
 
+// Dead-code-allow is temporary: this adapter is wired up incrementally across
+// Tasks 13–17. Task 13 creates it. Task 15 uses it for verify. Task 17 uses it
+// for the install pipeline. Once all emit sites are migrated, the allow goes.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tsw_core::download::DownloadProgress;
@@ -12,7 +17,7 @@ use tsw_core::progress::ProgressReporter;
 use tsw_core::verify::VerifyProgress;
 
 /// Wraps a Tauri `AppHandle` and emits progress events to the frontend.
-pub struct TauriReporter {
+struct TauriReporter {
     app: AppHandle,
 }
 

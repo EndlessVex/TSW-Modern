@@ -642,7 +642,7 @@ pub async fn run_downloads(
 
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let client = client.clone();
-        let reporter_task = Arc::clone(reporter);
+        let reporter_task = reporter.clone();
         let manifest = manifest.clone();
         let completion_log = completion_log.clone();
         let staging_dir = config.staging_dir.clone();
