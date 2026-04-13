@@ -1239,18 +1239,15 @@ async fn start_verification(app: tauri::AppHandle, install_path: String) -> Resu
                 }
             }
             Err(e) => {
-                use tauri::Emitter;
-                let _ = app_clone.emit(
-                    "verify:progress",
-                    &verify::VerifyProgress {
-                        entries_checked: 0,
-                        entries_total: 0,
-                        corrupted_count: 0,
-                        bytes_scanned: 0,
-                        current_file: String::new(),
-                        phase: format!("error: {}", e),
-                    },
-                );
+                let reporter = tauri_reporter::TauriReporter::new(app_clone.clone());
+                reporter.on_verify(&verify::VerifyProgress {
+                    entries_checked: 0,
+                    entries_total: 0,
+                    corrupted_count: 0,
+                    bytes_scanned: 0,
+                    current_file: String::new(),
+                    phase: format!("error: {}", e),
+                });
                 log::error!("Verification failed: {}", e);
             }
         }
@@ -1264,8 +1261,6 @@ fn run_verification_inner(
     app: &tauri::AppHandle,
     install_path: &str,
 ) -> Result<VerifyResult, String> {
-    use tauri::Emitter;
-
     let base = std::path::PathBuf::from(install_path);
     let le_index =
         rdb::parse_le_index(&base.join("RDB").join("le.idx")).map_err(|e| e.to_string())?;
@@ -1274,13 +1269,13 @@ fn run_verification_inner(
     let cancel_ref = cancel_flag.clone();
 
     // Bridge the global cancel flag to the local Arc
-    let app_for_progress = app.clone();
+    let reporter = tauri_reporter::TauriReporter::new(app.clone());
     let result = verify::verify_integrity(&base, &le_index, &cancel_flag, move |progress| {
         // Check global cancel and propagate to local flag
         if VERIFY_CANCEL.load(Ordering::Relaxed) {
             cancel_ref.store(true, Ordering::Relaxed);
         }
-        let _ = app_for_progress.emit("verify:progress", progress);
+        reporter.on_verify(progress);
     })?;
 
     Ok(result)
