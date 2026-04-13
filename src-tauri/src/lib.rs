@@ -961,7 +961,7 @@ async fn run_patching_inner(
     );
 
     // Adapt concurrency to system resources.
-    let available_ram_mb = get_available_ram_mb();
+    let available_ram_mb = tsw_core::sys::available_ram_mb();
     let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     // CPU slots: 1/3 of cores, minimum 1. Below-normal priority keeps us polite.
@@ -1895,41 +1895,6 @@ fn get_display_modes() -> Vec<String> {
     }
 
     modes
-}
-
-/// Get available system RAM in megabytes (free, not total).
-fn get_available_ram_mb() -> u64 {
-    #[cfg(target_os = "windows")]
-    {
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct MEMORYSTATUSEX {
-            dwLength: u32,
-            dwMemoryLoad: u32,
-            ullTotalPhys: u64,
-            ullAvailPhys: u64,
-            ullTotalPageFile: u64,
-            ullAvailPageFile: u64,
-            ullTotalVirtual: u64,
-            ullAvailVirtual: u64,
-            ullAvailExtendedVirtual: u64,
-        }
-
-        extern "system" {
-            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
-        }
-
-        let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let result = unsafe { GlobalMemoryStatusEx(&mut mem) };
-        if result != 0 {
-            // Use available (free) RAM, not total
-            return mem.ullAvailPhys / 1_048_576;
-        }
-    }
-
-    // Fallback: assume 4GB available
-    4096
 }
 
 /// Get free disk space for the drive containing the given path.

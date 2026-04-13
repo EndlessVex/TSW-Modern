@@ -13,4 +13,5 @@ pub mod progress;
 pub mod rdb;
 pub mod rdbdata;
 pub mod redux;
+pub mod sys;
 pub mod verify;
