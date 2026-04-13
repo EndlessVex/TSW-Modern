@@ -558,10 +558,10 @@ impl SpeedTracker {
 
 /// Run all downloads in parallel with bounded concurrency, retry, and progress.
 ///
-/// Emits `patch:progress` events through the Tauri app handle.
+/// Reports progress through the provided `ProgressReporter`.
 /// Persists the manifest after each file completes for resume support.
 pub async fn run_downloads(
-    app_handle: &tauri::AppHandle,
+    reporter: &Arc<dyn crate::progress::ProgressReporter>,
     config: &DownloadConfig,
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
@@ -569,26 +569,22 @@ pub async fn run_downloads(
     pause_flag: &AtomicBool,
     cancel_flag: &AtomicBool,
 ) -> Result<DownloadResult, DownloadError> {
-    use tauri::Emitter;
 
     let total_bytes: u64 = tasks.iter().map(|t| t.expected_size).sum();
     let files_total = tasks.len() as u32;
 
     if tasks.is_empty() {
         // Nothing to download — already up to date
-        let _ = app_handle.emit(
-            "patch:progress",
-            &DownloadProgress {
-                bytes_downloaded: 0,
-                total_bytes: 0,
-                files_completed: 0,
-                files_total: 0,
-                speed_bps: 0,
-                current_file: String::new(),
-                phase: "complete".into(),
-                failed_files: 0,
-            },
-        );
+        reporter.on_download(&DownloadProgress {
+            bytes_downloaded: 0,
+            total_bytes: 0,
+            files_completed: 0,
+            files_total: 0,
+            speed_bps: 0,
+            current_file: String::new(),
+            phase: "complete".into(),
+            failed_files: 0,
+        });
         return Ok(DownloadResult {
             files_completed: 0,
             files_failed: 0,
@@ -604,19 +600,16 @@ pub async fn run_downloads(
     let speed_tracker = Arc::new(Mutex::new(SpeedTracker::new(Duration::from_secs(15))));
 
     // Emit initial progress
-    let _ = app_handle.emit(
-        "patch:progress",
-        &DownloadProgress {
-            bytes_downloaded: 0,
-            total_bytes,
-            files_completed: 0,
-            files_total,
-            speed_bps: 0,
-            current_file: String::new(),
-            phase: "downloading".into(),
-            failed_files: 0,
-        },
-    );
+    reporter.on_download(&DownloadProgress {
+        bytes_downloaded: 0,
+        total_bytes,
+        files_completed: 0,
+        files_total,
+        speed_bps: 0,
+        current_file: String::new(),
+        phase: "downloading".into(),
+        failed_files: 0,
+    });
 
     // Pre-create all 256 staging subdirectories (00-ff) upfront.
     // Eliminates 650K redundant create_dir_all calls during download.
@@ -649,7 +642,7 @@ pub async fn run_downloads(
 
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let client = client.clone();
-        let app_handle = app_handle.clone();
+        let reporter_task = Arc::clone(reporter);
         let manifest = manifest.clone();
         let completion_log = completion_log.clone();
         let staging_dir = config.staging_dir.clone();
@@ -738,19 +731,16 @@ pub async fn run_downloads(
                         // Emit progress — throttle to every 20 files or when significant
                         // bytes are downloaded to avoid 650K IPC events
                         if completed % 20 == 0 || bytes_written > 100_000 || completed == files_total_val {
-                            let _ = app_handle.emit(
-                                "patch:progress",
-                                &DownloadProgress {
-                                    bytes_downloaded: new_total,
-                                    total_bytes: total_bytes_val,
-                                    files_completed: completed,
-                                    files_total: files_total_val,
-                                    speed_bps: speed,
-                                    current_file: task.hash_hex.clone(),
-                                    phase: "downloading".into(),
-                                    failed_files: failed,
-                                },
-                            );
+                            reporter_task.on_download(&DownloadProgress {
+                                bytes_downloaded: new_total,
+                                total_bytes: total_bytes_val,
+                                files_completed: completed,
+                                files_total: files_total_val,
+                                speed_bps: speed,
+                                current_file: task.hash_hex.clone(),
+                                phase: "downloading".into(),
+                                failed_files: failed,
+                            });
                         }
 
                         return Ok(());
@@ -836,19 +826,16 @@ pub async fn run_downloads(
 
     // Emit final progress
     let phase = if any_failed { "error" } else { "complete" };
-    let _ = app_handle.emit(
-        "patch:progress",
-        &DownloadProgress {
-            bytes_downloaded: final_downloaded,
-            total_bytes,
-            files_completed: final_completed,
-            files_total,
-            speed_bps: 0,
-            current_file: String::new(),
-            phase: phase.into(),
-            failed_files: final_failed,
-        },
-    );
+    reporter.on_download(&DownloadProgress {
+        bytes_downloaded: final_downloaded,
+        total_bytes,
+        files_completed: final_completed,
+        files_total,
+        speed_bps: 0,
+        current_file: String::new(),
+        phase: phase.into(),
+        failed_files: final_failed,
+    });
 
     Ok(DownloadResult {
         files_completed: final_completed,

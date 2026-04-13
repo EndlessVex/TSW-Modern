@@ -1,3 +1,5 @@
+mod tauri_reporter;
+
 pub use tsw_core::bxml;
 pub use tsw_core::client_files;
 pub use tsw_core::config;
