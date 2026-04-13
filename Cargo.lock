@@ -5019,7 +5019,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
- "tauri",
  "tokio",
 ]
 
