@@ -1,0 +1,11 @@
+[package]
+name = "tsw-core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core download, verify, and RDB parsing library for The Secret World"
+
+[dependencies]
+# Minimal deps. More will be added as modules are moved in Phase 2.
+serde = { version = "1", features = ["derive"] }
