@@ -36,7 +36,7 @@ impl ProgressReporter for CliReporter {
                     eprintln!("[{}] {}", p.phase, p.current_file);
                 }
             }
-            "downloading" | "patching" => {
+            "downloading" | "patching" | "installing" => {
                 let mut slot = self.download_bar.lock().unwrap();
                 let bar = slot.get_or_insert_with(|| {
                     let b = self.multi.add(ProgressBar::new(p.total_bytes.max(1)));

@@ -44,15 +44,65 @@ fn check_absolute(path: &Path) -> Result<(), GuardrailError> {
 fn check_blocklist(path: &Path) -> Result<(), GuardrailError> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
+    // Unix/Linux system directories — rejected regardless of host OS
+    // because the binary may receive Unix-style paths when invoked
+    // under WSL or similar cross-platform shells.
     const SYSTEM_BLOCKLIST: &[&str] = &[
         "/", "/home", "/root", "/usr", "/etc", "/var", "/opt", "/bin", "/sbin",
         "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/tmp", "/mnt", "/media",
+        "/srv", "/run",
     ];
 
     for &blocked in SYSTEM_BLOCKLIST {
         let blocked_path = Path::new(blocked);
         if canonical == blocked_path {
             return Err(GuardrailError::Blocklisted(canonical));
+        }
+    }
+
+    // Windows system directories. The Windows build of tsw-downloader
+    // (produced by the `build-windows` CI job as a side artifact) makes
+    // the uninstall guardrails relevant on Windows too. Compare via
+    // lowercased string to handle drive-letter case and backslash drift
+    // from canonicalize's extended-path prefix (\\?\C:\...).
+    #[cfg(windows)]
+    {
+        let canonical_str = canonical.to_string_lossy().to_ascii_lowercase();
+        // Strip Windows extended-path prefix if present.
+        let normalized = canonical_str
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical_str)
+            .trim_end_matches('\\');
+
+        const WINDOWS_BLOCKLIST: &[&str] = &[
+            "c:",
+            "c:\\",
+            "c:\\windows",
+            "c:\\program files",
+            "c:\\program files (x86)",
+            "c:\\users",
+            "c:\\programdata",
+            "d:",
+            "d:\\",
+            "e:",
+            "e:\\",
+        ];
+        for &blocked in WINDOWS_BLOCKLIST {
+            if normalized == blocked {
+                return Err(GuardrailError::Blocklisted(canonical));
+            }
+        }
+
+        // Also refuse the current user's profile root (C:\Users\<name>).
+        if let Some(home) = home_dir() {
+            let home_str = home.to_string_lossy().to_ascii_lowercase();
+            let home_normalized = home_str
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&home_str)
+                .trim_end_matches('\\');
+            if normalized == home_normalized {
+                return Err(GuardrailError::Blocklisted(canonical));
+            }
         }
     }
 
@@ -85,9 +135,16 @@ fn check_blocklist(path: &Path) -> Result<(), GuardrailError> {
 }
 
 fn check_component_count(path: &Path) -> Result<(), GuardrailError> {
+    // Under $HOME, require at least 2 additional components so that
+    // `$HOME/Games/TSW` (a typical Lutris/Proton install location) is
+    // allowed while `$HOME/x` or `$HOME/Games` alone is not — those
+    // latter cases are caught by the explicit blocklist above anyway.
+    // Under `/` (no home match), require at least 4 components so that
+    // `/foo` and `/var/tsw` are rejected but `/mnt/games/tsw/install`
+    // passes. The blocklist above already handles the dangerous roots.
     let components = path.components().count();
     let min_components = match home_dir() {
-        Some(home) if path.starts_with(&home) => 3 + home.components().count(),
+        Some(home) if path.starts_with(&home) => 2 + home.components().count(),
         _ => 4,
     };
     if components < min_components {
@@ -294,11 +351,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_missing_markers_without_force() {
-        let base = std::env::temp_dir().join("tsw-guardrail-test-nomark-deep-a-b-c");
+        // Use a path under $HOME with enough components to pass the
+        // depth check but NOT in the blocklist, so the only remaining
+        // guardrail is the marker-file check. That way we assert the
+        // exact reason for rejection (NoMarkerFiles) rather than some
+        // earlier check accidentally firing first.
+        let Some(home) = home_dir() else { return };
+        let base = home
+            .join("tsw-guardrail-test-nomark")
+            .join("nested")
+            .join("empty");
         std::fs::create_dir_all(&base).ok();
         let result = check_guardrails(&base, false);
-        assert!(result.is_err());
-        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(result, Err(GuardrailError::NoMarkerFiles(_))),
+            "expected NoMarkerFiles, got {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(home.join("tsw-guardrail-test-nomark"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepts_home_games_tsw_with_markers() {
+        // Regression test for the first-run UX bug where ~/Games/TSW
+        // was rejected as TooShallow. Construct a fake install at
+        // $HOME/tsw-guardrail-test-accept/Games/TSW with a marker file
+        // and verify all guardrails pass.
+        let Some(home) = home_dir() else { return };
+        let base = home
+            .join("tsw-guardrail-test-accept")
+            .join("Games")
+            .join("TSW");
+        let rdb = base.join("RDB");
+        std::fs::create_dir_all(&rdb).ok();
+        std::fs::write(rdb.join("le.idx"), b"fake").ok();
+
+        let result = check_guardrails(&base, false);
+        assert!(
+            result.is_ok(),
+            "expected guardrails to accept $HOME/.../Games/TSW with markers, got {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(home.join("tsw-guardrail-test-accept"));
     }
 }
