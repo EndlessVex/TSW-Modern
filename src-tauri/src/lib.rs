@@ -1,6 +1,6 @@
 pub mod bxml;
 pub mod client_files;
-pub mod config;
+pub use tsw_core::config;
 pub mod download;
 pub mod encoder_native;
 pub use tsw_core::rdb;
