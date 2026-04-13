@@ -32,6 +32,3 @@ tsw-core = { path = "../crates/tsw-core" }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
-
-[profile.dev]
-opt-level = 2

@@ -5,3 +5,4 @@
 //! dependency.
 
 pub mod rdb;
+pub mod rdbdata;

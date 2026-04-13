@@ -4,7 +4,7 @@ pub mod config;
 pub mod download;
 pub mod encoder_native;
 pub use tsw_core::rdb;
-pub mod rdbdata;
+pub use tsw_core::rdbdata;
 pub mod redux;
 pub mod verify;
 
