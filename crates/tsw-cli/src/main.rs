@@ -2,7 +2,10 @@
 
 mod args;
 mod config_file;
+mod errors;
 mod init;
+mod reporter;
+mod verify_cmd;
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,10 +20,23 @@ fn main() {
                 eprintln!("  caused by: {s}");
                 src = s.source();
             }
-            1
+            exit_code_for(&e)
         }
     };
     std::process::exit(code);
+}
+
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<errors::UserCancelled>().is_some() {
+        return 2;
+    }
+    if err.downcast_ref::<errors::VerifyFoundCorrupted>().is_some() {
+        return 3;
+    }
+    if err.downcast_ref::<errors::ConfigError>().is_some() {
+        return 4;
+    }
+    1
 }
 
 fn run() -> Result<i32> {
@@ -34,10 +50,7 @@ fn run() -> Result<i32> {
             println!("install: not yet implemented");
             Ok(0)
         }
-        args::Command::Verify(_) => {
-            println!("verify: not yet implemented");
-            Ok(0)
-        }
+        args::Command::Verify(verify_args) => verify_cmd::run(verify_args, cli.config),
         args::Command::Uninstall(_) => {
             println!("uninstall: not yet implemented");
             Ok(0)
