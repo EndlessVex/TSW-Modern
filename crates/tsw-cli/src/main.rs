@@ -1,6 +1,8 @@
 //! tsw-downloader — Linux CLI for downloading and verifying The Secret World.
 
 mod args;
+mod config_file;
+mod init;
 
 use anyhow::Result;
 use clap::Parser;
@@ -27,10 +29,7 @@ fn run() -> Result<i32> {
     init_logging(cli.verbose, cli.quiet);
 
     match cli.command {
-        args::Command::Init(_) => {
-            println!("init: not yet implemented");
-            Ok(0)
-        }
+        args::Command::Init(init_args) => init::run(init_args, cli.config),
         args::Command::Install(_) => {
             println!("install: not yet implemented");
             Ok(0)
