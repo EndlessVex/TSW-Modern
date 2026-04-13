@@ -4,6 +4,7 @@
 //! and the Linux CLI (`tsw-cli`). It contains no UI code and no Tauri
 //! dependency.
 
+pub mod bxml;
 pub mod config;
 pub mod rdb;
 pub mod rdbdata;

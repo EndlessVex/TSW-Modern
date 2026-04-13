@@ -1,4 +1,4 @@
-pub mod bxml;
+pub use tsw_core::bxml;
 pub mod client_files;
 pub use tsw_core::config;
 pub mod download;
