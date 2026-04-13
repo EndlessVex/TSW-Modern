@@ -1,5 +1,5 @@
 pub use tsw_core::bxml;
-pub mod client_files;
+pub use tsw_core::client_files;
 pub use tsw_core::config;
 pub use tsw_core::download;
 pub use tsw_core::encoder_native;
