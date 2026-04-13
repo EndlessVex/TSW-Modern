@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/tsw-core"]
+members = ["src-tauri", "crates/tsw-core", "crates/tsw-cli"]
 
 [workspace.package]
 edition = "2021"
