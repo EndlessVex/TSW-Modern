@@ -93,15 +93,40 @@ fn check_blocklist(path: &Path) -> Result<(), GuardrailError> {
             }
         }
 
-        // Also refuse the current user's profile root (C:\Users\<name>).
+        // Also refuse the current user's profile root (C:\Users\<name>)
+        // and common user-data subdirectories. The generic home check
+        // below also runs on Windows but relies on PathBuf equality,
+        // which fails against canonical's \\?\ extended prefix — so we
+        // do a normalized string comparison here instead.
         if let Some(home) = home_dir() {
             let home_str = home.to_string_lossy().to_ascii_lowercase();
             let home_normalized = home_str
                 .strip_prefix(r"\\?\")
                 .unwrap_or(&home_str)
-                .trim_end_matches('\\');
-            if normalized == home_normalized {
-                return Err(GuardrailError::Blocklisted(canonical));
+                .trim_end_matches('\\')
+                .to_string();
+
+            const USER_SUBDIRS: &[&str] = &[
+                "",
+                "desktop",
+                "documents",
+                "downloads",
+                "pictures",
+                "videos",
+                "music",
+                "appdata",
+                "appdata\\local",
+                "appdata\\roaming",
+            ];
+            for suffix in USER_SUBDIRS {
+                let blocked = if suffix.is_empty() {
+                    home_normalized.clone()
+                } else {
+                    format!("{}\\{}", home_normalized, suffix)
+                };
+                if normalized == blocked {
+                    return Err(GuardrailError::Blocklisted(canonical));
+                }
             }
         }
     }
