@@ -6,6 +6,7 @@
 
 pub mod bxml;
 pub mod config;
+pub mod download;
 pub mod encoder_native;
 pub mod rdb;
 pub mod rdbdata;

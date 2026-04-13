@@ -1,7 +1,7 @@
 pub use tsw_core::bxml;
 pub mod client_files;
 pub use tsw_core::config;
-pub mod download;
+pub use tsw_core::download;
 pub use tsw_core::encoder_native;
 pub use tsw_core::rdb;
 pub use tsw_core::rdbdata;
