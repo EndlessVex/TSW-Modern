@@ -102,16 +102,15 @@ pub fn client_file_url(cdn_base: &str, md5_hex: &str) -> String {
 }
 
 /// Download all missing client files with parallel HTTP/2, IOz2 decompression,
-/// and MD5 verification. Emits progress events via the Tauri app handle.
+/// and MD5 verification. Emits progress events via the provided reporter.
 pub async fn download_client_files(
-    app: &tauri::AppHandle,
+    reporter: &std::sync::Arc<dyn crate::progress::ProgressReporter>,
     cdn_base: &str,
     install_dir: &Path,
     pause_flag: &AtomicBool,
     cancel_flag: &AtomicBool,
 ) -> Result<u32, String> {
     use md5::Digest;
-    use tauri::Emitter;
 
     let plan = compute_client_file_plan(install_dir);
     let files_total = plan.len() as u32;
@@ -138,19 +137,16 @@ pub async fn download_client_files(
     let files_failed = Arc::new(AtomicU32::new(0));
 
     // Emit initial progress via patch:progress (same event PatchProgress listens to)
-    let _ = app.emit(
-        "patch:progress",
-        &crate::download::DownloadProgress {
-            bytes_downloaded: 0,
-            total_bytes,
-            files_completed: 0,
-            files_total,
-            speed_bps: 0,
-            current_file: "Downloading game files...".into(),
-            phase: "downloading".into(),
-            failed_files: 0,
-        },
-    );
+    reporter.on_download(&crate::download::DownloadProgress {
+        bytes_downloaded: 0,
+        total_bytes,
+        files_completed: 0,
+        files_total,
+        speed_bps: 0,
+        current_file: "Downloading game files...".into(),
+        phase: "downloading".into(),
+        failed_files: 0,
+    });
 
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
@@ -187,7 +183,7 @@ pub async fn download_client_files(
         let bytes_dl = bytes_downloaded.clone();
         let files_comp = files_completed.clone();
         let files_fail = files_failed.clone();
-        let app = app.clone();
+        let reporter_task = reporter.clone();
         let ft = files_total;
         let tb = total_bytes;
 
@@ -258,19 +254,16 @@ pub async fn download_client_files(
 
                 // Emit to patch:progress so the standard PatchProgress component works
                 if completed % 20 == 0 || completed == ft {
-                    let _ = app.emit(
-                        "patch:progress",
-                        &crate::download::DownloadProgress {
-                            bytes_downloaded: new_bytes,
-                            total_bytes: tb,
-                            files_completed: completed,
-                            files_total: ft,
-                            speed_bps: 0,
-                            current_file: entry.path.clone(),
-                            phase: "downloading".into(),
-                            failed_files: files_fail.load(Ordering::Relaxed),
-                        },
-                    );
+                    reporter_task.on_download(&crate::download::DownloadProgress {
+                        bytes_downloaded: new_bytes,
+                        total_bytes: tb,
+                        files_completed: completed,
+                        files_total: ft,
+                        speed_bps: 0,
+                        current_file: entry.path.clone(),
+                        phase: "downloading".into(),
+                        failed_files: files_fail.load(Ordering::Relaxed),
+                    });
                 }
 
                 return; // Success

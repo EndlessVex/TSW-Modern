@@ -510,8 +510,9 @@ async fn run_full_install_inner(
             phase: "bootstrapping".into(), failed_files: 0,
         },
     );
+    let reporter = tauri_reporter::TauriReporter::new(app.clone());
     client_files::download_client_files(
-        app, &cdn_base_url, &base, &PATCH_PAUSED, &PATCH_CANCEL,
+        &reporter, &cdn_base_url, &base, &PATCH_PAUSED, &PATCH_CANCEL,
     )
     .await?;
 

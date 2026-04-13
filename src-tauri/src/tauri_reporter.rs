@@ -17,13 +17,13 @@ use tsw_core::progress::ProgressReporter;
 use tsw_core::verify::VerifyProgress;
 
 /// Wraps a Tauri `AppHandle` and emits progress events to the frontend.
-struct TauriReporter {
+pub(crate) struct TauriReporter {
     app: AppHandle,
 }
 
 impl TauriReporter {
     /// Construct a shared reporter ready to hand to tsw-core functions.
-    pub fn new(app: AppHandle) -> Arc<dyn ProgressReporter> {
+    pub(crate) fn new(app: AppHandle) -> Arc<dyn ProgressReporter> {
         Arc::new(Self { app })
     }
 }
