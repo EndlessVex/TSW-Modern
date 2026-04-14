@@ -732,6 +732,7 @@ async fn run_patching_inner(
         &reporter,
         &PATCH_PAUSED,
         &PATCH_CANCEL,
+        None, // Windows launcher uses automatic RAM-based concurrency tuning
     )
     .await;
 

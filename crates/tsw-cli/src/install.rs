@@ -19,6 +19,13 @@ use crate::reporter::CliReporter;
 pub fn run(args: InstallArgs, config_path_override: Option<PathBuf>) -> Result<i32> {
     let install_dir = resolve_or_prompt_install_dir(&args, config_path_override)?;
 
+    if let Some(n) = args.concurrency {
+        if !confirm_concurrency_override(n, args.yes)? {
+            println!("Aborted.");
+            return Ok(0);
+        }
+    }
+
     let reporter: Arc<dyn tsw_core::progress::ProgressReporter> = Arc::new(CliReporter::new());
 
     let cancel_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -31,8 +38,17 @@ pub fn run(args: InstallArgs, config_path_override: Option<PathBuf>) -> Result<i
         .build()
         .context("building tokio runtime")?;
 
+    let concurrency_override = args.concurrency;
     runtime.block_on(async {
-        run_pipeline(&args, &install_dir, &reporter, &pause_flag, &cancel_flag).await
+        run_pipeline(
+            &args,
+            &install_dir,
+            &reporter,
+            &pause_flag,
+            &cancel_flag,
+            concurrency_override,
+        )
+        .await
     })?;
 
     if cancel_flag.load(Ordering::Relaxed) {
@@ -49,6 +65,7 @@ async fn run_pipeline(
     reporter: &Arc<dyn tsw_core::progress::ProgressReporter>,
     pause_flag: &Arc<AtomicBool>,
     cancel_flag: &Arc<AtomicBool>,
+    concurrency_override: Option<usize>,
 ) -> Result<()> {
     // Write embedded static files first. This creates LocalConfig.xml with
     // the default Funcom CDN URL if it doesn't already exist, plus the
@@ -82,10 +99,17 @@ async fn run_pipeline(
 
     // RDB install pipeline — handles bootstrap (le.idx, RDBHashIndex.bin),
     // rdbdata file creation, and the parallel download loop. Same function
-    // the Windows launcher uses.
-    tsw_core::install::run_install_pipeline(install_dir, reporter, pause_flag, cancel_flag)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // the Windows launcher uses, with an optional concurrency override from
+    // --concurrency.
+    tsw_core::install::run_install_pipeline(
+        install_dir,
+        reporter,
+        pause_flag,
+        cancel_flag,
+        concurrency_override,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     if cancel_flag.load(Ordering::Relaxed) {
         return Ok(());
@@ -176,6 +200,65 @@ fn save_install_dir_to_config(
     };
     config_file::write(&config_path, &config)?;
     Ok(())
+}
+
+/// Explain what --concurrency does, warn about unusual values, and give the
+/// user one last chance to back out. Returns `Ok(true)` if the user accepts
+/// (or --yes was passed), `Ok(false)` if they decline, and an `Err` for
+/// unusable values (like 0).
+fn confirm_concurrency_override(n: usize, yes: bool) -> Result<bool> {
+    if n == 0 {
+        anyhow::bail!("--concurrency must be at least 1");
+    }
+
+    println!();
+    println!("You passed --concurrency {}, which overrides the automatic tuning.", n);
+    println!();
+    println!("The default picks a connection count based on available RAM:");
+    println!("  over 8 GB available: 64 concurrent downloads");
+    println!("  over 4 GB available: 32 concurrent downloads");
+    println!("  otherwise:           16 concurrent downloads");
+    println!();
+    println!("Higher values saturate more bandwidth but cost memory (large");
+    println!("files buffer in RAM until written) and may get rate-limited by");
+    println!("the CDN. Lower values are slower than the default.");
+
+    if n > 128 {
+        println!();
+        println!(
+            "WARNING: {} is unusually high. The CDN may throttle or refuse",
+            n
+        );
+        println!("connections, and memory pressure can cause large-file downloads");
+        println!("to fail. 64 is a safe upper bound for most systems.");
+    } else if n < 4 {
+        println!();
+        println!(
+            "WARNING: {} will be significantly slower than the 16-connection",
+            n
+        );
+        println!("minimum default. Only use this if you're intentionally rate-limiting.");
+    }
+
+    println!();
+
+    if yes {
+        println!("--yes flag set, proceeding without confirmation.");
+        return Ok(true);
+    }
+
+    use dialoguer::Input;
+    let response: String = Input::new()
+        .with_prompt("Proceed with this concurrency setting? [y/N]")
+        .default("n".to_string())
+        .allow_empty(true)
+        .interact_text()
+        .context("reading confirmation from stdin")?;
+
+    Ok(matches!(
+        response.trim().to_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn install_ctrlc_handler(cancel_flag: &Arc<AtomicBool>) -> Result<()> {

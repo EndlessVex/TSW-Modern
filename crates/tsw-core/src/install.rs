@@ -23,6 +23,12 @@ use crate::progress::ProgressReporter;
 ///   {"checking", "bootstrapping", "downloading", "patching", "complete"}.
 /// - `pause_flag.store(true, ...)` pauses the download loop between files.
 /// - `cancel_flag.store(true, ...)` causes the function to return early.
+/// - `concurrency_override`, when `Some(n)`, replaces the auto-tuned main
+///   download concurrency. The tuner picks 16/32/64 based on available RAM
+///   and Linux/WSL users routinely see lower "available" values than the
+///   Windows launcher, resulting in fewer parallel connections and slower
+///   downloads. Passing an explicit override bypasses that calculation.
+///   The large-file and CPU-decompress semaphores are still auto-tuned.
 ///
 /// Returns `Err(String)` if a non-recoverable step fails (e.g., le.idx
 /// download returns HTTP 5xx, rdbdata file creation fails, too many files
@@ -32,6 +38,7 @@ pub async fn run_install_pipeline(
     reporter: &Arc<dyn ProgressReporter>,
     pause_flag: &AtomicBool,
     cancel_flag: &AtomicBool,
+    concurrency_override: Option<usize>,
 ) -> Result<(), String> {
     let base = install_dir.to_path_buf();
     let rdb_dir = base.join("RDB");
@@ -258,13 +265,21 @@ pub async fn run_install_pipeline(
     // Download slots: most resources are tiny (<10KB) and process instantly,
     // so high download concurrency keeps the network saturated. The large
     // semaphore separately limits big files that eat memory.
-    let main_concurrent = if available_ram_mb > 8000 {
-        64
-    } else if available_ram_mb > 4000 {
-        32
-    } else {
-        16
-    };
+    //
+    // An explicit concurrency_override (from the CLI's --concurrency flag)
+    // bypasses the RAM-based tuning. The tuner underreports available RAM
+    // on WSL2 in particular because Linux's page cache aggressively fills
+    // memory for disk caching, and sysinfo's available_memory() subtracts
+    // that away.
+    let main_concurrent = concurrency_override.unwrap_or_else(|| {
+        if available_ram_mb > 8000 {
+            64
+        } else if available_ram_mb > 4000 {
+            32
+        } else {
+            16
+        }
+    });
 
     // Large resource slots: limits how many big files (>1MB, up to 368MB) sit
     // in memory at once. Capped by RAM to avoid pressure on low-end systems.
@@ -276,7 +291,20 @@ pub async fn run_install_pipeline(
         1
     };
 
-    log::info!("System: {} cores, {}MB RAM | download={}, decompress={}, large={}", cpu_cores, available_ram_mb, main_concurrent, decompress_concurrent, large_concurrent);
+    let concurrency_source = if concurrency_override.is_some() {
+        "override"
+    } else {
+        "auto"
+    };
+    log::info!(
+        "System: {} cores, {}MB RAM | download={} ({}), decompress={}, large={}",
+        cpu_cores,
+        available_ram_mb,
+        main_concurrent,
+        concurrency_source,
+        decompress_concurrent,
+        large_concurrent
+    );
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(main_concurrent));
     let large_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(large_concurrent));

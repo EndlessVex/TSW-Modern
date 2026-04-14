@@ -63,6 +63,16 @@ pub struct InstallArgs {
     #[arg(long)]
     pub install_dir: Option<PathBuf>,
 
+    /// Override the automatic RAM-based concurrency tuning.
+    ///
+    /// Sets the maximum number of concurrent CDN connections. The default
+    /// picks 16, 32, or 64 based on available system RAM. Pass a higher
+    /// value to saturate more bandwidth (useful under WSL2 where memory
+    /// reporting understates host resources), or a lower value on
+    /// constrained networks.
+    #[arg(long)]
+    pub concurrency: Option<usize>,
+
     /// Skip loose client files (Data/, exes, dlls) — RDB only.
     #[arg(long)]
     pub skip_client_files: bool,

@@ -71,7 +71,12 @@ bench_staging/
 *.bak
 
 # ── Debug tools (not part of the app) ──
+tools/
 src-tauri/tools/
+
+# ── Rustc temp directories (created by some rustup toolchains) ──
+rmeta*/
+rustc*/
 
 # ── GSD baseline (auto-generated) ──
 .next/
