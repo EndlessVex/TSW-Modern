@@ -121,6 +121,10 @@ async fn run_pipeline(
     }
 
     // Post-install verify pass. Parses le.idx again and walks every entry.
+    // Texture entries (type 1010004) are filtered out of the error count on
+    // non-Windows-x86 targets because the Rust fallback encoder produces
+    // valid-but-not-bit-identical DXT output. See verify_cmd::TEXTURE_RDB_TYPE
+    // and the --skip-textures flag for the full explanation.
     if !args.no_verify {
         let le_idx_path = install_dir.join("RDB").join("le.idx");
         let le_index = tsw_core::rdb::parse_le_index(&le_idx_path)
@@ -135,9 +139,31 @@ async fn run_pipeline(
         )
         .map_err(|e| anyhow::anyhow!(e))?;
 
-        if !verify_result.corrupted.is_empty() {
+        let (texture_mismatches, real_corrupted): (Vec<_>, Vec<_>) = verify_result
+            .corrupted
+            .iter()
+            .cloned()
+            .partition(|e| e.rdb_type == crate::verify_cmd::TEXTURE_RDB_TYPE);
+
+        if args.skip_textures && !texture_mismatches.is_empty() {
+            println!();
+            println!(
+                "Verify finished: {} non-texture corrupted, {} texture mismatches skipped",
+                real_corrupted.len(),
+                texture_mismatches.len()
+            );
+            crate::verify_cmd::print_texture_skip_note();
+        }
+
+        let effective_corrupted = if args.skip_textures {
+            real_corrupted
+        } else {
+            verify_result.corrupted
+        };
+
+        if !effective_corrupted.is_empty() {
             return Err(VerifyFoundCorrupted {
-                count: verify_result.corrupted.len() as u64,
+                count: effective_corrupted.len() as u64,
             }
             .into());
         }
